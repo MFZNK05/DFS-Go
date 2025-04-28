@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
 )
@@ -23,9 +24,10 @@ type Server struct {
 	peerLock sync.Mutex
 	peers    map[string]peer2peer.Peer
 
-	serverOpts ServerOpts
-	Store      *Store
-	quitch     chan struct{}
+	serverOpts  ServerOpts
+	Store       *Store
+	quitch      chan struct{}
+	pendingFile map[string]chan io.Reader
 }
 
 type Message struct {
@@ -59,10 +61,19 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 		},
 	}
 
+	ch := make(chan io.Reader, 1)
+	s.pendingFile[key] = ch
+
 	if err := s.Broadcast(*p); err != nil {
 		return nil, err
 	}
 
+	time.Sleep(time.Millisecond * 50)
+
+	r := <-ch
+	delete(s.pendingFile, key)
+
+	return r, nil
 }
 
 func (s *Server) StoreData(key string, w io.Reader) error {
@@ -85,6 +96,8 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	if err != nil {
 		return err
 	}
+
+	time.Sleep(time.Millisecond * 50)
 
 	peerList := []io.Writer{}
 	for _, peer := range s.peers {
@@ -137,10 +150,11 @@ func NewServer(opts ServerOpts) *Server {
 	}
 
 	return &Server{
-		peers:      map[string]peer2peer.Peer{},
-		serverOpts: opts,
-		Store:      NewStore(StoreOpts),
-		quitch:     make(chan struct{}),
+		peers:       map[string]peer2peer.Peer{},
+		serverOpts:  opts,
+		Store:       NewStore(StoreOpts),
+		quitch:      make(chan struct{}),
+		pendingFile: make(map[string]chan io.Reader),
 	}
 }
 
@@ -198,7 +212,7 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 }
 
 func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
-	peer, ok := s.peers[from]
+	_, ok := s.peers[from]
 	if !ok {
 		return fmt.Errorf("peer (%s) not found", from)
 	}
@@ -214,12 +228,19 @@ func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 		return fmt.Errorf("error copying file to buffer: %w", err)
 	}
 
-	err = peer.Send(buff.Bytes())
-	if err != nil {
-		return fmt.Errorf("error sending data to peer: %w", err)
+	if ch, ok := s.pendingFile[msg.key]; ok {
+		ch <- r
+	} else {
+		fmt.Println("Received file but nobody waiting for it")
 	}
 
 	return nil
+	// err = peer.Send(buff.Bytes())
+	// if err != nil {
+	// 	return fmt.Errorf("error sending data to peer: %w", err)
+	// }
+
+	// return nil
 }
 
 func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
