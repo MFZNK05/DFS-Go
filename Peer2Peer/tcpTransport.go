@@ -4,11 +4,13 @@ import (
 	"errors"
 	"log"
 	"net"
+	"sync"
 )
 
 type TCPPeer struct {
 	net.Conn
 	outbound bool
+	Wg       *sync.WaitGroup
 }
 
 type TCPTransportOpts struct {
@@ -28,6 +30,7 @@ func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
 	return &TCPPeer{
 		Conn:     conn,
 		outbound: outbound,
+		Wg:       &sync.WaitGroup{},
 	}
 }
 
