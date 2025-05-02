@@ -92,33 +92,53 @@ func (t *TCPTransport) loopAndAccept() {
 
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	peer := NewTCPPeer(conn, outbound)
+	log.Printf("HANDLE_CONN: New connection from %s (outbound: %v)", conn.RemoteAddr(), outbound)
 
 	defer func() {
-		log.Println("Dropping peer connection")
+		log.Printf("HANDLE_CONN: Closing connection from %s", conn.RemoteAddr())
 		conn.Close()
 	}()
 
+	log.Println("HANDLE_CONN: Starting handshake...")
 	err := t.HandshakeFunc(peer)
 	if err != nil {
-		log.Printf("Handshake error: %v", err)
+		log.Printf("HANDLE_CONN: Handshake failed: %v", err)
+		return
 	}
 
 	if t.OnPeer != nil {
+		log.Println("HANDLE_CONN: Calling OnPeer callback...")
 		if err := t.OnPeer(peer); err != nil {
+			log.Printf("HANDLE_CONN: OnPeer failed: %v", err)
 			return
 		}
 	}
 
+	log.Println("HANDLE_CONN: Starting read loop...")
 	for {
+		log.Println("HANDLE_CONN: Waiting for message...")
 		msg := RPC{}
 		msg.From = conn.RemoteAddr()
 
 		err = t.Decoder.Decode(conn, &msg)
 		if err != nil {
-			log.Printf("Decode error from %v: %v", conn.RemoteAddr(), err)
+			log.Printf("HANDLE_CONN: Decode error from %v: %v", conn.RemoteAddr(), err)
 			return
 		}
 
+		log.Printf("HANDLE_CONN: Received message (stream: %v)", msg.Stream)
+
+		// if msg.Stream {
+		// 	peer.Wg.Add(1)
+		// 	log.Println("HANDLE_CONN: WaitGroup added (count:", peer.Wg, ")")
+
+		// 	log.Println("HANDLE_CONN: Waiting for stream completion...")
+		// 	t.rpcch <- msg
+		// 	peer.Wg.Wait()
+		// 	log.Println("HANDLE_CONN: Stream completed, continuing...")
+		// }
+
+		// log.Println("HANDLE_CONN: Sending message to channel...")
 		t.rpcch <- msg
 	}
 }
@@ -139,12 +159,17 @@ func (t *TCPPeer) RemoteAddr() net.Addr {
 }
 
 func (t *TCPPeer) Send(b []byte) error {
+	log.Printf("PEER_SEND: Attempting to send %d bytes to %s", len(b), t.RemoteAddr())
 	n, err := t.Conn.Write(b)
 	if err != nil {
+		log.Printf("PEER_SEND: Failed to send: %v", err)
 		return err
 	}
-
-	log.Printf("sent (%d) bytes over network", n)
-
+	log.Printf("PEER_SEND: Successfully sent %d bytes", n)
 	return nil
+}
+
+func (t *TCPPeer) CloseStream() {
+	log.Println("CLOSE_STREAM: Releasing WaitGroup")
+	t.Wg.Done()
 }

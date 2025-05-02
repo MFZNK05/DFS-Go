@@ -7,6 +7,7 @@ type Peer interface {
 	// Close() error
 	// RemoteAddr() net.Addr
 	Send([]byte) error
+	CloseStream()
 }
 
 type Transport interface {

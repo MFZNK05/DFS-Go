@@ -31,16 +31,16 @@ type Server struct {
 }
 
 type Message struct {
-	payload any
+	Payload any
 }
 
 type MessageStoreFile struct {
-	key string
+	Key string
 	//size int64
 }
 
 type MessageGetFile struct {
-	key string
+	Key string
 }
 
 func (s *Server) GetData(key string) (io.Reader, error) {
@@ -56,8 +56,8 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	fmt.Print("file not available on disk")
 
 	p := &Message{
-		payload: MessageGetFile{
-			key: key,
+		Payload: MessageGetFile{
+			Key: key,
 		},
 	}
 
@@ -77,65 +77,70 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 }
 
 func (s *Server) StoreData(key string, w io.Reader) error {
-	buff := new(bytes.Buffer)
-	tee := io.TeeReader(w, buff)
+	log.Println("STORE_DATA: Starting storage process for key:", key)
 
-	err := s.Store.WriteStream(key, tee)
-	if err != nil {
+	// First read ALL data into buffer
+	buff := new(bytes.Buffer)
+	if _, err := io.Copy(buff, w); err != nil {
+		log.Println("STORE_DATA: Error buffering data:", err)
 		return err
 	}
 
+	// Store from buffer
+	log.Println("STORE_DATA: Storing locally...")
+	if err := s.Store.WriteStream(key, bytes.NewReader(buff.Bytes())); err != nil {
+		log.Println("STORE_DATA: Local storage failed:", err)
+		return err
+	}
+	log.Println("STORE_DATA: Local storage successful")
+
+	// Rest of the function remains the same...
 	p := &Message{
-		payload: MessageStoreFile{
-			key: key,
-		},
-		//size: ,
+		Payload: MessageStoreFile{Key: key},
 	}
 
-	err = s.Broadcast(*p)
-	if err != nil {
+	log.Println("STORE_DATA: Broadcasting store message...")
+	if err := s.Broadcast(*p); err != nil {
+		log.Println("STORE_DATA: Broadcast failed:", err)
 		return err
 	}
 
 	time.Sleep(time.Millisecond * 50)
+	log.Println("STORE_DATA: Starting peer distribution...")
 
-	peerList := []io.Writer{}
-	for _, peer := range s.peers {
-		peerList = append(peerList, peer)
+	for addr, peer := range s.peers {
+		log.Printf("STORE_DATA: Processing peer %s", addr)
+
+		log.Printf("STORE_DATA: Sending stream signal to %s", addr)
+		if err := peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
+			log.Printf("STORE_DATA: Failed to signal stream to %s: %v", addr, err)
+			continue
+		}
+
+		log.Printf("STORE_DATA: Sending file data to %s", addr)
+		n, err := io.Copy(peer, bytes.NewReader(buff.Bytes()))
+		if err != nil {
+			log.Printf("STORE_DATA: Failed to send data to %s: %v", addr, err)
+			continue
+		}
+
+		log.Printf("STORE_DATA: Successfully sent %d bytes to %s", n, addr)
 	}
 
-	mw := io.MultiWriter(peerList...)
-	err = gob.NewEncoder(mw).Encode(buff)
-	if err != nil {
-		return err
-	}
-
+	log.Println("STORE_DATA: Completed peer distribution")
 	return nil
 }
 
 func (s *Server) Broadcast(d Message) error {
-	// peerList := []io.Writer{}
-	// for _, peer := range s.peers {
-	// 	peerList = append(peerList, peer)
-	// }
-
-	// mw := io.MultiWriter(peerList...)
-
-	// msg := Message{
-	// 	from:    "self",
-	// 	payload: &d,
-	// }
-
-	// return gob.NewEncoder(mw).Encode(msg)
-	buff := new(bytes.Buffer)
-	err := gob.NewEncoder(buff).Encode(d)
-	if err != nil {
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(d); err != nil {
 		return err
 	}
 
 	for _, peer := range s.peers {
-		if err := peer.Send(buff.Bytes()); err != nil {
-			fmt.Errorf("error sending to peer: %s", peer.RemoteAddr())
+		peer.Send([]byte{peer2peer.IncomingMessage})
+		if err := peer.Send(buf.Bytes()); err != nil {
+			return err
 		}
 	}
 
@@ -200,7 +205,7 @@ func (s *Server) loop() {
 }
 
 func (s *Server) handleMessage(from string, msg *Message) error {
-	switch m := msg.payload.(type) {
+	switch m := msg.Payload.(type) {
 	case *MessageStoreFile:
 		return s.handleStoreMessage(from, m)
 
@@ -212,23 +217,27 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 }
 
 func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
-	_, ok := s.peers[from]
+	peer, ok := s.peers[from]
 	if !ok {
 		return fmt.Errorf("peer (%s) not found", from)
 	}
 
-	r, err := s.Store.ReadStream(msg.key)
+	r, err := s.Store.ReadStream(msg.Key)
 	if err != nil {
 		return fmt.Errorf("error fetching file from disk: %+v", err)
 	}
 
-	buff := new(bytes.Buffer)
-	_, err = io.Copy(buff, r)
-	if err != nil {
-		return fmt.Errorf("error copying file to buffer: %w", err)
+	// buff := new(bytes.Buffer)
+	// _, err = io.Copy(buff, r)
+	// if err != nil {
+	// 	return fmt.Errorf("error copying file to buffer: %w", err)
+	// }
+
+	if err = peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
+		log.Printf("failed to signal stream to %s: %v", from, err)
 	}
 
-	if ch, ok := s.pendingFile[msg.key]; ok {
+	if ch, ok := s.pendingFile[msg.Key]; ok {
 		ch <- r
 	} else {
 		fmt.Println("Received file but nobody waiting for it")
@@ -243,27 +252,55 @@ func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 	// return nil
 }
 
+// func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
+// 	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
+
+// 	peer, ok := s.peers[from]
+// 	if !ok {
+// 		return fmt.Errorf("peer not found")
+// 	}
+
+// 	// Get the TCPPeer to access connection
+// 	tcpPeer, ok := peer.(*peer2peer.TCPPeer)
+// 	if !ok {
+// 		return fmt.Errorf("peer type assertion failed")
+// 	}
+
+// 	log.Println("HANDLE_STORE: Starting file storage...")
+// 	err := s.Store.WriteStream(msg.Key, tcpPeer.Conn)
+// 	if err != nil {
+// 		log.Println("HANDLE_STORE: Storage failed:", err)
+// 		return err
+// 	}
+
+// 	log.Println("HANDLE_STORE: Closing stream...")
+// 	//tcpPeer.Wg.Done()
+
+// 	log.Printf("HANDLE_STORE: Successfully stored file %s", msg.Key)
+// 	return nil
+// }
+
 func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
+	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
 
 	peer, ok := s.peers[from]
 	if !ok {
-		return fmt.Errorf("peer (%s) not found", from)
-	}
-
-	r := peer.(io.Reader)
-
-	err := s.Store.WriteStream(msg.key, r)
-	if err != nil {
-		return fmt.Errorf("error storing file to disk: %+v", err)
-	}
-
-	buff := new(bytes.Buffer)
-	n, err := io.Copy(buff, r)
-	if err != nil {
+		err := fmt.Errorf("peer (%s) not found", from)
+		log.Println("HANDLE_STORE: Error:", err)
 		return err
 	}
 
-	fmt.Printf("written (%d) bytes to disk", n)
+	log.Println("HANDLE_STORE: Starting file storage...")
+	err := s.Store.WriteStream(msg.Key, peer.(io.Reader))
+	if err != nil {
+		log.Println("HANDLE_STORE: Storage failed:", err)
+		return fmt.Errorf("error storing file to disk: %+v", err)
+	}
+
+	log.Println("HANDLE_STORE: Closing stream...")
+	peer.CloseStream()
+
+	log.Printf("HANDLE_STORE: Successfully stored file %s from %s", msg.Key, from)
 	return nil
 }
 
