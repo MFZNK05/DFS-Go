@@ -80,48 +80,48 @@ func CASPathTransformFunc(key string) PathKey {
 	}
 }
 
-func (s *Store) ReadStream(key string) (io.Reader, error) {
+func (s *Store) ReadStream(key string) (int64, io.Reader, error) {
 	// PathKey := s.structOpts.pathTransformFunc(key)
 
 	// filePath := PathKey.pathname
 
 	filePath, ok := s.structOpts.Metadata.Get(key)
 	if !ok {
-		return nil, os.ErrNotExist
+		return 0, nil, os.ErrNotExist
 	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
-	// fi, err := file.Stat()
-	// fs := fi.Size()
+	fi, _ := file.Stat()
+	fs := fi.Size()
 
 	buff := new(bytes.Buffer)
 
 	if _, err = io.Copy(buff, file); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
 	file.Close()
 
-	return buff, nil
+	return fs, buff, nil
 }
 
-func (s *Store) WriteStream(key string, w io.Reader) error {
+func (s *Store) WriteStream(key string, w io.Reader) (int64, error) {
 	pathKey := s.structOpts.PathTransformFunc(key)
 	//pathKey := s.CASPathTransformFunc(key)
 
 	err := os.MkdirAll(s.structOpts.Root+"/"+pathKey.pathname, os.ModePerm)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	buff := new(bytes.Buffer)
 	_, err = io.Copy(buff, w)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	hash := md5.Sum(buff.Bytes())
@@ -132,23 +132,29 @@ func (s *Store) WriteStream(key string, w io.Reader) error {
 
 	f, err := os.Create(filePath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	defer f.Close()
 
 	n, err := io.Copy(f, buff)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	fs := fi.Size()
 	err = s.structOpts.Metadata.Set(key, filePath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	log.Printf("written (%d) bytes to disk: %s", n, filePath)
-	return nil
+	return fs, nil
 }
 
 func (s *Store) Remove(key string) error {

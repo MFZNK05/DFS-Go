@@ -38,7 +38,7 @@ func TestWriteStream(t *testing.T) {
 		Metadata:          NewMetadata(metaPath),
 	})
 
-	err := store.WriteStream(Key, reader)
+	_, err := store.WriteStream(Key, reader)
 	if err != nil {
 		t.Fatalf("WriteStream failed: %v", err)
 	}
@@ -60,13 +60,13 @@ func TestReadStream(t *testing.T) {
 		key := fmt.Sprintf("file%d", i)
 		// First write to ensure file exists
 		reader := bytes.NewReader(Data)
-		err := store.WriteStream(key, reader)
+		_, err := store.WriteStream(key, reader)
 		if err != nil {
 			t.Fatalf("WriteStream failed: %v", err)
 		}
 
 		// Now test read
-		readStream, err := store.ReadStream(key)
+		_, readStream, err := store.ReadStream(key)
 		if err != nil {
 			t.Fatalf("ReadStream failed: %v", err)
 		}
