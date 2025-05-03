@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"io"
 )
 
@@ -83,4 +84,54 @@ func (e *EncryptionService) EncryptKey(fileKey []byte) ([]byte, error) {
 	cypherKey := gcm.Seal(nonce, nonce, fileKey, nil)
 
 	return cypherKey, nil
+}
+
+func (e *EncryptionService) DecryptFile(cipherText, encryptedKey []byte) ([]byte, error) {
+	decryptedKey, err := e.DecryptKey(encryptedKey)
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(decryptedKey)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(cipherText) < nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	nonce, ciphertext := cipherText[:nonceSize], cipherText[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+func (e *EncryptionService) DecryptKey(encryptedKey []byte) ([]byte, error) {
+	block, err := aes.NewCipher(e.FileKey)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(encryptedKey) < nonceSize {
+		return nil, errors.New("encrypted key too short")
+	}
+
+	nonce, ciphertext := encryptedKey[:nonceSize], encryptedKey[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
 }
