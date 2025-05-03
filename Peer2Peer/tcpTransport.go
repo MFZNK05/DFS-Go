@@ -128,17 +128,19 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 		log.Printf("HANDLE_CONN: Received message (stream: %v)", msg.Stream)
 
-		//if msg.Stream {
-		peer.Wg.Add(1)
-		log.Println("HANDLE_CONN: WaitGroup added (count:", peer.Wg, ")")
+		if msg.Stream {
+			peer.Wg.Add(1)
+			log.Println("HANDLE_CONN: WaitGroup added (count:", peer.Wg, ")")
 
-		log.Println("HANDLE_CONN: Waiting for stream completion...")
-		t.rpcch <- msg
-		peer.Wg.Wait()
-		log.Println("HANDLE_CONN: Stream completed, continuing...")
-		//	}
+			log.Println("HANDLE_CONN: Waiting for stream completion...")
+			t.rpcch <- msg
+			peer.Wg.Wait()
+			log.Println("HANDLE_CONN: Stream completed, continuing...")
+			continue
+		}
 
 		log.Println("HANDLE_CONN: Sending message to channel...")
+		t.rpcch <- msg
 	}
 }
 
