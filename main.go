@@ -45,6 +45,7 @@ func main() {
 
 func makeServer(listenAddr string, node ...string) *Server {
 	metaPath := "_metadata.json"
+	EncryptionServiceKey := "qwerty12345"
 
 	tcpOpts := peer2peer.TCPTransportOpts{
 		ListenAddr:    listenAddr,
@@ -62,6 +63,7 @@ func makeServer(listenAddr string, node ...string) *Server {
 		metaData:       NewMetaFile(listenAddr + metaPath),
 		bootstrapNodes: node,
 		storageRoot:    listenAddr + "_network",
+		Encryption:     NewEncryptionService(EncryptionServiceKey),
 	}
 
 	*s = *NewServer(opts)

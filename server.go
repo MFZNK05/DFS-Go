@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ type ServerOpts struct {
 	tcpTransport   peer2peer.TCPTransport
 	metaData       MetadataStore
 	bootstrapNodes []string
+	Encryption     *EncryptionService
 }
 
 type Server struct {
@@ -70,13 +72,74 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 		return nil, err
 	}
 
-	time.Sleep(time.Millisecond * 50)
+	time.Sleep(50 * time.Millisecond)
 
 	r := <-ch
 	delete(s.pendingFile, key)
 
-	return r, nil
+	// Get metadata
+	fm, ok := s.serverOpts.metaData.Get(key)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+
+	// Read from the `io.Reader` into a buffer
+	buf := new(bytes.Buffer)
+	if _, err := io.Copy(buf, r); err != nil {
+		return nil, err
+	}
+
+	// Decrypt the data
+	plainData, err := s.serverOpts.Encryption.DecryptFile(buf.Bytes(), []byte(fm.EncryptedKey))
+	if err != nil {
+		return nil, err
+	}
+
+	// Return a reader to the decrypted data
+	return bytes.NewReader(plainData), nil
 }
+
+// func (s *Server) GetData(key string) (io.Reader, error) {
+// 	if s.Store.Has(key) {
+// 		fmt.Print("reading from disk")
+// 		_, w, err := s.Store.ReadStream(key)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		return w, nil
+// 	}
+
+// 	fmt.Print("file not available on disk")
+
+// 	p := &Message{
+// 		Payload: MessageGetFile{
+// 			Key: key,
+// 		},
+// 	}
+
+// 	ch := make(chan io.Reader, 1)
+// 	s.pendingFile[key] = ch
+
+// 	if err := s.Broadcast(*p); err != nil {
+// 		return nil, err
+// 	}
+
+// 	time.Sleep(time.Millisecond * 50)
+
+// 	r := <-ch
+// 	delete(s.pendingFile, key)
+// 	fm, ok := s.serverOpts.metaData.Get(key)
+// 	if !ok {
+// 		return nil, os.ErrNotExist
+// 	}
+
+// 	fileData, err := s.serverOpts.Encryption.DecryptFile([]byte(r), []byte(fm.EncryptedKey))
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	return fileData, nil
+// }
 
 func (s *Server) StoreData(key string, w io.Reader) error {
 	log.Println("STORE_DATA: Starting storage process for key:", key)
@@ -88,19 +151,37 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		return err
 	}
 
-	// Store from buffer
-	log.Println("STORE_DATA: Storing locally...")
-	fs, err := s.Store.WriteStream(key, bytes.NewReader(buff.Bytes()))
+	// Encrypt once before sending to peers
+	log.Println("STORE_DATA: Encrypting file data...")
+	cipherText, encryptedKey, err := s.serverOpts.Encryption.EncryptFile(bytes.NewReader(buff.Bytes()))
+	if err != nil {
+		log.Println("STORE_DATA: Encryption failed:", err)
+		return err
+	}
+
+	// Store encrypted key in metadata
+	err = s.serverOpts.metaData.Set(key+"_key", FileMeta{EncryptedKey: string(encryptedKey)})
+	if err != nil {
+		log.Println("STORE_DATA: Metadata store failed:", err)
+		return err
+	}
+	log.Println("STORE_DATA: Metadata stored successfully")
+
+	// Store encrypted data locally
+	log.Println("STORE_DATA: Storing encrypted file locally...")
+	fs, err := s.Store.WriteStream(key, bytes.NewReader(cipherText))
 	if err != nil {
 		log.Println("STORE_DATA: Local storage failed:", err)
 		return err
 	}
 	log.Println("STORE_DATA: Local storage successful")
 
-	// Rest of the function remains the same...
+	// Broadcast metadata info
 	p := &Message{
-		Payload: MessageStoreFile{Key: key,
-			Size: fs},
+		Payload: MessageStoreFile{
+			Key:  key,
+			Size: fs,
+		},
 	}
 
 	log.Println("STORE_DATA: Broadcasting store message...")
@@ -112,6 +193,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	time.Sleep(time.Millisecond * 50)
 	log.Println("STORE_DATA: Starting peer distribution...")
 
+	// Now send encrypted data to peers
 	for addr, peer := range s.peers {
 		log.Printf("STORE_DATA: Processing peer %s", addr)
 
@@ -122,7 +204,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		}
 
 		log.Printf("STORE_DATA: Sending file data to %s", addr)
-		n, err := io.Copy(peer, io.LimitReader(bytes.NewReader(buff.Bytes()), fs))
+		n, err := io.Copy(peer, bytes.NewReader(cipherText))
 		if err != nil {
 			log.Printf("STORE_DATA: Failed to send data to %s: %v", addr, err)
 			continue
@@ -134,6 +216,69 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	log.Println("STORE_DATA: Completed peer distribution")
 	return nil
 }
+
+// func (s *Server) StoreData(key string, w io.Reader) error {
+// 	log.Println("STORE_DATA: Starting storage process for key:", key)
+
+// 	// First read ALL data into buffer
+// 	buff := new(bytes.Buffer)
+// 	if _, err := io.Copy(buff, w); err != nil {
+// 		log.Println("STORE_DATA: Error buffering data:", err)
+// 		return err
+// 	}
+
+// 	// Store from buffer
+// 	log.Println("STORE_DATA: Storing locally...")
+// 	fs, err := s.Store.WriteStream(key, bytes.NewReader(buff.Bytes()))
+// 	if err != nil {
+// 		log.Println("STORE_DATA: Local storage failed:", err)
+// 		return err
+// 	}
+// 	log.Println("STORE_DATA: Local storage successful")
+
+// 	// Rest of the function remains the same...
+// 	p := &Message{
+// 		Payload: MessageStoreFile{Key: key,
+// 			Size: fs},
+// 	}
+
+// 	log.Println("STORE_DATA: Broadcasting store message...")
+// 	if err := s.Broadcast(*p); err != nil {
+// 		log.Println("STORE_DATA: Broadcast failed:", err)
+// 		return err
+// 	}
+
+// 	time.Sleep(time.Millisecond * 50)
+// 	log.Println("STORE_DATA: Starting peer distribution...")
+
+// 	for addr, peer := range s.peers {
+// 		log.Printf("STORE_DATA: Processing peer %s", addr)
+
+// 		log.Printf("STORE_DATA: Sending stream signal to %s", addr)
+// 		if err := peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
+// 			log.Printf("STORE_DATA: Failed to signal stream to %s: %v", addr, err)
+// 			continue
+// 		}
+
+// 		ct, ck, err := s.serverOpts.Encryption.EncryptFile(bytes.NewReader(buff.Bytes()))
+// 		err = s.serverOpts.metaData.Set(key, string(ck))
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		log.Printf("STORE_DATA: Sending file data to %s", addr)
+// 		n, err := io.Copy(peer, io.LimitReader(ct, fs))
+// 		if err != nil {
+// 			log.Printf("STORE_DATA: Failed to send data to %s: %v", addr, err)
+// 			continue
+// 		}
+
+// 		log.Printf("STORE_DATA: Successfully sent %d bytes to %s", n, addr)
+// 	}
+
+// 	log.Println("STORE_DATA: Completed peer distribution")
+// 	return nil
+// }
 
 // func (s *Server) Broadcast(d Message) error {
 // 	buf := new(bytes.Buffer)

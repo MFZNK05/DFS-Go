@@ -128,7 +128,14 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 		log.Printf("HANDLE_CONN: Received message (stream: %v)", msg.Stream)
 
-		if msg.Stream {
+		buf := make([]byte, 1)
+		_, err := conn.Read(buf)
+		if err != nil {
+			log.Printf("HANDLE_CONN: Failed to read control byte from %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+
+		if buf[0] == IncomingStream {
 			peer.Wg.Add(1)
 			log.Println("HANDLE_CONN: WaitGroup added (count:", peer.Wg, ")")
 
