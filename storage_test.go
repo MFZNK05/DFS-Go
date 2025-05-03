@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-
-	//"os"
 	"testing"
 )
 
@@ -30,12 +28,9 @@ func TestPathTransformFunc(t *testing.T) {
 func TestWriteStream(t *testing.T) {
 	reader := bytes.NewReader(Data)
 
-	metaPath := "test_metadata.json"
-	//defer os.Remove(metaPath) // clean after test
-
 	store := NewStore(StructOpts{
 		PathTransformFunc: CASPathTransformFunc,
-		Metadata:          NewMetadata(metaPath),
+		Metadata:          NewMetaFile("metadata_test.json"),
 	})
 
 	_, err := store.WriteStream(Key, reader)
@@ -47,25 +42,22 @@ func TestWriteStream(t *testing.T) {
 }
 
 func TestReadStream(t *testing.T) {
-	metaPath := "test_metadata.json"
-	//defer os.Remove(metaPath) // clean metadata file
-
 	store := NewStore(StructOpts{
 		PathTransformFunc: CASPathTransformFunc,
-		Metadata:          NewMetadata(metaPath),
+		Metadata:          NewMetaFile("metadata_test.json"),
 	})
 
 	for i := 0; i < 50; i++ {
-
 		key := fmt.Sprintf("file%d", i)
-		// First write to ensure file exists
+
+		// Write
 		reader := bytes.NewReader(Data)
 		_, err := store.WriteStream(key, reader)
 		if err != nil {
 			t.Fatalf("WriteStream failed: %v", err)
 		}
 
-		// Now test read
+		// Read
 		_, readStream, err := store.ReadStream(key)
 		if err != nil {
 			t.Fatalf("ReadStream failed: %v", err)
@@ -79,17 +71,11 @@ func TestReadStream(t *testing.T) {
 		if !bytes.Equal(readData, Data) {
 			t.Errorf("ReadStream data mismatch:\ngot: %s\nwant: %s", string(readData), string(Data))
 		} else {
-			t.Logf("ReadStream succeeded and data matched.")
+			t.Logf("ReadStream succeeded for key: %s", key)
 		}
 	}
 
-	err := store.TearDown()
-	if err != nil {
+	if err := store.TearDown(); err != nil {
 		t.Error(err)
 	}
-
-	// err = store.Remove(key)
-	// if err != nil {
-	// 	t.Errorf("Removing data failed: %v", err)
-	// }
 }

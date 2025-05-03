@@ -44,7 +44,7 @@ func main() {
 }
 
 func makeServer(listenAddr string, node ...string) *Server {
-	metaPath := "test_metadata.json"
+	metaPath := "_metadata.json"
 
 	tcpOpts := peer2peer.TCPTransportOpts{
 		ListenAddr:    listenAddr,
@@ -59,7 +59,7 @@ func makeServer(listenAddr string, node ...string) *Server {
 	opts := ServerOpts{
 		pathTransform:  CASPathTransformFunc,
 		tcpTransport:   *tcpTransport,
-		metaData:       *NewMetadata(metaPath),
+		metaData:       NewMetaFile(listenAddr + metaPath),
 		bootstrapNodes: node,
 		storageRoot:    listenAddr + "_network",
 	}

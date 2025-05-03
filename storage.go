@@ -5,12 +5,14 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const defaultRoot = "DFSNetworkRoot"
@@ -23,8 +25,13 @@ type pathTransform func(string) PathKey
 
 type StructOpts struct {
 	PathTransformFunc pathTransform
-	Metadata          *Metadata
+	Metadata          MetadataStore
 	Root              string
+}
+
+type FileMeta struct {
+	Path         string
+	EncryptedKey string // Optional encrypted key (unused currently)
 }
 
 type PathKey struct {
@@ -32,20 +39,20 @@ type PathKey struct {
 	filename string
 }
 
+// Interface for metadata operations
+type MetadataStore interface {
+	Get(key string) (FileMeta, bool)
+	Set(key string, meta FileMeta) error
+}
+
 func NewStore(opts StructOpts) *Store {
-	store := &Store{
-		structOpts: opts,
+	if opts.PathTransformFunc == nil {
+		opts.PathTransformFunc = DefaultPathTransformFunc
 	}
-
-	if store.structOpts.PathTransformFunc == nil {
-		store.structOpts.PathTransformFunc = DefaultPathTransformFunc
+	if opts.Root == "" {
+		opts.Root = defaultRoot
 	}
-
-	if store.structOpts.Root == "" {
-		store.structOpts.Root = defaultRoot
-	}
-
-	return store
+	return &Store{structOpts: opts}
 }
 
 func DefaultPathTransformFunc(key string) PathKey {
@@ -63,9 +70,8 @@ func CASPathTransformFunc(key string) PathKey {
 	sliceLen := len(hashStr) / blockSize
 
 	paths := make([]string, sliceLen)
-
 	for i := 0; i < sliceLen; i++ {
-		from, to := i*blockSize, (i*blockSize)+blockSize
+		from, to := i*blockSize, (i+1)*blockSize
 		if to > len(hashStr) {
 			to = len(hashStr)
 		}
@@ -81,106 +87,130 @@ func CASPathTransformFunc(key string) PathKey {
 }
 
 func (s *Store) ReadStream(key string) (int64, io.Reader, error) {
-	// PathKey := s.structOpts.pathTransformFunc(key)
-
-	// filePath := PathKey.pathname
-
-	filePath, ok := s.structOpts.Metadata.Get(key)
+	meta, ok := s.structOpts.Metadata.Get(key)
 	if !ok {
 		return 0, nil, os.ErrNotExist
 	}
 
-	file, err := os.Open(filePath)
+	file, err := os.Open(meta.Path)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
 	if err != nil {
 		return 0, nil, err
 	}
 
-	fi, _ := file.Stat()
-	fs := fi.Size()
-
-	buff := new(bytes.Buffer)
-
-	if _, err = io.Copy(buff, file); err != nil {
+	buf := new(bytes.Buffer)
+	if _, err := io.Copy(buf, file); err != nil {
 		return 0, nil, err
 	}
 
-	file.Close()
-
-	return fs, buff, nil
+	return info.Size(), buf, nil
 }
 
-func (s *Store) WriteStream(key string, w io.Reader) (int64, error) {
+func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
 	pathKey := s.structOpts.PathTransformFunc(key)
-	//pathKey := s.CASPathTransformFunc(key)
 
-	err := os.MkdirAll(s.structOpts.Root+"/"+pathKey.pathname, os.ModePerm)
+	fullPath := filepath.Join(s.structOpts.Root, pathKey.pathname)
+	err := os.MkdirAll(fullPath, os.ModePerm)
 	if err != nil {
 		return 0, err
 	}
 
-	buff := new(bytes.Buffer)
-	_, err = io.Copy(buff, w)
+	buf := new(bytes.Buffer)
+	_, err = io.Copy(buf, r)
 	if err != nil {
 		return 0, err
 	}
 
-	hash := md5.Sum(buff.Bytes())
+	hash := md5.Sum(buf.Bytes())
 	hashStr := hex.EncodeToString(hash[:])
 	pathKey.filename = hashStr
 
-	filePath := s.structOpts.Root + "/" + pathKey.pathname + "/" + pathKey.filename
+	finalPath := filepath.Join(fullPath, pathKey.filename)
 
-	f, err := os.Create(filePath)
+	f, err := os.Create(finalPath)
 	if err != nil {
 		return 0, err
 	}
-
 	defer f.Close()
 
-	n, err := io.Copy(f, buff)
+	n, err := io.Copy(f, buf)
 	if err != nil {
 		return 0, err
 	}
 
-	fi, err := f.Stat()
-	if err != nil {
+	meta := FileMeta{Path: finalPath}
+	if err := s.structOpts.Metadata.Set(key, meta); err != nil {
 		return 0, err
 	}
 
-	fs := fi.Size()
-	err = s.structOpts.Metadata.Set(key, filePath)
-	if err != nil {
-		return 0, err
-	}
-
-	log.Printf("written (%d) bytes to disk: %s", n, filePath)
-	return fs, nil
+	log.Printf("Written %d bytes to %s\n", n, finalPath)
+	return n, nil
 }
 
 func (s *Store) Remove(key string) error {
-	filePath, ok := s.structOpts.Metadata.Get(key)
+	meta, ok := s.structOpts.Metadata.Get(key)
 	if !ok {
 		return os.ErrNotExist
 	}
+	return os.Remove(meta.Path)
+}
 
-	fmt.Println(filePath)
-	paths := strings.Split(filePath, "/")
-
-	err := os.RemoveAll(paths[1])
-	if err != nil {
-		return err
+func (s *Store) Has(key string) bool {
+	meta, ok := s.structOpts.Metadata.Get(key)
+	if !ok {
+		return false
 	}
 
-	return nil
+	_, err := os.Stat(meta.Path)
+	return !errors.Is(err, os.ErrNotExist)
 }
 
 func (s *Store) TearDown() error {
 	return os.RemoveAll(s.structOpts.Root)
 }
 
-func (s *Store) Has(key string) bool {
-	filePath, _ := s.structOpts.Metadata.Get(key)
+type MetaFile struct {
+	path  string
+	store map[string]FileMeta
+	mu    sync.Mutex
+}
 
-	_, err := os.Stat(filePath)
-	return !errors.Is(err, os.ErrNotExist)
+func NewMetaFile(path string) *MetaFile {
+	m := &MetaFile{
+		path:  path,
+		store: make(map[string]FileMeta),
+	}
+
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &m.store)
+	} else {
+		_ = os.WriteFile(path, []byte("{}"), os.ModePerm)
+	}
+
+	return m
+}
+
+func (m *MetaFile) Get(key string) (FileMeta, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	val, ok := m.store[key]
+	return val, ok
+}
+
+func (m *MetaFile) Set(key string, meta FileMeta) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.store[key] = meta
+	data, err := json.MarshalIndent(m.store, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(m.path, data, os.ModePerm)
 }

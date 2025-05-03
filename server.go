@@ -18,7 +18,7 @@ type ServerOpts struct {
 	storageRoot    string
 	pathTransform  pathTransform
 	tcpTransport   peer2peer.TCPTransport
-	metaData       Metadata
+	metaData       MetadataStore
 	bootstrapNodes []string
 }
 
@@ -185,7 +185,7 @@ func (s *Server) Broadcast(d Message) error {
 func NewServer(opts ServerOpts) *Server {
 	StoreOpts := StructOpts{
 		PathTransformFunc: opts.pathTransform,
-		Metadata:          &opts.metaData,
+		Metadata:          opts.metaData,
 		Root:              opts.storageRoot,
 	}
 
