@@ -57,6 +57,9 @@ func (e *EncryptionService) EncryptFile(src io.Reader) ([]byte, []byte, error) {
 	cipherText := gcm.Seal(nonce, nonce, buff.Bytes(), nil)
 
 	encryptedKey, err := e.EncryptKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return cipherText, encryptedKey, nil
 }
