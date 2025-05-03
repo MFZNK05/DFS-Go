@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"io"
 )
@@ -14,8 +15,9 @@ type EncryptionService struct {
 }
 
 func NewEncryptionService(Key string) *EncryptionService {
+	hash := sha256.Sum256([]byte(Key))
 	return &EncryptionService{
-		FileKey: []byte(Key),
+		FileKey: hash[:],
 	}
 }
 
@@ -81,9 +83,9 @@ func (e *EncryptionService) EncryptKey(fileKey []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	cypherKey := gcm.Seal(nonce, nonce, fileKey, nil)
+	cipherKey := gcm.Seal(nonce, nonce, fileKey, nil)
 
-	return cypherKey, nil
+	return cipherKey, nil
 }
 
 func (e *EncryptionService) DecryptFile(cipherText, encryptedKey []byte) ([]byte, error) {
