@@ -28,7 +28,7 @@ func main() {
 	// data := bytes.NewReader([]byte("This is some data"))
 	// s2.StoreData("this is a secret key", data)
 
-	// time.Sleep(time.Millisecond * 50)
+	time.Sleep(time.Millisecond * 50)
 	r, err := s2.GetData("this is a secret key")
 	if err != nil {
 		log.Fatal(err)

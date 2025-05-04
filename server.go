@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -150,7 +151,7 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	// 	return bytes.NewReader(plainData), nil
 	// }
 
-	return reader, fmt.Errorf("no peer could provide the file")
+	return reader, nil
 }
 
 // func (s *Server) GetData(key string) (io.Reader, error) {
@@ -266,7 +267,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	}
 
 	// Store encrypted key in metadata
-	err = s.serverOpts.metaData.Set(key, FileMeta{EncryptedKey: string(encryptedKey)})
+	err = s.serverOpts.metaData.Set(key, FileMeta{EncryptedKey: hex.EncodeToString(encryptedKey)})
 	if err != nil {
 		log.Println("STORE_DATA: Metadata store failed:", err)
 		return err
@@ -578,7 +579,16 @@ func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
 		return err
 	}
 
-	plainData, err := s.serverOpts.Encryption.DecryptFile(buf.Bytes(), []byte(fm.EncryptedKey))
+	log.Printf("HANDLE_LOCAL: Key = %s, ExpectedSize = %d, WrittenSize = %d", msg.Key, msg.Size, n)
+
+	decodedKey, err := hex.DecodeString(fm.EncryptedKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode hex key: %w", err)
+	}
+
+	log.Printf("HANDLE_LOCAL: EncryptedKey = %x", decodedKey)
+
+	plainData, err := s.serverOpts.Encryption.DecryptFile(buf.Bytes(), []byte(decodedKey))
 	if err != nil {
 		log.Printf("HANDLE_LOCAL: Decryption error: %v", err)
 		return err
