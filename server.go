@@ -160,7 +160,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	}
 
 	// Store encrypted key in metadata
-	err = s.serverOpts.metaData.Set(key+"_key", FileMeta{EncryptedKey: string(encryptedKey)})
+	err = s.serverOpts.metaData.Set(key, FileMeta{EncryptedKey: string(encryptedKey)})
 	if err != nil {
 		log.Println("STORE_DATA: Metadata store failed:", err)
 		return err

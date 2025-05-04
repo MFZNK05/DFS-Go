@@ -143,8 +143,14 @@ func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
 		return 0, err
 	}
 
-	meta := FileMeta{Path: finalPath}
-	if err := s.structOpts.Metadata.Set(key, meta); err != nil {
+	fm, ok := s.structOpts.Metadata.Get(key)
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+
+	fm.Path = finalPath
+
+	if err := s.structOpts.Metadata.Set(key, fm); err != nil {
 		return 0, err
 	}
 
