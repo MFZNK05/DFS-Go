@@ -49,15 +49,16 @@ type MessageGetFile struct {
 
 func (s *Server) GetData(key string) (io.Reader, error) {
 	if s.Store.Has(key) {
-		fmt.Print("reading from disk")
+		log.Printf("GET_DATA: File for key '%s' found on local disk.", key)
 		_, w, err := s.Store.ReadStream(key)
 		if err != nil {
+			log.Printf("GET_DATA: Failed to read file from local disk for key '%s': %v", key, err)
 			return nil, err
 		}
 		return w, nil
 	}
 
-	fmt.Print("file not available on disk")
+	log.Printf("GET_DATA: File for key '%s' not found on local disk. Requesting from peers...", key)
 
 	p := &Message{
 		Payload: MessageGetFile{
@@ -69,35 +70,93 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	s.pendingFile[key] = ch
 
 	if err := s.Broadcast(*p); err != nil {
+		log.Printf("GET_DATA: Broadcast to peers failed for key '%s': %v", key, err)
+		delete(s.pendingFile, key)
 		return nil, err
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // ⚠️ Consider replacing with a proper timeout/select logic
 
 	r := <-ch
 	delete(s.pendingFile, key)
+	log.Printf("GET_DATA: Received file stream for key '%s' from peer.", key)
 
-	// Get metadata
+	// Retrieve metadata
 	fm, ok := s.serverOpts.metaData.Get(key)
 	if !ok {
+		log.Printf("GET_DATA: Metadata missing for key '%s'", key)
 		return nil, os.ErrNotExist
 	}
 
-	// Read from the `io.Reader` into a buffer
+	// Buffer the peer's response
 	buf := new(bytes.Buffer)
 	if _, err := io.Copy(buf, r); err != nil {
+		log.Printf("GET_DATA: Failed to read from peer stream for key '%s': %v", key, err)
 		return nil, err
 	}
 
-	// Decrypt the data
+	log.Printf("GET_DATA: Starting decryption for key '%s'", key)
 	plainData, err := s.serverOpts.Encryption.DecryptFile(buf.Bytes(), []byte(fm.EncryptedKey))
 	if err != nil {
+		log.Printf("GET_DATA: Decryption failed for key '%s': %v", key, err)
 		return nil, err
 	}
 
-	// Return a reader to the decrypted data
+	log.Printf("GET_DATA: Successfully decrypted data for key '%s'", key)
 	return bytes.NewReader(plainData), nil
 }
+
+// func (s *Server) GetData(key string) (io.Reader, error) {
+// 	if s.Store.Has(key) {
+// 		fmt.Print("reading from disk")
+// 		_, w, err := s.Store.ReadStream(key)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		return w, nil
+// 	}
+
+// 	fmt.Print("file not available on disk")
+
+// 	p := &Message{
+// 		Payload: MessageGetFile{
+// 			Key: key,
+// 		},
+// 	}
+
+// 	ch := make(chan io.Reader, 1)
+// 	s.pendingFile[key] = ch
+
+// 	if err := s.Broadcast(*p); err != nil {
+// 		return nil, err
+// 	}
+
+// 	time.Sleep(50 * time.Millisecond)
+
+// 	r := <-ch
+// 	delete(s.pendingFile, key)
+
+// 	// Get metadata
+// 	fm, ok := s.serverOpts.metaData.Get(key)
+// 	if !ok {
+// 		return nil, os.ErrNotExist
+// 	}
+
+// 	// Read from the `io.Reader` into a buffer
+// 	buf := new(bytes.Buffer)
+// 	if _, err := io.Copy(buf, r); err != nil {
+// 		return nil, err
+// 	}
+
+// 	// Decrypt the data
+// 	plainData, err := s.serverOpts.Encryption.DecryptFile(buf.Bytes(), []byte(fm.EncryptedKey))
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// Return a reader to the decrypted data
+// 	return bytes.NewReader(plainData), nil
+// }
 
 // func (s *Server) GetData(key string) (io.Reader, error) {
 // 	if s.Store.Has(key) {
@@ -217,85 +276,6 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	return nil
 }
 
-// func (s *Server) StoreData(key string, w io.Reader) error {
-// 	log.Println("STORE_DATA: Starting storage process for key:", key)
-
-// 	// First read ALL data into buffer
-// 	buff := new(bytes.Buffer)
-// 	if _, err := io.Copy(buff, w); err != nil {
-// 		log.Println("STORE_DATA: Error buffering data:", err)
-// 		return err
-// 	}
-
-// 	// Store from buffer
-// 	log.Println("STORE_DATA: Storing locally...")
-// 	fs, err := s.Store.WriteStream(key, bytes.NewReader(buff.Bytes()))
-// 	if err != nil {
-// 		log.Println("STORE_DATA: Local storage failed:", err)
-// 		return err
-// 	}
-// 	log.Println("STORE_DATA: Local storage successful")
-
-// 	// Rest of the function remains the same...
-// 	p := &Message{
-// 		Payload: MessageStoreFile{Key: key,
-// 			Size: fs},
-// 	}
-
-// 	log.Println("STORE_DATA: Broadcasting store message...")
-// 	if err := s.Broadcast(*p); err != nil {
-// 		log.Println("STORE_DATA: Broadcast failed:", err)
-// 		return err
-// 	}
-
-// 	time.Sleep(time.Millisecond * 50)
-// 	log.Println("STORE_DATA: Starting peer distribution...")
-
-// 	for addr, peer := range s.peers {
-// 		log.Printf("STORE_DATA: Processing peer %s", addr)
-
-// 		log.Printf("STORE_DATA: Sending stream signal to %s", addr)
-// 		if err := peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
-// 			log.Printf("STORE_DATA: Failed to signal stream to %s: %v", addr, err)
-// 			continue
-// 		}
-
-// 		ct, ck, err := s.serverOpts.Encryption.EncryptFile(bytes.NewReader(buff.Bytes()))
-// 		err = s.serverOpts.metaData.Set(key, string(ck))
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		log.Printf("STORE_DATA: Sending file data to %s", addr)
-// 		n, err := io.Copy(peer, io.LimitReader(ct, fs))
-// 		if err != nil {
-// 			log.Printf("STORE_DATA: Failed to send data to %s: %v", addr, err)
-// 			continue
-// 		}
-
-// 		log.Printf("STORE_DATA: Successfully sent %d bytes to %s", n, addr)
-// 	}
-
-// 	log.Println("STORE_DATA: Completed peer distribution")
-// 	return nil
-// }
-
-// func (s *Server) Broadcast(d Message) error {
-// 	buf := new(bytes.Buffer)
-// 	if err := gob.NewEncoder(buf).Encode(d); err != nil {
-// 		return err
-// 	}
-
-// 	for _, peer := range s.peers {
-// 		peer.Send([]byte{peer2peer.IncomingMessage})
-// 		if err := peer.Send(buf.Bytes()); err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	return nil
-// }
-
 func (s *Server) Broadcast(d Message) error {
 	log.Println("[Broadcast] Encoding message...")
 
@@ -310,12 +290,12 @@ func (s *Server) Broadcast(d Message) error {
 	for addr, peer := range s.peers {
 		log.Printf("[Broadcast] Sending message to peer: %s\n", addr)
 
-		// if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-		// 	log.Printf("[Broadcast] Error sending message indicator to %s: %v\n", addr, err)
-		// 	return err
-		// }
-		fullBytesBuff := append([]byte{peer2peer.IncomingMessage}, buf.Bytes()...)
-		if err := peer.Send(fullBytesBuff); err != nil {
+		err := peer.Send([]byte{peer2peer.IncomingMessage})
+		if err != nil {
+			return err
+		}
+
+		if err := peer.Send(buf.Bytes()); err != nil {
 			log.Printf("[Broadcast] Error sending actual message to %s: %v\n", addr, err)
 			return err
 		}
@@ -370,18 +350,33 @@ func (s *Server) loop() {
 
 	for {
 		select {
-		case RPC := <-s.serverOpts.tcpTransport.Consume():
+		case RPC, ok := <-s.serverOpts.tcpTransport.Consume():
+			if !ok {
+				log.Println("[loop] Channel closed. Exiting loop.")
+				return
+			}
+
+			if RPC.From == nil {
+				log.Println("[loop] Got RPC with nil 'From'. Skipping.")
+				continue
+			}
+
 			log.Printf("[loop] Received RPC from: %s\n", RPC.From.String())
 
+			if len(RPC.Payload) == 0 {
+				log.Println("[loop] Empty payload. Skipping message.")
+				continue
+			}
+
 			var message Message
-			log.Print(RPC.Payload)
-			err := gob.NewDecoder(bytes.NewReader(RPC.Payload[1:])).Decode(&message)
+			err := gob.NewDecoder(bytes.NewReader(RPC.Payload)).Decode(&message)
 			if err != nil {
 				log.Printf("[loop] Error decoding message from %s: %v\n", RPC.From.String(), err)
 				continue
 			}
 
 			log.Printf("[loop] Decoded message: %+v\n", message)
+			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
 			if err := s.handleMessage(RPC.From.String(), &message); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
@@ -416,53 +411,39 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 	return nil
 }
 
-// func (s *Server) handleMessage(from string, msg *Message) error {
-// 	log.Printf("[handleMessage] Handling message from %s: Type=%T\n", from, msg.Payload)
-
-// 	t := reflect.TypeOf(msg.Payload)
-//     pt := strings.TrimPrefix(t.String(), "main.")
-// 	switch m := pt {
-// 	case *MessageStoreFile:
-// 		log.Printf("[handleMessage] Detected MessageStoreFile from %s\n", from)
-// 		return s.handleStoreMessage(from, m)
-
-// 	case *MessageGetFile:
-// 		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
-// 		return s.handleGetMessage(from, m)
-
-// 	default:
-// 		log.Printf("[handleMessage] Unknown message type %T from %s\n", msg.Payload, from)
-// 	}
-
-// 	return nil
-// }
-
 func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
+	log.Printf("HANDLE_GET: Received file request for key '%s' from peer '%s'", msg.Key, from)
+
 	peer, ok := s.peers[from]
 	if !ok {
-		return fmt.Errorf("peer (%s) not found", from)
+		return os.ErrNotExist
 	}
 
 	_, r, err := s.Store.ReadStream(msg.Key)
 	if err != nil {
-		return fmt.Errorf("error fetching file from disk: %+v", err)
+		log.Printf("HANDLE_GET: Error reading file for key '%s' from disk: %v", msg.Key, err)
+		return fmt.Errorf("HANDLE_GET: error fetching file from disk: %+v", err)
 	}
 
+	log.Printf("HANDLE_GET: Sending stream signal to peer '%s'", from)
 	if err = peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
-		log.Printf("failed to signal stream to %s: %v", from, err)
+		log.Printf("HANDLE_GET: Failed to signal stream to '%s': %v", from, err)
+		// Not returning error here so we still attempt to send file
 	}
 
+	log.Printf("HANDLE_GET: Sending file data for key '%s' to peer '%s'", msg.Key, from)
 	n, err := io.Copy(peer, r)
 	if err != nil {
-		log.Printf("failed to send data to %s: %v", from, err)
+		log.Printf("HANDLE_GET: Failed to send file data to peer '%s': %v", from, err)
 		return err
 	}
-	log.Printf("Successfully sent %d bytes to %s", n, from)
+	log.Printf("HANDLE_GET: Successfully sent %d bytes to peer '%s' for key '%s'", n, from, msg.Key)
 
 	if ch, ok := s.pendingFile[msg.Key]; ok {
+		log.Printf("HANDLE_GET: Forwarding file stream to requester for key '%s'", msg.Key)
 		ch <- r
 	} else {
-		fmt.Println("Received file but nobody waiting for it")
+		log.Printf("HANDLE_GET: File '%s' sent to peer '%s' but no one waiting in pendingFile", msg.Key, from)
 	}
 
 	return nil

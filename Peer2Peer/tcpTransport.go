@@ -100,8 +100,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	}()
 
 	log.Println("HANDLE_CONN: Starting handshake...")
-	err := t.HandshakeFunc(peer)
-	if err != nil {
+	if err := t.HandshakeFunc(peer); err != nil {
 		log.Printf("HANDLE_CONN: Handshake failed: %v", err)
 		return
 	}
@@ -117,36 +116,38 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 	log.Println("HANDLE_CONN: Starting read loop...")
 	for {
 		log.Println("HANDLE_CONN: Waiting for message...")
-		msg := RPC{}
-		msg.From = conn.RemoteAddr()
 
-		err = t.Decoder.Decode(conn, &msg)
-		if err != nil {
-			log.Printf("HANDLE_CONN: Decode error from %v: %v", conn.RemoteAddr(), err)
-			return
-		}
-
-		log.Printf("HANDLE_CONN: Received message (stream: %v)", msg.Stream)
-
+		// Read control byte
 		buf := make([]byte, 1)
-		_, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("HANDLE_CONN: Failed to read control byte from %s: %v", conn.RemoteAddr(), err)
+		if _, err := conn.Read(buf); err != nil {
+			log.Printf("HANDLE_CONN: Failed to read control byte: %v", err)
 			return
 		}
 
+		var msg RPC
+
+		// Handle stream messages
 		if buf[0] == IncomingStream {
 			peer.Wg.Add(1)
-			log.Println("HANDLE_CONN: WaitGroup added (count:", peer.Wg, ")")
 
-			log.Println("HANDLE_CONN: Waiting for stream completion...")
+			log.Println("HANDLE_CONN: Received stream signal")
+
 			t.rpcch <- msg
+
+			// Wait for stream to complete
 			peer.Wg.Wait()
-			log.Println("HANDLE_CONN: Stream completed, continuing...")
+			log.Println("HANDLE_CONN: Stream processing completed")
 			continue
 		}
 
-		log.Println("HANDLE_CONN: Sending message to channel...")
+		// Handle regular messages
+		if err := t.Decoder.Decode(conn, &msg); err != nil {
+			log.Printf("HANDLE_CONN: Decode error: %v", err)
+			return
+		}
+
+		msg.From = conn.RemoteAddr()
+		log.Printf("HANDLE_CONN: Forwarding regular message from %s", msg.From)
 		t.rpcch <- msg
 	}
 }
@@ -174,6 +175,7 @@ func (t *TCPPeer) Send(b []byte) error {
 		return err
 	}
 	log.Printf("PEER_SEND: Successfully sent %d bytes", n)
+	log.Print(string(b))
 	return nil
 }
 

@@ -112,49 +112,83 @@ func (s *Store) ReadStream(key string) (int64, io.Reader, error) {
 }
 
 func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
-	pathKey := s.structOpts.PathTransformFunc(key)
+	log.Printf("WRITE_STREAM: Starting to write stream for key: %s", key)
 
+	// Transform the key to path
+	pathKey := s.structOpts.PathTransformFunc(key)
+	log.Printf("WRITE_STREAM: Transformed key to path: %s", pathKey.pathname)
+
+	// Create directory
 	fullPath := filepath.Join(s.structOpts.Root, pathKey.pathname)
+	log.Printf("WRITE_STREAM: Creating directory at: %s", fullPath)
 	err := os.MkdirAll(fullPath, os.ModePerm)
 	if err != nil {
+		log.Printf("WRITE_STREAM: Failed to create directory: %v", err)
 		return 0, err
 	}
 
+	// Read all data into buffer
 	buf := new(bytes.Buffer)
+	log.Println("WRITE_STREAM: Copying data into buffer")
 	_, err = io.Copy(buf, r)
 	if err != nil {
+		log.Printf("WRITE_STREAM: Error while copying data to buffer: %v", err)
 		return 0, err
 	}
+	log.Printf("WRITE_STREAM: Data copied into buffer (%d bytes)", buf.Len())
 
+	// Calculate hash
 	hash := md5.Sum(buf.Bytes())
 	hashStr := hex.EncodeToString(hash[:])
 	pathKey.filename = hashStr
+	log.Printf("WRITE_STREAM: Calculated MD5 hash: %s", hashStr)
 
+	// Final file path
 	finalPath := filepath.Join(fullPath, pathKey.filename)
+	log.Printf("WRITE_STREAM: Final path for file: %s", finalPath)
 
+	// Create file
 	f, err := os.Create(finalPath)
 	if err != nil {
+		log.Printf("WRITE_STREAM: Failed to create file: %v", err)
 		return 0, err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("WRITE_STREAM: Warning - failed to close file: %v", cerr)
+		}
+	}()
+	log.Println("WRITE_STREAM: File created successfully")
 
+	// Write buffer to file
+	log.Println("WRITE_STREAM: Writing buffer data to file")
 	n, err := io.Copy(f, buf)
 	if err != nil {
+		log.Printf("WRITE_STREAM: Failed to write to file: %v", err)
 		return 0, err
 	}
+	log.Printf("WRITE_STREAM: Successfully wrote %d bytes to file", n)
 
+	// Get and update metadata
+	log.Printf("WRITE_STREAM: Fetching metadata for key: %s", key)
 	fm, ok := s.structOpts.Metadata.Get(key)
 	if !ok {
-		return 0, os.ErrNotExist
+		log.Printf("WRITE_STREAM: Metadata for key '%s' does not exist. Creating new metadata entry.", key)
+		fm := FileMeta{}
+		if err := s.structOpts.Metadata.Set(key, fm); err != nil {
+			return 0, err
+		}
 	}
 
 	fm.Path = finalPath
+	log.Printf("WRITE_STREAM: Setting file path in metadata: %s", finalPath)
 
 	if err := s.structOpts.Metadata.Set(key, fm); err != nil {
+		log.Printf("WRITE_STREAM: Failed to update metadata: %v", err)
 		return 0, err
 	}
+	log.Printf("WRITE_STREAM: Metadata updated successfully")
 
-	log.Printf("Written %d bytes to %s\n", n, finalPath)
 	return n, nil
 }
 
