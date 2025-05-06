@@ -1,72 +1,58 @@
 package main
 
 import (
-	"fmt"
-	"io"
-	"log"
-	"time"
+	// "bytes"
+	// "fmt"
+	// "io"
+	// "log"
+	// "time"
 
 	//"time"
 
-	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
+	//peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
+	//server "github.com/Faizan2005/DFS-Go/Server"
+	"github.com/Faizan2005/DFS-Go/cmd"
 )
 
 func main() {
-	s1 := makeServer(":3000")
-	s2 := makeServer(":4000", ":3000")
-
-	go func() {
-		if err := s1.Run(); err != nil {
-			log.Println("Server s1 error:", err)
-		}
-	}()
-	time.Sleep(1 * time.Second)
-
-	go s2.Run()
-	time.Sleep(1 * time.Second)
-
-	// data := bytes.NewReader([]byte("This is some data"))
-	// s2.StoreData("this is a secret key", data)
-
-	time.Sleep(time.Millisecond * 50)
-	r, err := s2.GetData("this is a secret key")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fileData, err := io.ReadAll(r)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Print(fileData)
-	fmt.Print(string(fileData))
-
-	select {}
+	cmd.Execute()
 }
 
-func makeServer(listenAddr string, node ...string) *Server {
-	metaPath := "_metadata.json"
-	EncryptionServiceKey := "qwerty12345"
+// func main() {
+// 	s1 := server.MakeServer(":3000", "")
+// 	s2 := server.MakeServer(":7000", "")
+// 	s3 := server.MakeServer(":5000", ":3000", ":7000")
 
-	tcpOpts := peer2peer.TCPTransportOpts{
-		ListenAddr:    listenAddr,
-		HandshakeFunc: peer2peer.NOPEHandshakeFunc,
-		Decoder:       peer2peer.DefaultDecoder{},
-	}
-	tcpTransport := peer2peer.NewTCPTransport(tcpOpts)
+// 	go func() { log.Fatal(s1.Run()) }()
+// 	time.Sleep(500 * time.Millisecond)
+// 	go func() { log.Fatal(s2.Run()) }()
 
-	s := &Server{} // create server first to use its OnPeer
-	tcpTransport.OnPeer = s.OnPeer
+// 	time.Sleep(2 * time.Second)
 
-	opts := ServerOpts{
-		pathTransform:  CASPathTransformFunc,
-		tcpTransport:   *tcpTransport,
-		metaData:       NewMetaFile(listenAddr + metaPath),
-		bootstrapNodes: node,
-		storageRoot:    listenAddr + "_network",
-		Encryption:     NewEncryptionService(EncryptionServiceKey),
-	}
+// 	go s3.Run()
+// 	time.Sleep(2 * time.Second)
 
-	*s = *NewServer(opts)
-	return s
-}
+// 	for i := 0; i < 20; i++ {
+// 		key := fmt.Sprintf("picture_%d.png", i)
+// 		data := bytes.NewReader([]byte("my big data file here!"))
+// 		s3.StoreData(key, data)
+
+// 		// if err := s3.store.Delete(s3.ID, key); err != nil {
+// 		// 	log.Fatal(err)
+// 		// }
+
+// 		r, err := s3.GetData(key)
+// 		if err != nil {
+// 			log.Fatal(err)
+// 		}
+
+// 		b, err := io.ReadAll(r)
+// 		if err != nil {
+// 			log.Fatal(err)
+// 		}
+
+// 		fmt.Println(string(b))
+// 	}
+
+// 	select {}
+// }
