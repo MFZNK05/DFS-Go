@@ -1,6 +1,7 @@
 package peer2peer
 
 import (
+	"crypto/tls"
 	"errors"
 	"log"
 	"net"
@@ -18,6 +19,7 @@ type TCPTransportOpts struct {
 	HandshakeFunc HandshakeFunc
 	Decoder       Decoder
 	OnPeer        func(Peer) error
+	TLSConfig     *tls.Config // Optional: if set, enables TLS
 }
 
 type TCPTransport struct {
@@ -64,7 +66,13 @@ func (p *TCPPeer) Close() error {
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
 
-	t.Listener, err = net.Listen("tcp", t.ListenAddr)
+	if t.TLSConfig != nil {
+		log.Printf("TLS enabled: listening on %s with TLS", t.ListenAddr)
+		t.Listener, err = tls.Listen("tcp", t.ListenAddr, t.TLSConfig)
+	} else {
+		log.Printf("TLS disabled: listening on %s with plain TCP", t.ListenAddr)
+		t.Listener, err = net.Listen("tcp", t.ListenAddr)
+	}
 	if err != nil {
 		log.Printf("Failed to listen on %s: %v", t.ListenAddr, err)
 		return err
@@ -153,7 +161,16 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 }
 
 func (t *TCPTransport) Dial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
+	var conn net.Conn
+	var err error
+
+	if t.TLSConfig != nil {
+		log.Printf("TLS enabled: dialing %s with TLS", addr)
+		conn, err = tls.Dial("tcp", addr, t.TLSConfig)
+	} else {
+		log.Printf("TLS disabled: dialing %s with plain TCP", addr)
+		conn, err = net.Dial("tcp", addr)
+	}
 	if err != nil {
 		return err
 	}
@@ -175,7 +192,6 @@ func (t *TCPPeer) Send(b []byte) error {
 		return err
 	}
 	log.Printf("PEER_SEND: Successfully sent %d bytes", n)
-	log.Print(string(b))
 	return nil
 }
 

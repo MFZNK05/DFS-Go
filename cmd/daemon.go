@@ -7,8 +7,6 @@ import (
 	"os"
 
 	serve "github.com/Faizan2005/DFS-Go/Server"
-	//cmd "github.com/Faizan2005/DFS-Go/cmd"
-	//internal "github.com/Faizan2005/DFS-Go/internal"
 )
 
 func StartDaemon(port string, peers []string) error {

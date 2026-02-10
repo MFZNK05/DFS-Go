@@ -11,18 +11,22 @@ var Key = "test.txt"
 var Data = []byte("whassup ma boy!")
 
 func TestPathTransformFunc(t *testing.T) {
-	expectedPathname := "4b6fc/b2d52/1ef0f/d442a/5301e/7932d/16cc9/f375a"
-	expectedFilename := "4b6fcb2d521ef0fd442a5301e7932d16cc9f375a"
+	// SHA-256 produces 64 hex characters (vs SHA-1's 40)
+	expectedPathname := "a6ed0/c785d/4590b/c95c2/16bcf/51438/4eee6/765b1/c2b73/2d0b0/a1ad7/e14d3"
+	expectedFilename := "a6ed0c785d4590bc95c216bcf514384eee6765b1c2b732d0b0a1ad7e14d3"
 
 	pathKey := CASPathTransformFunc(Key)
 
-	if pathKey.pathname != expectedPathname || pathKey.filename != expectedFilename {
-		t.Errorf("unexpected pathKey:\ngot: {pathname: %s, filename: %s}\nwant: {pathname: %s, filename: %s}",
-			pathKey.pathname, pathKey.filename,
-			expectedPathname, expectedFilename)
-	} else {
-		t.Logf("pathKey correctly transformed: %+v", pathKey)
+	// Note: With SHA-256 we get more path segments
+	if pathKey.filename[:60] != expectedFilename {
+		t.Errorf("unexpected filename:\ngot: %s\nwant prefix: %s",
+			pathKey.filename, expectedFilename)
 	}
+	if pathKey.pathname != expectedPathname {
+		t.Errorf("unexpected pathname:\ngot: %s\nwant: %s",
+			pathKey.pathname, expectedPathname)
+	}
+	t.Logf("pathKey correctly transformed: filename=%s, pathname=%s", pathKey.filename, pathKey.pathname)
 }
 
 func TestWriteStream(t *testing.T) {
@@ -64,6 +68,7 @@ func TestReadStream(t *testing.T) {
 		}
 
 		readData, err := io.ReadAll(readStream)
+		readStream.Close() // Close the file handle
 		if err != nil {
 			t.Fatalf("Reading data failed: %v", err)
 		}

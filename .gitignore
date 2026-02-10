@@ -1,0 +1,26 @@
+# Environment files (contain secrets!)
+.env
+
+# TLS certificates (auto-generated)
+.certs/
+
+# Binary outputs
+bin/
+*.exe
+
+# Go build cache
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data directories (created at runtime)
+*_network/
+*_metadata.json

@@ -1,9 +1,8 @@
 package Storage
 
 import (
-	"bytes"
 	"crypto/md5"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -63,7 +62,7 @@ func DefaultPathTransformFunc(key string) PathKey {
 }
 
 func CASPathTransformFunc(key string) PathKey {
-	hash := sha1.Sum([]byte(key))
+	hash := sha256.Sum256([]byte(key))
 	hashStr := hex.EncodeToString(hash[:])
 
 	blockSize := 5
@@ -86,7 +85,9 @@ func CASPathTransformFunc(key string) PathKey {
 	}
 }
 
-func (s *Store) ReadStream(key string) (int64, io.Reader, error) {
+// ReadStream returns a reader for the file content.
+// IMPORTANT: The returned io.ReadCloser MUST be closed by the caller.
+func (s *Store) ReadStream(key string) (int64, io.ReadCloser, error) {
 	meta, ok := s.structOpts.Metadata.Get(key)
 	if !ok {
 		return 0, nil, os.ErrNotExist
@@ -96,19 +97,15 @@ func (s *Store) ReadStream(key string) (int64, io.Reader, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
+		file.Close()
 		return 0, nil, err
 	}
 
-	buf := new(bytes.Buffer)
-	if _, err := io.Copy(buf, file); err != nil {
-		return 0, nil, err
-	}
-
-	return info.Size(), buf, nil
+	// Return the file handle directly - caller must close it
+	return info.Size(), file, nil
 }
 
 func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
@@ -127,61 +124,63 @@ func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
 		return 0, err
 	}
 
-	// Read all data into buffer
-	buf := new(bytes.Buffer)
-	log.Println("WRITE_STREAM: Copying data into buffer")
-	_, err = io.Copy(buf, r)
+	// Create a temporary file to stream data to
+	tempFile, err := os.CreateTemp(fullPath, "temp-*")
 	if err != nil {
-		log.Printf("WRITE_STREAM: Error while copying data to buffer: %v", err)
+		log.Printf("WRITE_STREAM: Failed to create temp file: %v", err)
 		return 0, err
 	}
-	log.Printf("WRITE_STREAM: Data copied into buffer (%d bytes)", buf.Len())
+	tempPath := tempFile.Name()
 
-	// Calculate hash
-	hash := md5.Sum(buf.Bytes())
-	hashStr := hex.EncodeToString(hash[:])
+	// Ensure cleanup on error
+	defer func() {
+		tempFile.Close()
+		// Remove temp file if it still exists (wasn't renamed)
+		os.Remove(tempPath)
+	}()
+
+	// Create MD5 hasher for content-addressing
+	hasher := md5.New()
+
+	// TeeReader: reads from r, writes to hasher, returns data for file write
+	teeReader := io.TeeReader(r, hasher)
+
+	// Stream directly to temp file while computing hash
+	log.Println("WRITE_STREAM: Streaming data to temp file while computing hash...")
+	n, err := io.Copy(tempFile, teeReader)
+	if err != nil {
+		log.Printf("WRITE_STREAM: Failed to write to temp file: %v", err)
+		return 0, err
+	}
+	log.Printf("WRITE_STREAM: Successfully streamed %d bytes", n)
+
+	// Get the computed hash
+	hashBytes := hasher.Sum(nil)
+	hashStr := hex.EncodeToString(hashBytes)
 	pathKey.filename = hashStr
 	log.Printf("WRITE_STREAM: Calculated MD5 hash: %s", hashStr)
 
-	// Final file path
+	// Close temp file before rename
+	if err := tempFile.Close(); err != nil {
+		log.Printf("WRITE_STREAM: Failed to close temp file: %v", err)
+		return 0, err
+	}
+
+	// Final file path (content-addressed)
 	finalPath := filepath.Join(fullPath, pathKey.filename)
 	log.Printf("WRITE_STREAM: Final path for file: %s", finalPath)
 
-	// Create file
-	f, err := os.Create(finalPath)
-	if err != nil {
-		log.Printf("WRITE_STREAM: Failed to create file: %v", err)
+	// Rename temp file to final content-addressed path
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		log.Printf("WRITE_STREAM: Failed to rename temp file: %v", err)
 		return 0, err
 	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil {
-			log.Printf("WRITE_STREAM: Warning - failed to close file: %v", cerr)
-		}
-	}()
-	log.Println("WRITE_STREAM: File created successfully")
+	log.Println("WRITE_STREAM: File renamed successfully")
 
-	// Write buffer to file
-	log.Println("WRITE_STREAM: Writing buffer data to file")
-	n, err := io.Copy(f, buf)
-	if err != nil {
-		log.Printf("WRITE_STREAM: Failed to write to file: %v", err)
-		return 0, err
-	}
-	log.Printf("WRITE_STREAM: Successfully wrote %d bytes to file", n)
-
-	// Get and update metadata
-	log.Printf("WRITE_STREAM: Fetching metadata for key: %s", key)
-	fm, ok := s.structOpts.Metadata.Get(key)
-	if !ok {
-		log.Printf("WRITE_STREAM: Metadata for key '%s' does not exist. Creating new metadata entry.", key)
-		fm := FileMeta{}
-		if err := s.structOpts.Metadata.Set(key, fm); err != nil {
-			return 0, err
-		}
-	}
-
+	// Update metadata
+	log.Printf("WRITE_STREAM: Updating metadata for key: %s", key)
+	fm, _ := s.structOpts.Metadata.Get(key)
 	fm.Path = finalPath
-	log.Printf("WRITE_STREAM: Setting file path in metadata: %s", finalPath)
 
 	if err := s.structOpts.Metadata.Set(key, fm); err != nil {
 		log.Printf("WRITE_STREAM: Failed to update metadata: %v", err)

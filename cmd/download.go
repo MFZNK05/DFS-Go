@@ -8,8 +8,7 @@ import (
 
 var (
 	downloadKey string
-	//	downloadPort string
-	outputFile string // New flag for output file
+	outputFile  string
 )
 
 var downloadCmd = &cobra.Command{
@@ -26,13 +25,8 @@ var downloadCmd = &cobra.Command{
 }
 
 func init() {
-	// Add flags with shorthand versions
 	downloadCmd.Flags().StringVarP(&downloadKey, "key", "k", "", "Key to retrieve the file (required)")
-	//downloadCmd.Flags().StringVarP(&downloadPort, "port", "p", ":4000", "Port to run this peer on")
-	downloadCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file (default prints to stdout)")
-
-	// Mark required flags
+	downloadCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path (required)")
 	downloadCmd.MarkFlagRequired("key")
-
 	rootCmd.AddCommand(downloadCmd)
 }

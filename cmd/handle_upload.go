@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	//internal "github.com/Faizan2005/DFS-Go/internal"
 )
 
 func UploadFile(key, filePath string) error {

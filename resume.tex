@@ -1,0 +1,238 @@
+\documentclass[a4paper,9pt]{extarticle} % Reduced font size for single page
+
+\usepackage{fontspec} % For loading fonts
+% Ensure these font files are in the specified path or accessible by your LaTeX distribution
+\setmainfont[Path = ./Ubuntu/,
+             Extension = .ttf,
+             UprightFont = *-Regular,
+             BoldFont = *-Bold,
+             ItalicFont = *-Italic,
+             SmallCapsFont = *-Medium]
+            {Ubuntu}
+\usepackage{fontawesome} % For font awesome icons (make sure fontawesome-webfont.ttf is accessible)
+
+\usepackage{color}
+\definecolor{primary}{rgb}{0.4, 0, 0.1}
+\definecolor{secondary}{rgb}{0, 0, 0} % This color is defined but not used in your provided code.
+
+\usepackage{xunicode,xltxtra,url,parskip} % Formatting packages
+\usepackage[usenames,dvipsnames]{xcolor} % Required for specifying custom colors
+
+\usepackage{geometry}
+\geometry{a4paper,
+  left=0.40cm,
+  right=0.40cm,
+  top=0.3cm,   % Further reduced top margin to 0.5cm
+  bottom=0.40cm
+}
+
+\usepackage{hyperref} % Required for adding links and customizing them
+\definecolor{linkcolour}{rgb}{0,0.4,0.5} % Link color
+\hypersetup{colorlinks,breaklinks,urlcolor=linkcolour,linkcolor=linkcolour} % Set link colors throughout the document
+
+\usepackage{titlesec} % Used to customize the \section command
+\titleformat{\section}{\large\scshape\raggedright}{}{0em}{}[\titlerule] % Text formatting of sections
+\titlespacing{\section}{0pt}{0.25cm}{0.12cm} % Uniform section spacing
+
+\usepackage{multicol}
+\setlength{\columnsep}{0.5cm} % Adjusted column separation for better visual balance
+
+\usepackage{tabularx}
+\usepackage{textcomp} % Provides additional text symbols
+\usepackage{enumitem} % For list customization
+
+% Global settings for description and itemize to make them more compact
+\setlist[description]{%
+  topsep=2pt, % Space before start of list (reduced from 4pt to 2pt)
+  itemsep=0pt, % Reduced space between main description items (each project)
+  parsep=0pt,  % Space between paragraphs within a description item
+  font=$\bullet$\hspace{2mm}\normalsize, % Your bullet style
+  leftmargin=0em, % No intrinsic left margin for the description label itself
+  labelsep=0.5em, % Space between the label (bullet) and the text for description items
+  align=left % Ensure description labels align left
+}
+\setlist[itemize]{itemsep=0pt, topsep=0pt, parsep=0pt, partopsep=0pt} % For nested itemize lists
+
+
+\def\arraystretch{1}
+\renewcommand{\baselinestretch}{1.05}
+
+\begin{document}
+
+\pagestyle{empty} % Removes page numbering
+
+%----------------------------------------------------------------------------------------
+% NAME AND CONTACT INFORMATION
+%----------------------------------------------------------------------------------------
+\begin{multicols}{3}
+\normalsize \faGithub\ {\href{https://github.com/MFZNK05}{\ GitHub}}\\
+\columnbreak
+\normalsize\par{\centering{\huge\textsc{\textcolor{primary}{Mohd Faizan Khan}}}\par}
+\par{\centering\normalsize {\textsc{Jodhpur, India}}\hfill\par}
+\columnbreak
+\raggedright\hfill\normalsize \faEnvelope\ {\href{mailto:mfaizankhaniitkgp@gmail.com}{\ mfaizankhaniitkgp@gmail.com}}\\ % Changed to mailto: for email link
+\raggedright\hfill\normalsize \faLinkedinSquare\ {\href{https://www.linkedin.com/in/faizan-khan-944181290/}{\ LinkedIn}}\\
+\end{multicols}
+\vspace{-0.85 cm} % Adjusted space before Education
+
+%----------------------------------------------------------------------------------------
+% EDUCATION
+%----------------------------------------------------------------------------------------
+\section{\textcolor{primary}{Education}}
+
+\begin{tabularx}{\linewidth}{@{} l X l r @{}}
+\textbf{2023-2028} & \textbf{B.Tech + M.Tech}, Agricultural and Food Engineering & \makebox[4.5cm][l]{\textbf{IIT Kharagpur}} & \textbf{8.16/10} \\
+& \textbf{Minor}: Computer Science and Engineering & & \\
+& \textbf{Micro-specialization}: Artificial Intelligence & & \\
+\textbf{2023} & \textbf{Class XII} & \makebox[4.5cm][l]{\textbf{Kalyani Public School}} & \textbf{90.40\%} \\
+\textbf{2021} & \textbf{Class X} & \makebox[4.5cm][l]{\textbf{APS Kaluchak}} & \textbf{96.80\%} \\
+\end{tabularx}
+
+%----------------------------------------------------------------------------------------
+% SKILLS
+%----------------------------------------------------------------------------------------
+\vspace{0.0cm}
+\section{\textcolor{primary}{Technical Skills}}
+\vspace{0.05cm}
+\begin{tabular}{r|p{15cm}}
+\textsc{Languages} & Golang, Python, JavaScript, TypeScript, C/C++, HTML, CSS \\
+\textsc{Frameworks} & Go-Fiber, Node.js, Express.js, React, Django, NestJS \\
+\textsc{Networking} & ns-3, TCP/IP, Socket Programming, IEEE 802.11k/v, Wireshark, Network Protocols \\
+\textsc{Others} & PostgreSQL, MongoDB, Docker, Kafka, Nginx, Git, GitHub, RESTful APIs, WebSockets
+\end{tabular}
+
+%----------------------------------------------------------------------------------------
+% INTERNSHIPS
+%----------------------------------------------------------------------------------------
+\vspace{0.0cm}
+\section{\textcolor{primary}{Internships}}
+\vspace{0.02cm}
+
+\begin{description}
+
+  \item[{Research Intern | Deakin University | Prof. Ye Zhu, School of Information Technology} \hfill]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Built an \textbf{MCP client–server} architecture (\texttt{stdio}, \texttt{HTTP/SSE}) integrating \textbf{open-source LLMs} for secure agent communication.
+    \item Executed \textbf{prompt injection}, \textbf{tool misuse}, and \textbf{role-based privacy attacks} on remote GPU servers; achieved \textbf{85\%+ attack success rate}.
+    \item Designed a \textbf{retrieval pipeline} with \textbf{vectorized data} to simulate data leakage via deceptive queries across \textbf{3 LLM architectures}.
+    \item Benchmarked robustness metrics for protocol hardening, anomaly detection, and cryptographic validation across \textbf{500+ test cases}.
+  \end{itemize}
+  \vspace{0.1cm}
+
+  \item[{Web Development Intern | Avijo} \hfill Sept'25 - Nov'25]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Integrated \textbf{5+ third-party APIs} (govt. and non-govt. healthcare sources) into Avijo's platform, reducing data fetch latency by \textbf{40\%}.
+    \item Developed and tested \textbf{12+ RESTful API endpoints} for doctor workspace supporting patient, appointment, and service management.
+    \item Built \textbf{MongoDB} aggregation pipelines and contributed to \textbf{React.js} frontend components for seamless user experience.
+  \end{itemize}
+
+\end{description}
+
+\vspace{0.0cm}
+\section{\textcolor{primary}{Projects}}
+\vspace{0.05cm}
+
+\begin{description}
+
+\item[{Client-Side WiFi RRM | ns-3, C++, Kafka, IEEE 802.11k/v}]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Engineered \textbf{20+ custom ns-3 modules} for \textbf{client-centric Radio Resource Management}, shifting intelligence from AP to STA layer.
+    \item Pioneered \textbf{IEEE 802.11k/v protocol stack} with BSS Transition Management, Neighbor Reports, and Link/Beacon measurement frames.
+    \item Architected \textbf{real-time Kafka pipeline} for spectrum analytics; simulated \textbf{RF interference} from microwave, Zigbee, and BLE devices.
+    \item Designed \textbf{ML-ready channel/power scoring} with SNR, utilization, and interference metrics; enabled \textbf{seamless auto-roaming} across APs.
+  \end{itemize}
+  \vspace{0.1cm}
+
+\item[{\href{https://github.com/MFZNK05/Atlas}{Atlas} | Hybrid L4/L7 Load Balancer} | Golang, Docker]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Engineered \textbf{production-grade hybrid L4/L7 load balancer} using \textbf{Strategy Pattern} for hot-swappable algorithm selection at runtime.
+    \item Implemented \textbf{5 load balancing algorithms} including \textbf{IP Hash (FNV-1a)} for sticky sessions and \textbf{Weighted Least Connections}.
+    \item Designed \textbf{Adapter Pattern} abstracting L4/L7 pools; built \textbf{intelligent auto-selection} that adapts algorithms to real-time load patterns.
+    \item Enabled \textbf{content-aware routing} with URL path matching and cookie-based affinity across isolated static, dynamic, and session pools.
+  \end{itemize}
+  \vspace{0.1cm}
+
+\item[{\href{https://github.com/MFZNK05/DFS-Go}{DFS-Go} | Distributed File Storage} | Golang, TCP]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Engineered \textbf{decentralized P2P file storage} with \textbf{content-addressable storage (CAS)} enabling automatic deduplication via SHA-1.
+    \item Implemented \textbf{military-grade AES-GCM encryption} with \textbf{two-layer key derivation}; designed custom \textbf{TCP streaming protocol}.
+    \item Architected \textbf{Unix socket IPC} for client-daemon separation; built \textbf{concurrent peer orchestration} with persistent metadata sync.
+    \item Enabled \textbf{fault-tolerant replication} with automatic file propagation and recovery across dynamically scaling node clusters.
+  \end{itemize}
+  \vspace{0.1cm}
+
+\item[{\href{https://github.com/MFZNK05/WebSocket_Raw}{RFC 6455 WebSocket Server}} | Node.js, TCP]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Built \textbf{RFC 6455 WebSocket protocol from scratch}—zero external libraries—mastering low-level \textbf{HTTP upgrade} and frame mechanics.
+    \item Engineered \textbf{variable-length frame parser} handling 7-bit, 16-bit, and 64-bit payloads with proper boundary detection and buffering.
+    \item Implemented \textbf{cryptographic frame masking/unmasking} via 4-byte XOR key rotation; ensured full compliance with IETF specification.
+    \item Enabled \textbf{real-time bidirectional communication} with JSON serialization, opcode dispatch, and graceful connection lifecycle handling.
+  \end{itemize}
+  \vspace{0.1cm}
+
+\item[{\href{https://github.com/MFZNK05/StockMarketTrackingApp}{Stock Market Tracker}} | Node.js, PostgreSQL, Redis, WebSocket]
+  \mbox{}\newline
+  \vspace{-0.35cm}
+  \begin{itemize}
+    \item Architected \textbf{real-time trading dashboard} ingesting live market data via \textbf{Finnhub WebSocket}; \textbf{sub-second latency} to clients.
+    \item Designed \textbf{high-performance caching} with Redis and \textbf{optimized PostgreSQL connection pooling} for concurrent user sessions.
+    \item Implemented \textbf{enterprise-grade auth}: Google OAuth 2.0 + Passport.js with \textbf{JWT tokens} in HTTP-only secure cookies.
+    \item Built \textbf{event-driven data pipeline}: Finnhub WS → Redis → Socket.IO fan-out; tracks \textbf{stocks and cryptocurrencies} in real-time.
+  \end{itemize}
+
+\end{description}
+
+% ----------------------------------------------------------------------------------------
+% Contributions
+% ----------------------------------------------------------------------------------------
+\vspace{-0.05cm}
+\section{\textcolor{primary}{Open-Source Contributions}}
+\vspace{0.05cm}
+
+\begin{itemize}[leftmargin=0.55cm, rightmargin=0.2cm, label={\Large\textbullet}, itemsep=1pt]
+\item \textbf{WIMP (Where is My Professor)} | Python, BeautifulSoup — Contributed web scraping and API integration for professor schedule tracking.
+\item \textbf{Kharagpur Winter of Code '24 Website} | Golang, TypeScript — Contributed to the official KWoC '24 event website development.
+\end{itemize}
+
+%----------------------------------------------------------------------------------------
+% COMPETITIONS
+%----------------------------------------------------------------------------------------
+\vspace{0.0cm}
+\section{\textcolor{primary}{Competitions}}
+\vspace{0.05cm}
+
+\begin{itemize}[leftmargin=0.55cm, rightmargin=0.2cm, label={\Large\textbullet}, itemsep=1pt]
+
+\item \textbf{Inter-IIT Tech Meet 14.0 | Gold | Arista Networks: Client-Centric WiFi RRM} — Represented IIT Kharagpur at Inter-IIT Tech Meet 14.0; competed among all IITs and secured \textbf{1st place (Gold)} in Arista Networks’ Client-Centric WiFi RRM Problem Statement.
+
+\item \textbf{Open-IIT Tech | Silver | Data Analytics} — Secured \textbf{Silver} in inter-hostel Data Analytics competition at IIT Kharagpur.
+
+\end{itemize}
+
+%----------------------------------------------------------------------------------------
+% EXTRA CURRICULAR
+%----------------------------------------------------------------------------------------
+\vspace{0.0cm}
+\section{\textcolor{primary}{Extra-Curricular Activities}}
+\vspace{0.05cm}
+
+\begin{itemize}[leftmargin=0cm, rightmargin=0.2cm, label={\Large\textbullet}, itemsep=1pt]
+\item \textbf{Executive | Kharagpur Open Source Society (KOSS)} \hfill Jul'25 - Present \\
+\hspace*{0.35cm} Organized workshops on Git/GitHub, Linux, CTFs, GSoC; led \textbf{KWoC '24} mentorship program for open-source contributions.
+
+\item \textbf{Student Member | Students' International Relations Cell, IIT Kharagpur} \hfill Jan'24 - Jul'25 \\
+\hspace*{0.35cm} Facilitated \textbf{285+} foreign internship offers and secured \textbf{₹12.72M} funding; contributed to IITKGP's \textbf{QS Rank 222 (49-rank jump)}.
+\end{itemize}
+\end{document}
