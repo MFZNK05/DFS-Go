@@ -15,26 +15,29 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/Faizan2005/DFS-Go/Cluster/hashring"
 	crypto "github.com/Faizan2005/DFS-Go/Crypto"
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
 	storage "github.com/Faizan2005/DFS-Go/Storage"
 )
 
 type ServerOpts struct {
-	storageRoot    string
-	pathTransform  storage.PathTransform
-	tcpTransport   peer2peer.TCPTransport
-	metaData       storage.MetadataStore
-	bootstrapNodes []string
-	Encryption     *crypto.EncryptionService
+	storageRoot       string
+	pathTransform     storage.PathTransform
+	tcpTransport      *peer2peer.TCPTransport
+	metaData          storage.MetadataStore
+	bootstrapNodes    []string
+	Encryption        *crypto.EncryptionService
+	ReplicationFactor int
 }
 
 type Server struct {
-	peerLock sync.Mutex
+	peerLock sync.RWMutex
 	peers    map[string]peer2peer.Peer
 
 	serverOpts  ServerOpts
 	Store       *storage.Store
+	HashRing    *hashring.HashRing
 	quitch      chan struct{}
 	pendingFile map[string]chan io.Reader
 	mu          sync.Mutex
@@ -45,8 +48,9 @@ type Message struct {
 }
 
 type MessageStoreFile struct {
-	Key  string
-	Size int64
+	Key          string
+	Size         int64
+	EncryptedKey string
 }
 
 type MessageGetFile struct {
@@ -66,18 +70,36 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 			log.Printf("GET_DATA: Failed to read file from local disk for key '%s': %v", key, err)
 			return nil, err
 		}
-		// Note: Caller is responsible for closing if r is io.ReadCloser
-		// For now, read into buffer since we return io.Reader
-		buf := new(bytes.Buffer)
-		if _, err := io.Copy(buf, r); err != nil {
-			r.Close()
-			return nil, err
+		defer r.Close()
+
+		// Look up the encrypted key from metadata for decryption
+		fm, ok := s.serverOpts.metaData.Get(key)
+		if !ok {
+			return nil, fmt.Errorf("metadata not found for key '%s'", key)
 		}
-		r.Close()
-		return buf, nil
+
+		decodedKey, err := hex.DecodeString(fm.EncryptedKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode encrypted key for '%s': %w", key, err)
+		}
+
+		// Decrypt the file before returning
+		var decryptedBuf bytes.Buffer
+		if err := s.serverOpts.Encryption.DecryptStream(r, &decryptedBuf, decodedKey); err != nil {
+			return nil, fmt.Errorf("failed to decrypt file for key '%s': %w", key, err)
+		}
+
+		return &decryptedBuf, nil
 	}
 
 	log.Printf("GET_DATA: File for key '%s' not found on local disk. Requesting from peers...", key)
+
+	// Use consistent hashing to find which nodes should have this key
+	selfAddr := s.serverOpts.tcpTransport.Addr()
+	replFactor := s.HashRing.ReplicationFactor()
+	targetNodes := s.HashRing.GetNodes(key, replFactor)
+
+	log.Printf("GET_DATA: Hash ring targets for key '%s': %v", key, targetNodes)
 
 	ch := make(chan io.Reader, 1)
 
@@ -85,16 +107,51 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	s.pendingFile[key] = ch
 	s.mu.Unlock()
 
-	p := &Message{
+	// Send get request only to target nodes (not broadcast)
+	getMsg := &Message{
 		Payload: MessageGetFile{
 			Key: key,
 		},
 	}
 
-	if err := s.Broadcast(*p); err != nil {
-		log.Printf("GET_DATA: Broadcast to peers failed for key '%s': %v", key, err)
-
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(getMsg); err != nil {
+		s.mu.Lock()
+		delete(s.pendingFile, key)
+		s.mu.Unlock()
 		return nil, err
+	}
+	msgBytes := buf.Bytes()
+
+	s.peerLock.RLock()
+	sent := 0
+	for _, nodeAddr := range targetNodes {
+		if nodeAddr == selfAddr {
+			continue
+		}
+		peer, ok := s.peers[nodeAddr]
+		if !ok {
+			log.Printf("GET_DATA: Target node %s not connected, skipping", nodeAddr)
+			continue
+		}
+		if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
+			log.Printf("GET_DATA: Failed to send control byte to %s: %v", nodeAddr, err)
+			continue
+		}
+		if err := peer.Send(msgBytes); err != nil {
+			log.Printf("GET_DATA: Failed to send get message to %s: %v", nodeAddr, err)
+			continue
+		}
+		sent++
+		log.Printf("GET_DATA: Sent get request to %s", nodeAddr)
+	}
+	s.peerLock.RUnlock()
+
+	if sent == 0 {
+		s.mu.Lock()
+		delete(s.pendingFile, key)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("no reachable peers for key '%s'", key)
 	}
 
 	// Wait for response with timeout (instead of blocking forever)
@@ -180,30 +237,55 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	}
 	log.Printf("STORE_DATA: Local storage successful (%d bytes)", fs)
 
-	// Broadcast metadata info
-	p := &Message{
+	// Use consistent hashing to determine which nodes should store this key
+	selfAddr := s.serverOpts.tcpTransport.Addr()
+	replFactor := s.HashRing.ReplicationFactor()
+	targetNodes := s.HashRing.GetNodes(key, replFactor)
+
+	log.Printf("STORE_DATA: Hash ring targets for key '%s' (N=%d): %v", key, replFactor, targetNodes)
+
+	// Filter to only remote peers (exclude self)
+	s.peerLock.RLock()
+	var targetPeers []struct {
+		addr string
+		peer peer2peer.Peer
+	}
+	for _, nodeAddr := range targetNodes {
+		if nodeAddr == selfAddr {
+			continue // we already stored locally
+		}
+		if p, ok := s.peers[nodeAddr]; ok {
+			targetPeers = append(targetPeers, struct {
+				addr string
+				peer peer2peer.Peer
+			}{nodeAddr, p})
+		} else {
+			log.Printf("STORE_DATA: Target node %s not connected, skipping", nodeAddr)
+		}
+	}
+	s.peerLock.RUnlock()
+
+	if len(targetPeers) == 0 {
+		log.Println("STORE_DATA: No remote peers to replicate to")
+		return nil
+	}
+
+	// Send store message to target peers
+	encKeyHex := hex.EncodeToString(encryptedKey)
+	msg := &Message{
 		Payload: MessageStoreFile{
-			Key:  key,
-			Size: encryptedSize,
+			Key:          key,
+			Size:         encryptedSize,
+			EncryptedKey: encKeyHex,
 		},
 	}
 
-	log.Println("STORE_DATA: Broadcasting store message...")
-	if err := s.Broadcast(*p); err != nil {
-		log.Println("STORE_DATA: Broadcast failed:", err)
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+		log.Println("STORE_DATA: Failed to encode store message:", err)
 		return err
 	}
-
-	time.Sleep(time.Millisecond * 50)
-	log.Println("STORE_DATA: Starting peer distribution...")
-
-	// Copy peers while holding lock to avoid race condition
-	s.peerLock.Lock()
-	peersCopy := make(map[string]peer2peer.Peer, len(s.peers))
-	for addr, peer := range s.peers {
-		peersCopy[addr] = peer
-	}
-	s.peerLock.Unlock()
+	msgBytes := buf.Bytes()
 
 	// Seek temp file back to start for peer distribution
 	if _, err := tempFile.Seek(0, 0); err != nil {
@@ -211,44 +293,53 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		return err
 	}
 
-	// Read encrypted data for peer distribution
-	// Note: We need to buffer here since we send to multiple peers
-	// TODO: Future optimization - stream from local storage instead
+	// Buffer encrypted data for parallel sends
 	encryptedData, err := io.ReadAll(tempFile)
 	if err != nil {
 		log.Println("STORE_DATA: Failed to read encrypted data:", err)
 		return err
 	}
 
-	// Now send encrypted data to peers IN PARALLEL
-	var wg sync.WaitGroup
+	log.Printf("STORE_DATA: Replicating to %d target peers...", len(targetPeers))
 
-	for addr, peer := range peersCopy {
+	var wg sync.WaitGroup
+	for _, tp := range targetPeers {
 		wg.Add(1)
 		go func(addr string, p peer2peer.Peer) {
 			defer wg.Done()
 
-			log.Printf("STORE_DATA: [Parallel] Sending to peer %s", addr)
+			log.Printf("STORE_DATA: [Replicate] Sending to peer %s", addr)
 
+			// Send control byte + gob message
+			if err := p.Send([]byte{peer2peer.IncomingMessage}); err != nil {
+				log.Printf("STORE_DATA: [Replicate] Failed to send control byte to %s: %v", addr, err)
+				return
+			}
+			if err := p.Send(msgBytes); err != nil {
+				log.Printf("STORE_DATA: [Replicate] Failed to send message to %s: %v", addr, err)
+				return
+			}
+
+			time.Sleep(time.Millisecond * 50)
+
+			// Send stream signal + encrypted data
 			if err := p.Send([]byte{peer2peer.IncomingStream}); err != nil {
-				log.Printf("STORE_DATA: [Parallel] Failed to signal stream to %s: %v", addr, err)
+				log.Printf("STORE_DATA: [Replicate] Failed to signal stream to %s: %v", addr, err)
 				return
 			}
 
 			n, err := io.Copy(p, bytes.NewReader(encryptedData))
 			if err != nil {
-				log.Printf("STORE_DATA: [Parallel] Failed to send data to %s: %v", addr, err)
+				log.Printf("STORE_DATA: [Replicate] Failed to send data to %s: %v", addr, err)
 				return
 			}
 
-			log.Printf("STORE_DATA: [Parallel] Successfully sent %d bytes to %s", n, addr)
-		}(addr, peer)
+			log.Printf("STORE_DATA: [Replicate] Successfully sent %d bytes to %s", n, addr)
+		}(tp.addr, tp.peer)
 	}
 
-	// Wait for all peer distributions to complete
 	wg.Wait()
-
-	log.Println("STORE_DATA: Completed parallel peer distribution")
+	log.Printf("STORE_DATA: Replication complete for key '%s'", key)
 	return nil
 }
 
@@ -271,23 +362,30 @@ func (s *Server) Broadcast(d Message) error {
 
 	log.Printf("[Broadcast] Broadcasting message to %d peers\n", len(peersCopy))
 
+	var errs []error
 	for addr, peer := range peersCopy {
 		log.Printf("[Broadcast] Sending message to peer: %s\n", addr)
 
 		err := peer.Send([]byte{peer2peer.IncomingMessage})
 		if err != nil {
-			return err
+			log.Printf("[Broadcast] Error sending control byte to %s: %v\n", addr, err)
+			errs = append(errs, fmt.Errorf("peer %s: %w", addr, err))
+			continue
 		}
 
 		if err := peer.Send(buf.Bytes()); err != nil {
 			log.Printf("[Broadcast] Error sending actual message to %s: %v\n", addr, err)
-			return err
+			errs = append(errs, fmt.Errorf("peer %s: %w", addr, err))
+			continue
 		}
 
 		log.Printf("[Broadcast] Successfully sent message to %s\n", addr)
 	}
 
 	log.Println("[Broadcast] Message broadcast complete")
+	if len(errs) > 0 {
+		return fmt.Errorf("broadcast failed for %d/%d peers: %v", len(errs), len(peersCopy), errs[0])
+	}
 	return nil
 }
 
@@ -298,10 +396,18 @@ func NewServer(opts ServerOpts) *Server {
 		Root:              opts.storageRoot,
 	}
 
+	replFactor := opts.ReplicationFactor
+	if replFactor <= 0 {
+		replFactor = hashring.DefaultReplicationFactor
+	}
+
 	return &Server{
-		peers:       map[string]peer2peer.Peer{},
-		serverOpts:  opts,
-		Store:       storage.NewStore(StoreOpts),
+		peers:      map[string]peer2peer.Peer{},
+		serverOpts: opts,
+		Store:      storage.NewStore(StoreOpts),
+		HashRing: hashring.New(&hashring.Config{
+			ReplicationFactor: replFactor,
+		}),
 		quitch:      make(chan struct{}),
 		pendingFile: make(map[string]chan io.Reader),
 	}
@@ -312,6 +418,11 @@ func (s *Server) Run() error {
 	if err != nil {
 		return err
 	}
+
+	// Add self to the hash ring so we participate in key ownership
+	selfAddr := s.serverOpts.tcpTransport.Addr()
+	s.HashRing.AddNode(selfAddr)
+	log.Printf("[Run] Added self (%s) to hash ring (replication factor: %d)", selfAddr, s.HashRing.ReplicationFactor())
 
 	if len(s.serverOpts.bootstrapNodes) != 0 {
 		err := s.BootstrapNetwork()
@@ -364,7 +475,7 @@ func (s *Server) loop() {
 
 			if err := s.handleMessage(RPC.From.String(), &message); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
-				return
+				continue
 			}
 
 		case <-s.quitch:
@@ -402,9 +513,11 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 	log.Printf("HANDLE_GET: Received file request for key '%s' from peer '%s'", msg.Key, from)
 
+	s.peerLock.RLock()
 	peer, ok := s.peers[from]
+	s.peerLock.RUnlock()
 	if !ok {
-		return os.ErrNotExist
+		return fmt.Errorf("peer (%s) not found", from)
 	}
 
 	fs, r, err := s.Store.ReadStream(msg.Key)
@@ -459,7 +572,9 @@ func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
 	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
 
+	s.peerLock.RLock()
 	peer, ok := s.peers[from]
+	s.peerLock.RUnlock()
 	if !ok {
 		err := fmt.Errorf("peer (%s) not found", from)
 		log.Println("HANDLE_STORE: Error:", err)
@@ -476,12 +591,26 @@ func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
 	log.Println("HANDLE_STORE: Closing stream...")
 	peer.CloseStream()
 
+	// Save the encrypted key to local metadata so this node can decrypt the file
+	if msg.EncryptedKey != "" {
+		if err := s.serverOpts.metaData.Set(msg.Key, storage.FileMeta{EncryptedKey: msg.EncryptedKey}); err != nil {
+			log.Printf("HANDLE_STORE: Failed to save metadata for key %s: %v", msg.Key, err)
+			return err
+		}
+	}
+
 	log.Printf("HANDLE_STORE: Successfully stored [%d] bytes to %s from %s", n, msg.Key, from)
 	return nil
 }
 
 func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
-	peer := s.peers[from]
+	s.peerLock.RLock()
+	peer, ok := s.peers[from]
+	s.peerLock.RUnlock()
+	if !ok {
+		return fmt.Errorf("peer (%s) not found", from)
+	}
+
 	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer, msg.Size))
 	if err != nil {
 		log.Printf("HANDLE_LOCAL: Storage error from %s: %v", from, err)
@@ -541,20 +670,34 @@ func (s *Server) Stop() {
 	close(s.quitch)
 }
 
-func (s *Server) BootstrapNetwork() error {
-	for _, addr := range s.serverOpts.bootstrapNodes {
+func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
+	s.peerLock.Lock()
+	defer s.peerLock.Unlock()
 
+	addr := p.RemoteAddr().String()
+	delete(s.peers, addr)
+	s.HashRing.RemoveNode(addr)
+	log.Printf("[OnPeerDisconnect] Removed peer: %s (ring size: %d)\n", addr, s.HashRing.Size())
+}
+
+func (s *Server) BootstrapNetwork() error {
+	var wg sync.WaitGroup
+	for _, addr := range s.serverOpts.bootstrapNodes {
 		if addr == "" {
 			continue
 		}
-		go func() {
-			fmt.Println("attempting to connect with remote: ", addr)
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			log.Printf("[Bootstrap] Attempting to connect with remote: %s", addr)
 			if err := s.serverOpts.tcpTransport.Dial(addr); err != nil {
-				log.Println("Dial error:", err)
+				log.Printf("[Bootstrap] Failed to dial %s: %v", addr, err)
+			} else {
+				log.Printf("[Bootstrap] Successfully connected to %s", addr)
 			}
-		}()
+		}(addr)
 	}
-
+	wg.Wait()
 	return nil
 }
 
@@ -562,10 +705,10 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 	s.peerLock.Lock()
 	defer s.peerLock.Unlock()
 
-	addr := p.RemoteAddr()
-
-	s.peers[addr.String()] = p
-	log.Printf("[OnPeer] Connected with remote peer: %s\n", addr.String())
+	addr := p.RemoteAddr().String()
+	s.peers[addr] = p
+	s.HashRing.AddNode(addr)
+	log.Printf("[OnPeer] Connected with remote peer: %s (ring size: %d)\n", addr, s.HashRing.Size())
 	return nil
 }
 
@@ -575,7 +718,7 @@ func init() {
 	gob.Register(&MessageLocalFile{})
 }
 
-func MakeServer(listenAddr string, node ...string) *Server {
+func MakeServer(listenAddr string, replicationFactor int, node ...string) *Server {
 	metaPath := "_metadata.json"
 
 	// Load .env file (ignore error if not found - will use OS env vars)
@@ -640,18 +783,20 @@ func MakeServer(listenAddr string, node ...string) *Server {
 
 	tcpTransport := peer2peer.NewTCPTransport(tcpOpts)
 
-	s := &Server{} // create server first to use its OnPeer
-	tcpTransport.OnPeer = s.OnPeer
-
 	opts := ServerOpts{
-		pathTransform:  storage.CASPathTransformFunc,
-		tcpTransport:   *tcpTransport,
-		metaData:       storage.NewMetaFile(listenAddr + metaPath),
-		bootstrapNodes: node,
-		storageRoot:    listenAddr + "_network",
-		Encryption:     crypto.NewEncryptionService(EncryptionServiceKey),
+		pathTransform:     storage.CASPathTransformFunc,
+		tcpTransport:      tcpTransport,
+		metaData:          storage.NewMetaFile(listenAddr + metaPath),
+		bootstrapNodes:    node,
+		storageRoot:       listenAddr + "_network",
+		Encryption:        crypto.NewEncryptionService(EncryptionServiceKey),
+		ReplicationFactor: replicationFactor,
 	}
 
-	*s = *NewServer(opts)
+	s := NewServer(opts)
+	// Wire callbacks after server is fully constructed so they
+	// operate on the correct server instance's peers map.
+	tcpTransport.OnPeer = s.OnPeer
+	tcpTransport.OnPeerDisconnect = s.OnPeerDisconnect
 	return s
 }

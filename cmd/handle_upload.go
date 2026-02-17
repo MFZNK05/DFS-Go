@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -23,7 +24,7 @@ func UploadFile(key, filePath string) error {
 	req := map[string]string{
 		"action": "upload",
 		"key":    key,
-		"data":   string(data),
+		"data":   base64.StdEncoding.EncodeToString(data),
 	}
 
 	b, err := json.Marshal(req)

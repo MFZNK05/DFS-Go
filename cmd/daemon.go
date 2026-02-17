@@ -9,7 +9,7 @@ import (
 	serve "github.com/Faizan2005/DFS-Go/Server"
 )
 
-func StartDaemon(port string, peers []string) error {
+func StartDaemon(port string, peers []string, replicationFactor int) error {
 	socketPath := GetSocketPath()
 
 	_ = os.RemoveAll(socketPath)
@@ -21,7 +21,7 @@ func StartDaemon(port string, peers []string) error {
 
 	defer listener.Close()
 
-	server := serve.MakeServer(port, peers...)
+	server := serve.MakeServer(port, replicationFactor, peers...)
 	go server.Run()
 
 	fmt.Println("Daemon started at", socketPath)

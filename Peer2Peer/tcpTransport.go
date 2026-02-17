@@ -15,11 +15,12 @@ type TCPPeer struct {
 }
 
 type TCPTransportOpts struct {
-	ListenAddr    string
-	HandshakeFunc HandshakeFunc
-	Decoder       Decoder
-	OnPeer        func(Peer) error
-	TLSConfig     *tls.Config // Optional: if set, enables TLS
+	ListenAddr       string
+	HandshakeFunc    HandshakeFunc
+	Decoder          Decoder
+	OnPeer           func(Peer) error
+	OnPeerDisconnect func(Peer)
+	TLSConfig        *tls.Config // Optional: if set, enables TLS
 }
 
 type TCPTransport struct {
@@ -104,6 +105,9 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 	defer func() {
 		log.Printf("HANDLE_CONN: Closing connection from %s", conn.RemoteAddr())
+		if t.OnPeerDisconnect != nil {
+			t.OnPeerDisconnect(peer)
+		}
 		conn.Close()
 	}()
 
@@ -140,6 +144,8 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 
 			log.Println("HANDLE_CONN: Received stream signal")
 
+			msg.From = conn.RemoteAddr()
+			msg.Stream = true
 			t.rpcch <- msg
 
 			// Wait for stream to complete

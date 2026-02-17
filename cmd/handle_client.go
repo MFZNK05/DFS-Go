@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -19,15 +20,15 @@ type Request struct {
 func HandleClient(conn net.Conn, s *server.Server) {
 	defer conn.Close()
 
-	buff := make([]byte, 4096)
-	n, err := conn.Read(buff)
+	// Read the full request (no arbitrary size limit)
+	data, err := io.ReadAll(conn)
 	if err != nil {
 		log.Println("Error reading:", err)
 		return
 	}
 
 	req := new(Request)
-	err = json.Unmarshal(buff[:n], &req)
+	err = json.Unmarshal(data, &req)
 	if err != nil {
 		log.Println("Invalid request:", err)
 		return
@@ -35,8 +36,19 @@ func HandleClient(conn net.Conn, s *server.Server) {
 
 	switch req.Action {
 	case "upload":
-		reader := bytes.NewReader([]byte(req.Data))
-		s.StoreData(req.Key, reader)
+		// Decode base64-encoded file data to preserve binary content
+		fileData, err := base64.StdEncoding.DecodeString(req.Data)
+		if err != nil {
+			log.Println("Failed to decode upload data:", err)
+			conn.Write([]byte("error: failed to decode upload data: " + err.Error()))
+			return
+		}
+		reader := bytes.NewReader(fileData)
+		if err := s.StoreData(req.Key, reader); err != nil {
+			log.Println("StoreData failed:", err)
+			conn.Write([]byte("error: " + err.Error()))
+			return
+		}
 		conn.Write([]byte("uploaded\n"))
 	case "download":
 		data, err := s.GetData(req.Key)

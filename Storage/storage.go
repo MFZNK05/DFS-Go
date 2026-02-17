@@ -228,7 +228,7 @@ func NewMetaFile(path string) *MetaFile {
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &m.store)
 	} else {
-		_ = os.WriteFile(path, []byte("{}"), os.ModePerm)
+		_ = os.WriteFile(path, []byte("{}"), 0600)
 	}
 
 	return m
@@ -251,5 +251,5 @@ func (m *MetaFile) Set(key string, meta FileMeta) error {
 		return err
 	}
 
-	return os.WriteFile(m.path, data, os.ModePerm)
+	return os.WriteFile(m.path, data, 0600)
 }

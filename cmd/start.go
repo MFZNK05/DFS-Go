@@ -8,18 +8,20 @@ import (
 
 var port string
 var peers []string
+var replicationFactor int
 
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the DFS daemon server",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting daemon on", port)
-		return StartDaemon(port, peers)
+		return StartDaemon(port, peers, replicationFactor)
 	},
 }
 
 func init() {
 	startCmd.Flags().StringVar(&port, "port", ":3000", "Listening port for this node")
 	startCmd.Flags().StringSliceVar(&peers, "peer", []string{}, "Comma-separated list of peer addresses")
+	startCmd.Flags().IntVar(&replicationFactor, "replication", 3, "Number of replicas per file (default 3)")
 	rootCmd.AddCommand(startCmd)
 }
