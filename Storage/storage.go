@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 )
 
 const defaultRoot = "DFSNetworkRoot"
@@ -30,7 +32,11 @@ type StructOpts struct {
 
 type FileMeta struct {
 	Path         string
-	EncryptedKey string // Optional encrypted key (unused currently)
+	EncryptedKey string            // hex-encoded per-file AES key
+	VClock       map[string]uint64 // vector clock at time of write (Sprint 4)
+	Timestamp    int64             // UnixNano wall clock — LWW tiebreaker (Sprint 4)
+	Chunked      bool              // true when the file was split into chunks (Sprint 6)
+	Manifest     *chunker.ChunkManifest // non-nil iff Chunked == true (Sprint 6)
 }
 
 type PathKey struct {
@@ -42,6 +48,8 @@ type PathKey struct {
 type MetadataStore interface {
 	Get(key string) (FileMeta, bool)
 	Set(key string, meta FileMeta) error
+	GetManifest(fileKey string) (*chunker.ChunkManifest, bool)
+	SetManifest(fileKey string, manifest *chunker.ChunkManifest) error
 }
 
 func NewStore(opts StructOpts) *Store {
@@ -252,4 +260,35 @@ func (m *MetaFile) Set(key string, meta FileMeta) error {
 	}
 
 	return os.WriteFile(m.path, data, 0600)
+}
+
+// Keys returns all keys currently tracked in the metadata store.
+// Used by Rebalancer to enumerate locally-held files.
+func (m *MetaFile) Keys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	keys := make([]string, 0, len(m.store))
+	for k := range m.store {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// GetManifest returns the ChunkManifest for a chunked file, stored inline in
+// the FileMeta entry under the manifest storage key.
+func (m *MetaFile) GetManifest(fileKey string) (*chunker.ChunkManifest, bool) {
+	mkey := chunker.ManifestStorageKey(fileKey)
+	fm, ok := m.Get(mkey)
+	if !ok || fm.Manifest == nil {
+		return nil, false
+	}
+	return fm.Manifest, true
+}
+
+// SetManifest stores manifest in the metadata store under the manifest key for
+// fileKey. The manifest is serialised as part of the FileMeta JSON.
+func (m *MetaFile) SetManifest(fileKey string, manifest *chunker.ChunkManifest) error {
+	mkey := chunker.ManifestStorageKey(fileKey)
+	return m.Set(mkey, FileMeta{Manifest: manifest})
 }
