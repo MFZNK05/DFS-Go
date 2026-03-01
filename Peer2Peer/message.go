@@ -13,6 +13,7 @@ const (
 
 type RPC struct {
 	From     net.Addr
+	Peer     Peer            // direct reference to the sending peer; use this for stream I/O
 	Payload  []byte
 	Stream   bool
 	StreamWg *sync.WaitGroup // non-nil for stream RPCs; call Done() when finished reading

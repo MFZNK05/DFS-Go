@@ -153,6 +153,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			log.Println("HANDLE_CONN: Received stream signal")
 
 			msg.From = conn.RemoteAddr()
+			msg.Peer = peer
 			msg.Stream = true
 			msg.StreamWg = &streamWg
 			t.rpcch <- msg
@@ -168,6 +169,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 				return
 			}
 			msg.From = conn.RemoteAddr()
+			msg.Peer = peer
 			var streamWg sync.WaitGroup
 			streamWg.Add(1)
 			msg.Stream = true
@@ -185,6 +187,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 				return
 			}
 			msg.From = conn.RemoteAddr()
+			msg.Peer = peer
 			log.Printf("HANDLE_CONN: Forwarding regular message from %s", msg.From)
 			t.rpcch <- msg
 		}

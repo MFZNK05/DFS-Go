@@ -257,6 +257,11 @@ type HandoffService struct {
 	stopCh   chan struct{}
 	once     sync.Once
 	stopOnce sync.Once
+	// activeDeliveries prevents concurrent deliverPending calls for the same
+	// target address. Without this, a rapid reconnect-disconnect cycle causes
+	// two goroutines to read the same hint copies (pass-by-value), increment
+	// Attempts independently, and overwrite each other's progress.
+	activeDeliveries sync.Map // map[targetAddr]struct{}
 }
 
 // NewHandoffService creates a HandoffService backed by store.
@@ -284,11 +289,20 @@ func (hs *HandoffService) Stop() {
 
 // OnPeerReconnect is called by server.OnPeer when a peer reconnects.
 // It asynchronously delivers all pending hints for that address.
+// Only one delivery loop runs per address at a time — rapid reconnect events
+// are coalesced so concurrent goroutines don't overwrite each other's attempt counts.
 func (hs *HandoffService) OnPeerReconnect(addr string) {
 	if !hs.store.HasPending(addr) {
 		return
 	}
-	go hs.deliverPending(addr)
+	if _, alreadyActive := hs.activeDeliveries.LoadOrStore(addr, struct{}{}); alreadyActive {
+		log.Printf("[handoff] delivery already in progress for %s — skipping duplicate", addr)
+		return
+	}
+	go func() {
+		defer hs.activeDeliveries.Delete(addr)
+		hs.deliverPending(addr)
+	}()
 }
 
 // StoreHint records a hint for later delivery. Called from StoreData when a

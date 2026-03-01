@@ -134,7 +134,14 @@ func (gs *GossipService) gossipLoop() {
 
 // doGossipRound picks up to FanOut random peers and sends them a digest.
 func (gs *GossipService) doGossipRound() {
-	peers := gs.getPeers()
+	all := gs.getPeers()
+	// Filter out self — we should never gossip to our own address.
+	peers := all[:0]
+	for _, p := range all {
+		if p != gs.selfAddr {
+			peers = append(peers, p)
+		}
+	}
 	if len(peers) == 0 {
 		return
 	}
@@ -148,10 +155,23 @@ func (gs *GossipService) doGossipRound() {
 	}
 	targets := peers[:fanOut]
 
-	digest := gs.cluster.Digest()
+	// Only include entries for nodes we are directly connected to (plus self).
+	// This prevents phantom addresses — learned via third-party gossip but never
+	// directly reachable — from propagating across the cluster.
+	connectedSet := make(map[string]struct{}, len(peers)+1)
+	connectedSet[gs.selfAddr] = struct{}{}
+	for _, p := range peers {
+		connectedSet[p] = struct{}{}
+	}
+	var filtered []membership.GossipDigest
+	for _, d := range gs.cluster.Digest() {
+		if _, ok := connectedSet[d.Addr]; ok {
+			filtered = append(filtered, d)
+		}
+	}
 	msg := &MessageGossipDigest{
 		From:    gs.selfAddr,
-		Digests: digest,
+		Digests: filtered,
 	}
 
 	for _, target := range targets {
@@ -168,7 +188,11 @@ func (gs *GossipService) doGossipRound() {
 //
 // If the digest contains nodes we have never seen, we also call onNewPeer so
 // the server can open an outbound connection to them.
-func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest) {
+//
+// replyFn sends a message directly on the peer's connection, bypassing the
+// peers-map lookup. This avoids the ephemeral-vs-canonical address mismatch
+// that causes "peer not connected" errors after handleAnnounce remaps the key.
+func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, replyFn func(interface{}) error) {
 	// Record which addrs we already know BEFORE the merge so we can detect
 	// newly discovered nodes afterwards.
 	knownBefore := make(map[string]bool)
@@ -258,7 +282,7 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest) {
 		MyDigest: gs.cluster.Digest(),
 	}
 
-	if err := gs.sendMsg(from, resp); err != nil {
+	if err := replyFn(resp); err != nil {
 		log.Printf("[gossip] failed to send response to %s: %v", from, err)
 	}
 }

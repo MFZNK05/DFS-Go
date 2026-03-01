@@ -2,6 +2,7 @@ package rebalance
 
 import (
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/Faizan2005/DFS-Go/Cluster/hashring"
@@ -18,15 +19,25 @@ type SendFileFunc func(targetAddr, key, encKey string, data []byte) error
 // Returns the hex-encoded encrypted key and the raw encrypted bytes.
 type ReadFileFunc func(key string) (encKey string, data []byte, err error)
 
+// SendManifestFunc sends a ChunkManifest (already serialised as JSON) to a peer.
+// fileKey is the original file key (not the "manifest:" prefixed key).
+type SendManifestFunc func(targetAddr, fileKey string, manifestJSON []byte) error
+
+// ReadManifestFunc reads the JSON-serialised ChunkManifest for a chunked file.
+// Returns (nil, false) when the manifest is not held locally.
+type ReadManifestFunc func(fileKey string) (manifestJSON []byte, ok bool)
+
 // Rebalancer migrates data when the hash ring topology changes:
 //   - On node join:  keys the new node should own are copied to it.
 //   - On node leave: keys that now have fewer than N replicas are re-replicated.
 type Rebalancer struct {
-	selfAddr string
-	ring     *hashring.HashRing
-	meta     storage.MetadataStore
-	readFile ReadFileFunc
-	sendFile SendFileFunc
+	selfAddr     string
+	ring         *hashring.HashRing
+	meta         storage.MetadataStore
+	readFile     ReadFileFunc
+	sendFile     SendFileFunc
+	readManifest ReadManifestFunc
+	sendManifest SendManifestFunc
 
 	mu         sync.Mutex
 	inProgress bool
@@ -52,6 +63,13 @@ func New(
 	}
 }
 
+// SetManifestFuncs wires optional manifest read/send closures.
+// Call this after New() before the first OnNodeJoined fires.
+func (r *Rebalancer) SetManifestFuncs(read ReadManifestFunc, send SendManifestFunc) {
+	r.readManifest = read
+	r.sendManifest = send
+}
+
 // OnNodeJoined triggers key migration when a new node has been added to the ring.
 // It runs asynchronously so it doesn't block OnPeer.
 func (r *Rebalancer) OnNodeJoined(newAddr string) {
@@ -66,6 +84,7 @@ func (r *Rebalancer) OnNodeLeft(deadAddr string) {
 
 // migrateToNewNode scans all locally-held keys.
 // For each key where newAddr is now a responsible replica, it sends a copy there.
+// Manifest keys ("manifest:*") are sent via sendManifest when available.
 func (r *Rebalancer) migrateToNewNode(newAddr string) {
 	r.mu.Lock()
 	if r.inProgress {
@@ -98,6 +117,22 @@ func (r *Rebalancer) migrateToNewNode(newAddr string) {
 		}
 		if !contains(responsible, r.selfAddr) {
 			continue // we are not responsible either — not our job to migrate
+		}
+
+		// Manifest keys are metadata-only (no CAS file). Send via dedicated path.
+		if strings.HasPrefix(key, "manifest:") {
+			fileKey := strings.TrimPrefix(key, "manifest:")
+			if r.readManifest != nil && r.sendManifest != nil {
+				if data, ok := r.readManifest(fileKey); ok {
+					if err := r.sendManifest(newAddr, fileKey, data); err != nil {
+						log.Printf("[rebalance] failed to send manifest key=%s to %s: %v", fileKey, newAddr, err)
+					} else {
+						migrated++
+						log.Printf("[rebalance] migrated manifest key=%s to %s", fileKey, newAddr)
+					}
+				}
+			}
+			continue
 		}
 
 		encKey, data, err := r.readFile(key)

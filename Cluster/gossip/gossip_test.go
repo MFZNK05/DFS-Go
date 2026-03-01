@@ -73,7 +73,10 @@ func TestGossipConvergence3Nodes(t *testing.T) {
 
 	// Simulate: A sends its digest to B.
 	digestFromA := csA.Digest()
-	gsB.HandleDigest("A", &MessageGossipDigest{From: "A", Digests: digestFromA})
+	gsB.HandleDigest("A", &MessageGossipDigest{From: "A", Digests: digestFromA}, func(msg interface{}) error {
+		capture.send("A", msg)
+		return nil
+	})
 
 	// B should now know about C (applied from the response path — but HandleDigest
 	// only merges and sends a response. The response carries full NodeInfo back to A,
@@ -152,6 +155,9 @@ func TestHandleDigestRequestsFull(t *testing.T) {
 		Digests: []membership.GossipDigest{
 			{Addr: "stranger", State: membership.StateAlive, Generation: 1},
 		},
+	}, func(msg interface{}) error {
+		capture.send("peer1", msg)
+		return nil
 	})
 
 	// HandleDigest must send exactly one response back to "peer1".
@@ -193,7 +199,7 @@ func TestStaleDigestIgnored(t *testing.T) {
 		Digests: []membership.GossipDigest{
 			{Addr: "peer1", State: membership.StateAlive, Generation: 3},
 		},
-	})
+	}, func(msg interface{}) error { return nil })
 
 	n, _ := cs.GetNode("peer1")
 	if n.State != membership.StateDead {

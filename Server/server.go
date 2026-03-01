@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -60,6 +61,12 @@ type Server struct {
 	// dialingLock protects dialingSet — prevents concurrent duplicate dials to the same addr.
 	dialingLock sync.Mutex
 	dialingSet  map[string]struct{}
+
+	// announceAdded maps canonical listen addr → ephemeral remote addr for inbound
+	// peers that were added to the ring via handleAnnounce. Used by OnPeerDisconnect
+	// to remove them from the ring when the connection drops (inbound peers are
+	// otherwise excluded from ring cleanup).
+	announceAdded map[string]string // canonical → ephemeral
 
 	serverOpts   ServerOpts
 	Store        *storage.Store
@@ -111,6 +118,14 @@ type MessageLocalFile struct {
 }
 
 // Sprint 2 message types
+
+// MessageAnnounce is the first message an outbound node sends after OnPeer fires.
+// It carries the sender's listen address so the receiving node can immediately
+// remap the inbound peer from its ephemeral TCP port to the canonical listen
+// address and add it to the hash ring — no heartbeat wait required.
+type MessageAnnounce struct {
+	ListenAddr string // e.g. "172.17.0.2:3000"
+}
 
 type MessageHeartbeat struct {
 	From      string
@@ -221,6 +236,7 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 
 	// Check whether this key is stored as chunked.
 	fm, hasMeta := s.serverOpts.metaData.Get(key)
+	log.Printf("[LIFECYCLE] GET_DATA: key=%s hasMeta=%v Chunked=%v", key, hasMeta, fm.Chunked)
 	if hasMeta && fm.Chunked {
 		defer func() { metrics.RecordGet("local", nil, time.Since(t0)) }()
 		return s.getChunked(key)
@@ -274,6 +290,7 @@ func (s *Server) getChunked(key string) (io.Reader, error) {
 	if !ok {
 		return nil, fmt.Errorf("getChunked: no manifest for key '%s'", key)
 	}
+	log.Printf("[LIFECYCLE] GET_CHUNKED: key=%s numChunks=%d usingDownloader=%v", key, len(manifest.Chunks), s.Downloader != nil)
 
 	// Sprint 7: parallel path via Downloader.
 	if s.Downloader != nil {
@@ -368,10 +385,35 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 	selfAddr := s.serverOpts.transport.Addr()
 	targetNodes := s.HashRing.GetNodes(storageKey, s.HashRing.ReplicationFactor())
 
-	ch := make(chan io.Reader, 1)
+	// If another goroutine is already fetching this key, share its channel
+	// rather than overwriting it. Overwriting would orphan the first caller's
+	// select, causing it to time out even when a response arrives.
 	s.mu.Lock()
-	s.pendingFile[storageKey] = ch
+	ch, alreadyFetching := s.pendingFile[storageKey]
+	if !alreadyFetching {
+		ch = make(chan io.Reader, 1)
+		s.pendingFile[storageKey] = ch
+	}
 	s.mu.Unlock()
+
+	if alreadyFetching {
+		// Another goroutine owns this fetch — wait for its result.
+		select {
+		case r := <-ch:
+			if r == nil {
+				return nil, fmt.Errorf("fetchChunkFromPeers: nil reader for '%s'", storageKey)
+			}
+			// Put it back so any other waiter also gets it (best-effort).
+			select {
+			case ch <- r:
+			default:
+			}
+			return io.ReadAll(r)
+		case <-time.After(10 * time.Second):
+			return nil, fmt.Errorf("fetchChunkFromPeers: timeout waiting for in-flight fetch of '%s'", storageKey)
+		}
+	}
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.pendingFile, storageKey)
@@ -422,8 +464,12 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 // peer via the Selector — so we send to that peer only.
 // When peerAddr == selfAddr the chunk is read directly from local storage.
 func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error) {
-	// Self-read: chunk lives locally, no network hop needed.
-	if peerAddr == s.serverOpts.transport.Addr() {
+	// Local read: chunk is on disk here — no network hop needed.
+	// Check s.Store.Has first so that a node whose ring address doesn't match
+	// its transport.Addr() string (e.g. Docker container whose canonical addr
+	// is "172.17.0.2:3000" but transport.Addr() is ":3000") still serves the
+	// chunk from local storage instead of attempting a self-dial.
+	if s.Store.Has(storageKey) {
 		_, r, err := s.Store.ReadStream(storageKey)
 		if err != nil {
 			return nil, fmt.Errorf("fetchChunkFromPeer: local read: %w", err)
@@ -432,10 +478,31 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 		return io.ReadAll(r)
 	}
 
-	ch := make(chan io.Reader, 1)
+	// If another goroutine is already fetching this key, share its channel.
 	s.mu.Lock()
-	s.pendingFile[storageKey] = ch
+	ch, alreadyFetching := s.pendingFile[storageKey]
+	if !alreadyFetching {
+		ch = make(chan io.Reader, 1)
+		s.pendingFile[storageKey] = ch
+	}
 	s.mu.Unlock()
+
+	if alreadyFetching {
+		select {
+		case r := <-ch:
+			if r == nil {
+				return nil, fmt.Errorf("fetchChunkFromPeer: nil reader for '%s'", storageKey)
+			}
+			select {
+			case ch <- r:
+			default:
+			}
+			return io.ReadAll(r)
+		case <-time.After(10 * time.Second):
+			return nil, fmt.Errorf("fetchChunkFromPeer: timeout waiting for in-flight fetch of '%s'", storageKey)
+		}
+	}
+
 	defer func() {
 		s.mu.Lock()
 		delete(s.pendingFile, storageKey)
@@ -605,6 +672,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 
 		// Replicate to ring-responsible peers.
 		targetNodes := s.HashRing.GetNodes(storageKey, replFactor)
+		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s encKeyHex=%q targets=%v", storageKey, encKeyHex, targetNodes)
 		s.replicateChunk(selfAddr, storageKey, encKeyHex, encData, targetNodes)
 
 		chunkInfos = append(chunkInfos, chunker.ChunkInfo{
@@ -652,6 +720,7 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 // replicateChunk sends storageKey's encrypted bytes to all targetNodes that
 // are not selfAddr. Unreachable nodes get a hint entry.
 func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData []byte, targetNodes []string) {
+	log.Printf("REPLICATE_CHUNK_DEBUG: storageKey=%s encKeyHex=%q encKeyLen=%d", storageKey, encKeyHex, len(encKeyHex))
 	msg := &Message{
 		Payload: &MessageStoreFile{
 			Key:          storageKey,
@@ -665,6 +734,7 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		return
 	}
 	msgBytes := buf.Bytes()
+	log.Printf("REPLICATE_CHUNK_DEBUG: encoded msgBytes len=%d", len(msgBytes))
 
 	s.peerLock.RLock()
 	peers := make(map[string]peer2peer.Peer, len(s.peers))
@@ -840,7 +910,7 @@ func (s *Server) readRepair(key string) {
 }
 
 // handleQuorumWrite stores the incoming write locally and sends an ack back.
-func (s *Server) handleQuorumWrite(from string, msg *MessageQuorumWrite) error {
+func (s *Server) handleQuorumWrite(from string, peer peer2peer.Peer, msg *MessageQuorumWrite) error {
 	selfAddr := s.serverOpts.transport.Addr()
 
 	// Write the data into local store via the existing WriteStream path.
@@ -866,12 +936,17 @@ func (s *Server) handleQuorumWrite(from string, msg *MessageQuorumWrite) error {
 			return ""
 		}(),
 	}}
-	_ = s.sendToAddr(from, ack) // best-effort
+	// Send ack directly on the same connection — avoids peers[from] map lookup
+	// which fails after handleAnnounce remaps the ephemeral key to canonical.
+	buf := new(bytes.Buffer)
+	if encErr := gob.NewEncoder(buf).Encode(ack); encErr == nil {
+		_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+	}
 	return nil
 }
 
 // handleQuorumRead responds with local metadata for the requested key.
-func (s *Server) handleQuorumRead(from string, msg *MessageQuorumRead) error {
+func (s *Server) handleQuorumRead(from string, peer peer2peer.Peer, msg *MessageQuorumRead) error {
 	selfAddr := s.serverOpts.transport.Addr()
 	fm, found := s.serverOpts.metaData.Get(msg.Key)
 
@@ -883,13 +958,45 @@ func (s *Server) handleQuorumRead(from string, msg *MessageQuorumRead) error {
 		Timestamp:    fm.Timestamp,
 		EncryptedKey: fm.EncryptedKey,
 	}}
-	_ = s.sendToAddr(from, resp)
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(resp); err == nil {
+		_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+	}
 	return nil
 }
 
 // deriveHealthPort returns the health-server listen address by adding 1000 to
 // the port in listenAddr (e.g. ":3000" → ":4000", "127.0.0.1:3000" → "127.0.0.1:4000").
 // Falls back to ":14000" if parsing fails.
+// isLocalAddr returns true if host matches one of this machine's own network
+// interface addresses. Used by handleAnnounce to reject self-connections that
+// arrive when gossip causes a node to dial its own alternate IP.
+func isLocalAddr(host string) bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.String() == host {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func deriveHealthPort(listenAddr string) string {
 	host, portStr, err := strings.Cut(listenAddr, ":")
 	if !err {
@@ -947,11 +1054,16 @@ func (s *Server) readEncryptedFile(key string) (encKey string, data []byte, err 
 
 // healthStatus returns the current health snapshot for /health endpoint.
 func (s *Server) healthStatus() health.Status {
-	peerCount := s.outboundPeerCount()
-
 	ringSize := s.HashRing.Size()
+	// Ring size includes self, so peers = ringSize - 1.
+	// This counts both outbound and announced-inbound peers correctly.
+	peerCount := ringSize - 1
+	if peerCount < 0 {
+		peerCount = 0
+	}
+
 	status := "ok"
-	if peerCount == 0 && ringSize <= 1 {
+	if peerCount == 0 {
 		status = "degraded" // isolated single node
 	}
 
@@ -1068,12 +1180,15 @@ func (s *Server) handleLeaving(addr string, msgGen uint64) error {
 	}
 
 	// Remove from local peer map so heartbeats stop.
+	// Also clean up the announceAdded reverse-mapping so OnPeerDisconnect
+	// doesn't attempt a second (redundant) ring removal and doesn't leak memory.
 	s.peerLock.Lock()
 	if peer, ok := s.peers[addr]; ok {
 		log.Printf("[TRACE][handleLeaving] self=%s closing peer ptr=%p for addr=%s", self, peer, addr)
 		_ = peer.Close()
 		delete(s.peers, addr)
 	}
+	delete(s.announceAdded, addr)
 	s.peerLock.Unlock()
 
 	metrics.PeerCount.Set(float64(len(s.peers)))
@@ -1140,8 +1255,9 @@ func NewServer(opts ServerOpts) *Server {
 			ReplicationFactor: replFactor,
 		}),
 		quitch:      make(chan struct{}),
-		pendingFile: make(map[string]chan io.Reader),
-		dialingSet:  make(map[string]struct{}),
+		pendingFile:   make(map[string]chan io.Reader),
+		dialingSet:    make(map[string]struct{}),
+		announceAdded: make(map[string]string),
 	}
 }
 
@@ -1227,7 +1343,7 @@ func (s *Server) loop() {
 			log.Printf("[loop] Decoded message: %+v\n", message)
 			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
-			if err := s.handleMessage(RPC.From.String(), &message, RPC.StreamWg); err != nil {
+			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
 				continue
 			}
@@ -1239,36 +1355,57 @@ func (s *Server) loop() {
 	}
 }
 
-func (s *Server) handleMessage(from string, msg *Message, streamWg *sync.WaitGroup) error {
+func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, streamWg *sync.WaitGroup) error {
 	log.Printf("[handleMessage] Handling message from %s: Type=%s\n",
 		from, strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main."))
 
 	switch m := msg.Payload.(type) {
 	case *MessageStoreFile:
 		log.Printf("[handleMessage] Detected MessageStoreFile from %s\n", from)
-		return s.handleStoreMessage(from, m, streamWg)
+		return s.handleStoreMessage(from, peer, m, streamWg)
 
 	case *MessageGetFile:
 		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
-		return s.handleGetMessage(from, m)
+		return s.handleGetMessage(from, peer, m)
 
 	case *MessageLocalFile:
 		log.Printf("[handleMessage] Detected MessageLocalFile from %s\n", from)
-		return s.handleLocalMessage(from, m, streamWg)
+		return s.handleLocalMessage(from, peer, m, streamWg)
 
 	case *MessageHeartbeat:
-		return s.handleHeartbeat(from, m)
+		return s.handleHeartbeat(from, peer, m)
 
 	case *MessageHeartbeatAck:
 		// RTT measurement could be recorded here in future; for now just log.
 		log.Printf("[handleMessage] HeartbeatAck from %s (rtt origin ts=%d)\n", from, m.Timestamp)
 		return nil
 
+	case *MessageAnnounce:
+		return s.handleAnnounce(from, m)
+
 	case *MessageGossipDigest:
 		if s.GossipSvc != nil {
 			s.GossipSvc.HandleDigest(from, &gossip.MessageGossipDigest{
 				From:    m.From,
 				Digests: m.Digests,
+			}, func(msg interface{}) error {
+				// Convert *gossip.MessageGossipResponse → *MessageGossipResponse
+				// (the registered gob type) before encoding.
+				var payload interface{}
+				if gr, ok := msg.(*gossip.MessageGossipResponse); ok {
+					payload = &MessageGossipResponse{
+						From:     gr.From,
+						Full:     gr.Full,
+						MyDigest: gr.MyDigest,
+					}
+				} else {
+					payload = msg
+				}
+				buf := new(bytes.Buffer)
+				if err := gob.NewEncoder(buf).Encode(&Message{Payload: payload}); err != nil {
+					return err
+				}
+				return peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
 			})
 		}
 		return nil
@@ -1284,7 +1421,7 @@ func (s *Server) handleMessage(from string, msg *Message, streamWg *sync.WaitGro
 		return nil
 
 	case *MessageQuorumWrite:
-		return s.handleQuorumWrite(from, m)
+		return s.handleQuorumWrite(from, peer, m)
 
 	case *MessageQuorumWriteAck:
 		if s.Quorum != nil {
@@ -1298,7 +1435,7 @@ func (s *Server) handleMessage(from string, msg *Message, streamWg *sync.WaitGro
 		return nil
 
 	case *MessageQuorumRead:
-		return s.handleQuorumRead(from, m)
+		return s.handleQuorumRead(from, peer, m)
 
 	case *MessageQuorumReadResponse:
 		if s.Quorum != nil {
@@ -1357,7 +1494,10 @@ func (s *Server) handleMessage(from string, msg *Message, streamWg *sync.WaitGro
 				resp.ManifestJSON = data
 			}
 		}
-		_ = s.sendToAddr(from, &Message{Payload: resp})
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(&Message{Payload: resp}); err == nil {
+			_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+		}
 		return nil
 
 	case *MessageManifestResponse:
@@ -1401,32 +1541,111 @@ func (s *Server) sendToAddr(addr string, msg *Message) error {
 	return nil
 }
 
-// handleHeartbeat records the arrival and sends an ack back.
-func (s *Server) handleHeartbeat(from string, msg *MessageHeartbeat) error {
+// handleHeartbeat records the heartbeat arrival and sends an ack.
+func (s *Server) handleHeartbeat(from string, peer peer2peer.Peer, msg *MessageHeartbeat) error {
 	metrics.RecordHeartbeat("received")
 	if s.HeartbeatSvc != nil {
-		s.HeartbeatSvc.RecordHeartbeat(msg.From)
+		s.HeartbeatSvc.RecordHeartbeat(from)
+		// Also record under the canonical address if this inbound peer was remapped
+		// by handleAnnounce. Without this, the liveness detector tracks phi under
+		// the ephemeral key while the ring only knows the canonical key.
+		s.peerLock.RLock()
+		for canonical, ephemeral := range s.announceAdded {
+			if ephemeral == from {
+				s.HeartbeatSvc.RecordHeartbeat(canonical)
+				break
+			}
+		}
+		s.peerLock.RUnlock()
 	}
-
 	selfAddr := s.serverOpts.transport.Addr()
 	ack := &Message{Payload: &MessageHeartbeatAck{
 		From:      selfAddr,
 		Timestamp: msg.Timestamp,
 	}}
-	// Best-effort ack — ignore error (peer may have already disconnected).
-	_ = s.sendToAddr(from, ack)
+	// Send ack directly on the same connection — avoids peers[from] map lookup
+	// which fails after handleAnnounce remaps the ephemeral key to canonical.
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(ack); err == nil {
+		_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+	}
 	return nil
 }
 
-func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
-	log.Printf("HANDLE_GET: Received file request for key '%s' from peer '%s'", msg.Key, from)
-
-	s.peerLock.RLock()
-	peer, ok := s.peers[from]
-	s.peerLock.RUnlock()
-	if !ok {
-		return fmt.Errorf("peer (%s) not found", from)
+// handleAnnounce processes a MessageAnnounce from a newly-connected inbound peer.
+// The peer's TCP connection is stored under its ephemeral port (e.g. "172.17.0.2:47636").
+// This handler remaps it to the canonical listen address (e.g. "172.17.0.2:3000"),
+// adds it to the hash ring, and triggers rebalance — all immediately on connect.
+func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
+	canonical := msg.ListenAddr
+	if canonical == "" {
+		return nil
 	}
+
+	// If the peer announced only a port (e.g. ":3000"), resolve it to a full
+	// address using the remote IP we already know from the TCP connection.
+	// This handles the case where Node B is inside Docker and its self-address
+	// is ":3000" (container-local), but Node A sees it arrive from 172.17.0.2.
+	if strings.HasPrefix(canonical, ":") {
+		remoteHost, _, err := net.SplitHostPort(from)
+		if err == nil && remoteHost != "" {
+			canonical = net.JoinHostPort(remoteHost, canonical[1:])
+		}
+	}
+
+	if canonical == from {
+		return nil
+	}
+
+	// Reject self-connections: if the resolved canonical address has the same
+	// port as us and its host is one of our own local interfaces, it's a
+	// gossip-triggered loopback (e.g. gossip learns "10.145.16.251:3000" from
+	// a stale entry, dials us, and we'd add ourselves twice under a different key).
+	selfAddr := s.serverOpts.transport.Addr()
+	_, selfPort, _ := net.SplitHostPort(selfAddr)
+	canonicalHost, canonicalPort, _ := net.SplitHostPort(canonical)
+	if canonicalPort == selfPort && isLocalAddr(canonicalHost) {
+		log.Printf("[handleAnnounce] ignoring self-connection from %s (canonical %s matches local port %s)", from, canonical, selfPort)
+		return nil
+	}
+
+	s.peerLock.Lock()
+	p, ok := s.peers[from]
+	if ok && !p.Outbound() {
+		// Remap ephemeral entry → canonical listen address.
+		delete(s.peers, from)
+		s.peers[canonical] = p
+		// Record so OnPeerDisconnect can clean up the ring when this inbound drops.
+		s.announceAdded[canonical] = from
+		log.Printf("[handleAnnounce] inbound peer %s → canonical %s", from, canonical)
+	}
+	s.peerLock.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	if !s.HashRing.HasNode(canonical) {
+		s.HashRing.AddNode(canonical)
+		log.Printf("[handleAnnounce] added %s to hash ring (size=%d)", canonical, s.HashRing.Size())
+		metrics.SetPeerCount(s.outboundPeerCount())
+		metrics.SetRingSize(s.HashRing.Size())
+
+		if s.Cluster != nil {
+			s.Cluster.AddNode(canonical, nil)
+		}
+		if s.HandoffSvc != nil {
+			s.HandoffSvc.OnPeerReconnect(canonical)
+		}
+		if s.Rebalancer != nil {
+			s.Rebalancer.OnNodeJoined(canonical)
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleGetMessage(from string, peer peer2peer.Peer, msg *MessageGetFile) error {
+	log.Printf("HANDLE_GET: Received file request for key '%s' from peer '%s'", msg.Key, from)
 
 	fs, r, err := s.Store.ReadStream(msg.Key)
 	if err != nil {
@@ -1463,17 +1682,8 @@ func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 	return nil
 }
 
-func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile, streamWg *sync.WaitGroup) error {
-	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
-
-	s.peerLock.RLock()
-	peer, ok := s.peers[from]
-	s.peerLock.RUnlock()
-	if !ok {
-		err := fmt.Errorf("peer (%s) not found", from)
-		log.Println("HANDLE_STORE: Error:", err)
-		return err
-	}
+func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *MessageStoreFile, streamWg *sync.WaitGroup) error {
+	log.Printf("HANDLE_STORE: Received store request for key %s from %s — EncryptedKey=%q encKeyLen=%d", msg.Key, from, msg.EncryptedKey, len(msg.EncryptedKey))
 
 	log.Println("HANDLE_STORE: Starting file storage...")
 	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer.(io.Reader), msg.Size))
@@ -1495,21 +1705,22 @@ func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile, streamWg
 			log.Printf("HANDLE_STORE: Failed to save metadata for key %s: %v", msg.Key, err)
 			return err
 		}
+		// Immediately verify the write persisted.
+		if verified, ok := s.serverOpts.metaData.Get(msg.Key); ok {
+			log.Printf("[LIFECYCLE] HANDLE_STORE: metadata saved key=%s EncryptedKey=%q", msg.Key, verified.EncryptedKey)
+		} else {
+			log.Printf("[LIFECYCLE] HANDLE_STORE: WARNING metadata GET failed immediately after SET for key=%s", msg.Key)
+		}
+	} else {
+		log.Printf("[LIFECYCLE] HANDLE_STORE: WARNING EncryptedKey is EMPTY in received message for key=%s from=%s", msg.Key, from)
 	}
 
 	log.Printf("HANDLE_STORE: Successfully stored [%d] bytes to %s from %s", n, msg.Key, from)
 	return nil
 }
 
-func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile, streamWg *sync.WaitGroup) error {
-	s.peerLock.RLock()
-	peer, ok := s.peers[from]
-	s.peerLock.RUnlock()
-	if !ok {
-		return fmt.Errorf("peer (%s) not found", from)
-	}
-
-	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer, msg.Size))
+func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *MessageLocalFile, streamWg *sync.WaitGroup) error {
+	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer.(io.Reader), msg.Size))
 	if err != nil {
 		log.Printf("HANDLE_LOCAL: Storage error from %s: %v", from, err)
 		return err
@@ -1574,9 +1785,37 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	log.Printf("[TRACE][OnPeerDisconnect] self=%s addr=%s map_had_entry=%v same_ptr=%v current_ptr=%p disconnect_ptr=%p",
 		self, addr, ok, samePtr, current, p)
 
-	// Only outbound peers were added to the ring / membership.
+	// Outbound peers are always in the ring. Inbound peers are normally NOT in
+	// the ring — EXCEPT those added via handleAnnounce (remapped to canonical).
+	// Check announceAdded first so those get cleaned up too.
 	if !p.Outbound() {
-		log.Printf("[TRACE][OnPeerDisconnect] INBOUND closed: self=%s addr=%s (no ring change)", self, addr)
+		// Look for a canonical addr that was remapped from this ephemeral addr,
+		// OR check if this addr itself is a canonical that was announce-added.
+		s.peerLock.Lock()
+		var canonicalToRemove string
+		for canonical, ephemeral := range s.announceAdded {
+			if ephemeral == addr || canonical == addr {
+				canonicalToRemove = canonical
+				break
+			}
+		}
+		if canonicalToRemove != "" {
+			delete(s.announceAdded, canonicalToRemove)
+		}
+		s.peerLock.Unlock()
+
+		if canonicalToRemove != "" {
+			log.Printf("[TRACE][OnPeerDisconnect] INBOUND announce-added closed: self=%s canonical=%s — removing from ring", self, canonicalToRemove)
+			s.HashRing.RemoveNode(canonicalToRemove)
+			metrics.SetPeerCount(s.outboundPeerCount())
+			metrics.SetRingSize(s.HashRing.Size())
+			if s.Cluster != nil {
+				nextGen := s.Cluster.NextGeneration(canonicalToRemove)
+				s.Cluster.UpdateState(canonicalToRemove, membership.StateSuspect, nextGen)
+			}
+		} else {
+			log.Printf("[TRACE][OnPeerDisconnect] INBOUND closed: self=%s addr=%s (no ring change)", self, addr)
+		}
 		return
 	}
 
@@ -1683,6 +1922,16 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 	metrics.SetPeerCount(peerCount)
 	metrics.SetRingSize(s.HashRing.Size())
 
+	// Tell the peer our canonical listen address so it can remap its inbound
+	// connection (stored under our ephemeral port) to our real listen address
+	// and add us to its hash ring immediately.
+	go func() {
+		announceMsg := &Message{Payload: &MessageAnnounce{ListenAddr: self}}
+		if err := s.sendToAddr(addr, announceMsg); err != nil {
+			log.Printf("[OnPeer] announce to %s failed: %v", addr, err)
+		}
+	}()
+
 	// Sprint 2: deliver any pending hints and trigger rebalance.
 	if s.HandoffSvc != nil {
 		s.HandoffSvc.OnPeerReconnect(addr)
@@ -1706,6 +1955,7 @@ func init() {
 	gob.Register(&MessageStoreFile{})
 	gob.Register(&MessageGetFile{})
 	gob.Register(&MessageLocalFile{})
+	gob.Register(&MessageAnnounce{})
 	gob.Register(&MessageHeartbeat{})
 	gob.Register(&MessageHeartbeatAck{})
 	gob.Register(&MessageGossipDigest{})
@@ -1906,6 +2156,27 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 			return peer.SendStream(buf.Bytes(), data)
 		},
 	)
+	s.Rebalancer.SetManifestFuncs(
+		// readManifest: serialise the manifest from metadata to JSON
+		func(fileKey string) ([]byte, bool) {
+			manifest, ok := opts.metaData.GetManifest(fileKey)
+			if !ok {
+				return nil, false
+			}
+			data, err := json.Marshal(manifest)
+			if err != nil {
+				return nil, false
+			}
+			return data, true
+		},
+		// sendManifest: send MessageStoreManifest to a peer
+		func(targetAddr, fileKey string, manifestJSON []byte) error {
+			return s.sendToAddr(targetAddr, &Message{Payload: &MessageStoreManifest{
+				FileKey:      fileKey,
+				ManifestJSON: manifestJSON,
+			}})
+		},
+	)
 
 	// Sprint 4: wire Quorum coordinator.
 	s.Quorum = quorum.New(
@@ -2012,6 +2283,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		// decrypt: look up per-chunk key and decrypt
 		func(storageKey string, encData []byte) ([]byte, error) {
 			fm, ok := s.serverOpts.metaData.Get(storageKey)
+			log.Printf("[LIFECYCLE] DECRYPT: storageKey=%s metaFound=%v EncryptedKey=%q", storageKey, ok, fm.EncryptedKey)
 			if !ok {
 				return nil, fmt.Errorf("no metadata for chunk %s", storageKey)
 			}
@@ -2083,6 +2355,18 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		// Guards against concurrent duplicate dials via dialingSet.
 		func(addr string) {
 			self := s.serverOpts.transport.Addr()
+
+			// Reject self-connections: if the discovered addr has the same port
+			// as us and its host is one of our own network interfaces, skip it.
+			// This prevents gossip from triggering loopback dials (e.g. a bare
+			// host learning "172.17.0.1:3000" from a Docker-container peer and
+			// dialing the Docker bridge gateway which routes back to itself).
+			_, selfPort, _ := net.SplitHostPort(self)
+			addrHost, addrPort, _ := net.SplitHostPort(addr)
+			if addrPort == selfPort && isLocalAddr(addrHost) {
+				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (self-loopback via local interface)", self, addr)
+				return
+			}
 
 			// Check peers map first — fastest path.
 			s.peerLock.RLock()
