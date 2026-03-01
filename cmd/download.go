@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	downloadKey string
-	outputFile  string
+	downloadKey  string
+	outputFile   string
+	downloadNode string
 )
 
 var downloadCmd = &cobra.Command{
@@ -19,14 +20,14 @@ var downloadCmd = &cobra.Command{
 		if downloadKey == "" {
 			return fmt.Errorf("key is required")
 		}
-
-		return DownloadFile(downloadKey, outputFile)
+		return DownloadFile(downloadKey, outputFile, socketPath(downloadNode))
 	},
 }
 
 func init() {
 	downloadCmd.Flags().StringVarP(&downloadKey, "key", "k", "", "Key to retrieve the file (required)")
 	downloadCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path (required)")
+	downloadCmd.Flags().StringVarP(&downloadNode, "node", "n", ":3000", "Port of the local node to download through (e.g. :3001)")
 	downloadCmd.MarkFlagRequired("key")
 	rootCmd.AddCommand(downloadCmd)
 }

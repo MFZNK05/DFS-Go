@@ -28,10 +28,10 @@ func StartDaemon(port string, peers []string, replicationFactor int) error {
 		shutdownTracing = func(_ context.Context) error { return nil }
 	}
 
-	socketPath := GetSocketPath()
-	_ = os.RemoveAll(socketPath)
+	sockPath := socketPath(port)
+	_ = os.RemoveAll(sockPath)
 
-	listener, err := net.Listen("unix", socketPath)
+	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return err
 	}
@@ -55,8 +55,8 @@ func StartDaemon(port string, peers []string, replicationFactor int) error {
 
 	go server.Run()
 
-	logging.Global.Info("daemon started", "socket", socketPath, "port", port)
-	fmt.Println("Daemon started at", socketPath)
+	logging.Global.Info("daemon started", "socket", sockPath, "port", port)
+	fmt.Println("Daemon started at", sockPath)
 
 	for {
 		conn, err := listener.Accept()

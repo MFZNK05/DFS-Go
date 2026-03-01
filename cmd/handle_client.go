@@ -1,9 +1,7 @@
 package cmd
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -11,54 +9,73 @@ import (
 	server "github.com/Faizan2005/DFS-Go/Server"
 )
 
-type Request struct {
-	Action string `json:"action"` // "upload" or "download"
-	Key    string `json:"key"`
-	Data   string `json:"data,omitempty"` // used only for upload
-}
-
+// HandleClient dispatches a single IPC connection from the CLI.
+// Protocol is defined in ipc.go.
 func HandleClient(conn net.Conn, s *server.Server) {
 	defer conn.Close()
 
-	// Read the full request (no arbitrary size limit)
-	data, err := io.ReadAll(conn)
-	if err != nil {
-		log.Println("Error reading:", err)
+	var opcode [1]byte
+	if _, err := io.ReadFull(conn, opcode[:]); err != nil {
+		log.Println("IPC: read opcode:", err)
 		return
 	}
 
-	req := new(Request)
-	err = json.Unmarshal(data, &req)
-	if err != nil {
-		log.Println("Invalid request:", err)
-		return
-	}
-
-	switch req.Action {
-	case "upload":
-		// Decode base64-encoded file data to preserve binary content
-		fileData, err := base64.StdEncoding.DecodeString(req.Data)
-		if err != nil {
-			log.Println("Failed to decode upload data:", err)
-			conn.Write([]byte("error: failed to decode upload data: " + err.Error()))
-			return
-		}
-		reader := bytes.NewReader(fileData)
-		if err := s.StoreData(req.Key, reader); err != nil {
-			log.Println("StoreData failed:", err)
-			conn.Write([]byte("error: " + err.Error()))
-			return
-		}
-		conn.Write([]byte("uploaded\n"))
-	case "download":
-		data, err := s.GetData(req.Key)
-		if err != nil {
-			conn.Write([]byte("error: " + err.Error()))
-			return
-		}
-		b, _ := io.ReadAll(data)
-		conn.Write(b)
+	switch opcode[0] {
+	case opcodeUpload:
+		handleUpload(conn, s)
+	case opcodeDownload:
+		handleDownload(conn, s)
 	default:
-		conn.Write([]byte("unknown action\n"))
+		log.Printf("IPC: unknown opcode 0x%02x", opcode[0])
+	}
+}
+
+func handleUpload(conn net.Conn, s *server.Server) {
+	key, fileSize, err := readUploadRequest(conn)
+	if err != nil {
+		log.Println("IPC upload: read header:", err)
+		writeStatus(conn, statusError, "bad request: "+err.Error())
+		return
+	}
+
+	// conn is now positioned at the raw file bytes.
+	// Use LimitReader when the size is known to guard against a malformed client
+	// sending extra bytes; fall back to raw conn (reads until EOF/CloseWrite) otherwise.
+	var body io.Reader = conn
+	if fileSize > 0 {
+		body = io.LimitReader(conn, fileSize)
+	}
+
+	if err := s.StoreData(key, body); err != nil {
+		log.Println("IPC upload: StoreData:", err)
+		writeStatus(conn, statusError, err.Error())
+		return
+	}
+	writeStatus(conn, statusOK, fmt.Sprintf("stored %d bytes under key %q", fileSize, key))
+}
+
+func handleDownload(conn net.Conn, s *server.Server) {
+	key, err := readDownloadRequest(conn)
+	if err != nil {
+		log.Println("IPC download: read header:", err)
+		writeDownloadError(conn, "bad request: "+err.Error())
+		return
+	}
+
+	reader, err := s.GetData(key)
+	if err != nil {
+		log.Println("IPC download: GetData:", err)
+		writeDownloadError(conn, err.Error())
+		return
+	}
+
+	// Use manifest TotalSize so the CLI can use LimitReader instead of
+	// relying on connection close to signal EOF. Falls back to 0 (unknown)
+	// for legacy single-blob files — CLI handles the 0 case by reading until close.
+	contentLen := s.ContentLength(key)
+	writeDownloadResponse(conn, contentLen)
+
+	if _, err := io.Copy(conn, reader); err != nil {
+		log.Println("IPC download: stream:", err)
 	}
 }

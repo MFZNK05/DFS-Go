@@ -57,12 +57,17 @@ type Server struct {
 	peerLock sync.RWMutex
 	peers    map[string]peer2peer.Peer
 
-	serverOpts  ServerOpts
-	Store       *storage.Store
-	HashRing    *hashring.HashRing
-	quitch      chan struct{}
-	pendingFile map[string]chan io.Reader
-	mu          sync.Mutex
+	// dialingLock protects dialingSet — prevents concurrent duplicate dials to the same addr.
+	dialingLock sync.Mutex
+	dialingSet  map[string]struct{}
+
+	serverOpts   ServerOpts
+	Store        *storage.Store
+	HashRing     *hashring.HashRing
+	quitch       chan struct{}
+	pendingFile  map[string]chan io.Reader
+	mu           sync.Mutex
+	shutdownOnce sync.Once
 
 	// Sprint 2: failure detection, hinted handoff, rebalancing
 	HeartbeatSvc *failure.HeartbeatService
@@ -167,6 +172,48 @@ type MessageMerkleSync struct {
 type MessageMerkleDiffResponse struct {
 	From    string
 	AllKeys []string
+}
+
+// MessageLeaving is broadcast by a node that is voluntarily leaving the cluster.
+// Peers immediately remove it from their hash ring and cluster state — no need
+// to wait for failure detection timeouts.
+type MessageLeaving struct {
+	From       string // address of the departing node
+	Generation uint64 // the sender's current generation — peers use gen+1 as StateLeft generation
+	// so that any stale gossip digest (with gen==Generation) cannot override StateLeft
+}
+
+// MessageStoreManifest replicates a ChunkManifest to peers.
+// The manifest lives only in metadata (no physical file), so a dedicated message
+// is needed rather than the regular store-file stream protocol.
+type MessageStoreManifest struct {
+	FileKey      string // original file key (not the "manifest:" prefixed key)
+	ManifestJSON []byte // JSON-encoded chunker.ChunkManifest
+}
+
+// MessageGetManifest asks a peer to return its copy of a manifest for FileKey.
+type MessageGetManifest struct {
+	FileKey string
+}
+
+// MessageManifestResponse is the reply to MessageGetManifest.
+// ManifestJSON is empty when the peer does not have the manifest.
+type MessageManifestResponse struct {
+	FileKey      string
+	ManifestJSON []byte // nil/empty if not found
+}
+
+// ContentLength returns the total plaintext byte count for a stored key.
+// Returns 0 when the size is unknown (legacy single-blob files or key not found).
+func (s *Server) ContentLength(key string) int64 {
+	meta, ok := s.serverOpts.metaData.Get(key)
+	if !ok {
+		return 0
+	}
+	if meta.Manifest != nil {
+		return meta.Manifest.TotalSize
+	}
+	return 0
 }
 
 func (s *Server) GetData(key string) (io.Reader, error) {
@@ -348,10 +395,7 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-			continue
-		}
-		if err := peer.Send(msgBytes); err != nil {
+		if err := peer.SendMsg(peer2peer.IncomingMessage, msgBytes); err != nil {
 			continue
 		}
 		sent++
@@ -376,7 +420,18 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 // fetchChunkFromPeer fetches the encrypted bytes for storageKey from one
 // specific peer. Used by the Downloader which has already selected the best
 // peer via the Selector — so we send to that peer only.
+// When peerAddr == selfAddr the chunk is read directly from local storage.
 func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error) {
+	// Self-read: chunk lives locally, no network hop needed.
+	if peerAddr == s.serverOpts.transport.Addr() {
+		_, r, err := s.Store.ReadStream(storageKey)
+		if err != nil {
+			return nil, fmt.Errorf("fetchChunkFromPeer: local read: %w", err)
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	}
+
 	ch := make(chan io.Reader, 1)
 	s.mu.Lock()
 	s.pendingFile[storageKey] = ch
@@ -399,10 +454,7 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 	if !ok {
 		return nil, fmt.Errorf("fetchChunkFromPeer: peer %s not connected", peerAddr)
 	}
-	if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-		return nil, fmt.Errorf("fetchChunkFromPeer: send control byte: %w", err)
-	}
-	if err := peer.Send(buf.Bytes()); err != nil {
+	if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
 		return nil, fmt.Errorf("fetchChunkFromPeer: send msg: %w", err)
 	}
 
@@ -418,25 +470,25 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 }
 
 // fetchManifestFromPeers retrieves a ChunkManifest from peers for key.
-// This is used when a node doesn't have the manifest locally yet.
+// Uses MessageGetManifest / MessageManifestResponse — a direct JSON exchange
+// that does NOT go through the encrypted-stream path.
 func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, error) {
-	// The manifest is stored under "manifest:<key>" as a regular metadata entry.
-	// We request it via the normal get path so peers respond with their copy.
-	manifestKey := chunker.ManifestStorageKey(key)
 	selfAddr := s.serverOpts.transport.Addr()
-	targetNodes := s.HashRing.GetNodes(manifestKey, s.HashRing.ReplicationFactor())
+	targetNodes := s.HashRing.GetNodes(key, s.HashRing.ReplicationFactor())
 
-	ch := make(chan io.Reader, 1)
+	// Use a sentinel key in pendingFile to receive the async response.
+	pendingKey := "__manifest__" + key
+	ch := make(chan io.Reader, len(targetNodes))
 	s.mu.Lock()
-	s.pendingFile[manifestKey] = ch
+	s.pendingFile[pendingKey] = ch
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		delete(s.pendingFile, manifestKey)
+		delete(s.pendingFile, pendingKey)
 		s.mu.Unlock()
 	}()
 
-	getMsg := &Message{Payload: &MessageGetFile{Key: manifestKey}}
+	getMsg := &Message{Payload: &MessageGetManifest{FileKey: key}}
 	buf := new(bytes.Buffer)
 	if err := gob.NewEncoder(buf).Encode(getMsg); err != nil {
 		return nil, err
@@ -453,10 +505,7 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 		if !ok {
 			continue
 		}
-		if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-			continue
-		}
-		if err := peer.Send(msgBytes); err != nil {
+		if err := peer.SendMsg(peer2peer.IncomingMessage, msgBytes); err != nil {
 			continue
 		}
 		sent++
@@ -464,33 +513,20 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 	s.peerLock.RUnlock()
 
 	if sent == 0 {
-		return nil, fmt.Errorf("no reachable peers for manifest of '%s'", key)
+		return nil, fmt.Errorf("fetchManifest: no reachable peers for '%s'", key)
 	}
 
 	select {
 	case r := <-ch:
-		if r == nil {
-			return nil, fmt.Errorf("nil reader for manifest of '%s'", key)
-		}
-		// The manifest was stored as a JSON-encoded FileMeta.Manifest field.
-		// The peer sends back the raw encrypted manifest bytes; we decode them.
 		data, err := io.ReadAll(r)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetchManifest: read response: %w", err)
 		}
-		// Peer sends it as encrypted bytes — decrypt using local key if available,
-		// otherwise the manifest is stored plaintext in the metadata JSON.
-		// Since manifests are stored via SetManifest (which uses FileMeta.Manifest,
-		// a JSON-serialised struct), the peer's handleGetMessage returns the raw
-		// store bytes. We decode it as a FileMeta to extract the Manifest field.
-		var fm storage.FileMeta
-		if err := json.Unmarshal(data, &fm); err != nil {
-			return nil, fmt.Errorf("fetchManifest: unmarshal FileMeta: %w", err)
+		var manifest chunker.ChunkManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return nil, fmt.Errorf("fetchManifest: unmarshal: %w", err)
 		}
-		if fm.Manifest == nil {
-			return nil, fmt.Errorf("fetchManifest: nil manifest in FileMeta for '%s'", key)
-		}
-		return fm.Manifest, nil
+		return &manifest, nil
 	case <-time.After(10 * time.Second):
 		return nil, fmt.Errorf("timeout fetching manifest for '%s'", key)
 	}
@@ -557,10 +593,12 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 			if _, err := s.Store.WriteStream(storageKey, bytes.NewReader(encData)); err != nil {
 				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", chunk.Index, err)
 			}
-			if err := s.serverOpts.metaData.Set(storageKey, storage.FileMeta{
-				EncryptedKey: encKeyHex,
-				Timestamp:    time.Now().UnixNano(),
-			}); err != nil {
+			// Merge EncryptedKey into the FileMeta that WriteStream just set
+			// (which carries the Path). Replacing it wholesale would lose Path.
+			fm, _ := s.serverOpts.metaData.Get(storageKey)
+			fm.EncryptedKey = encKeyHex
+			fm.Timestamp = time.Now().UnixNano()
+			if err := s.serverOpts.metaData.Set(storageKey, fm); err != nil {
 				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", chunk.Index, err)
 			}
 		}
@@ -585,17 +623,25 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		return fmt.Errorf("STORE_DATA: chunker read error: %w", err)
 	}
 
-	// Build and persist the manifest.
+	// Build and persist the manifest locally.
 	manifest := chunker.BuildManifest(key, chunkInfos, time.Now().UnixNano())
 	if err := s.serverOpts.metaData.SetManifest(key, manifest); err != nil {
 		return fmt.Errorf("STORE_DATA: store manifest: %w", err)
 	}
 
-	// Update top-level FileMeta so Has(key) works and GetData knows it's chunked.
-	if err := s.serverOpts.metaData.Set(key, storage.FileMeta{
-		Chunked:   true,
-		Timestamp: time.Now().UnixNano(),
-	}); err != nil {
+	// Replicate the manifest to all ring-responsible peers so GetData works from any node.
+	s.replicateManifest(key, selfAddr, manifest)
+
+	// Update top-level FileMeta: merge with existing to preserve any prior VClock,
+	// then increment the clock for this writer.
+	topFm, _ := s.serverOpts.metaData.Get(key)
+	if topFm.VClock == nil {
+		topFm.VClock = make(map[string]uint64)
+	}
+	topFm.VClock[selfAddr]++
+	topFm.Chunked = true
+	topFm.Timestamp = time.Now().UnixNano()
+	if err := s.serverOpts.metaData.Set(key, topFm); err != nil {
 		return fmt.Errorf("STORE_DATA: update file meta: %w", err)
 	}
 
@@ -627,6 +673,15 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 	}
 	s.peerLock.RUnlock()
 
+	log.Printf("REPLICATE_CHUNK: key=%s selfAddr=%s targets=%v peerKeys=%v",
+		storageKey, selfAddr, targetNodes, func() []string {
+			keys := make([]string, 0, len(peers))
+			for k := range peers {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
+
 	var wg sync.WaitGroup
 	for _, nodeAddr := range targetNodes {
 		if nodeAddr == selfAddr {
@@ -634,6 +689,7 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		}
 		p, ok := peers[nodeAddr]
 		if !ok {
+			log.Printf("REPLICATE_CHUNK: peer %s NOT FOUND in peers map, storing hint", nodeAddr)
 			s.storeHint(nodeAddr, storageKey, encKeyHex, encData)
 			metrics.RecordReplication("hint")
 			continue
@@ -641,28 +697,64 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		wg.Add(1)
 		go func(addr string, peer peer2peer.Peer) {
 			defer wg.Done()
-			if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
+			if err := peer.SendStream(msgBytes, encData); err != nil {
+				log.Printf("REPLICATE_CHUNK: SendStream to %s failed: %v, storing hint", addr, err)
 				s.storeHint(addr, storageKey, encKeyHex, encData)
 				metrics.RecordReplication("hint")
 				return
 			}
-			if err := peer.Send(msgBytes); err != nil {
-				s.storeHint(addr, storageKey, encKeyHex, encData)
-				metrics.RecordReplication("hint")
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-			if err := peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
-				s.storeHint(addr, storageKey, encKeyHex, encData)
-				metrics.RecordReplication("hint")
-				return
-			}
-			if _, err := io.Copy(peer, bytes.NewReader(encData)); err != nil {
-				s.storeHint(addr, storageKey, encKeyHex, encData)
-				metrics.RecordReplication("hint")
-				return
-			}
+			log.Printf("REPLICATE_CHUNK: SendStream to %s OK for key=%s", addr, storageKey)
 			metrics.RecordReplication("ok")
+		}(nodeAddr, p)
+	}
+	wg.Wait()
+}
+
+// replicateManifest sends a ChunkManifest to every ring-responsible peer for key.
+// The manifest is stored only in metadata (no physical CAS file), so it must be
+// propagated via a dedicated message rather than the regular stream protocol.
+func (s *Server) replicateManifest(key, selfAddr string, manifest *chunker.ChunkManifest) {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		log.Printf("replicateManifest: marshal: %v", err)
+		return
+	}
+
+	msg := &Message{Payload: &MessageStoreManifest{
+		FileKey:      key,
+		ManifestJSON: data,
+	}}
+
+	targetNodes := s.HashRing.GetNodes(key, s.HashRing.ReplicationFactor())
+
+	s.peerLock.RLock()
+	peers := make(map[string]peer2peer.Peer, len(s.peers))
+	for a, p := range s.peers {
+		peers[a] = p
+	}
+	s.peerLock.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, nodeAddr := range targetNodes {
+		if nodeAddr == selfAddr {
+			continue
+		}
+		p, ok := peers[nodeAddr]
+		if !ok {
+			log.Printf("replicateManifest: peer %s not connected, skipping", nodeAddr)
+			continue
+		}
+		wg.Add(1)
+		go func(addr string, peer peer2peer.Peer) {
+			defer wg.Done()
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+				log.Printf("replicateManifest: encode for %s: %v", addr, err)
+				return
+			}
+			if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+				log.Printf("replicateManifest: send to %s: %v", addr, err)
+			}
 		}(nodeAddr, p)
 	}
 	wg.Wait()
@@ -755,19 +847,19 @@ func (s *Server) handleQuorumWrite(from string, msg *MessageQuorumWrite) error {
 	// We store the raw encrypted bytes directly (already encrypted by sender).
 	_, err := s.Store.WriteStream(msg.Key, bytes.NewReader(msg.Data))
 	if err == nil {
-		// Update metadata with the vclock and timestamp from the write.
-		_ = s.serverOpts.metaData.Set(msg.Key, storage.FileMeta{
-			EncryptedKey: msg.EncryptedKey,
-			VClock:       msg.Clock,
-			Timestamp:    time.Now().UnixNano(),
-		})
+		// Merge into the FileMeta that WriteStream just wrote (which has Path set).
+		fm, _ := s.serverOpts.metaData.Get(msg.Key)
+		fm.EncryptedKey = msg.EncryptedKey
+		fm.VClock = msg.Clock
+		fm.Timestamp = time.Now().UnixNano()
+		_ = s.serverOpts.metaData.Set(msg.Key, fm)
 	}
 
 	ack := &Message{Payload: &MessageQuorumWriteAck{
 		Key:     msg.Key,
 		From:    selfAddr,
 		Success: err == nil,
-		ErrMsg:  func() string {
+		ErrMsg: func() string {
 			if err != nil {
 				return err.Error()
 			}
@@ -855,9 +947,7 @@ func (s *Server) readEncryptedFile(key string) (encKey string, data []byte, err 
 
 // healthStatus returns the current health snapshot for /health endpoint.
 func (s *Server) healthStatus() health.Status {
-	s.peerLock.RLock()
-	peerCount := len(s.peers)
-	s.peerLock.RUnlock()
+	peerCount := s.outboundPeerCount()
 
 	ringSize := s.HashRing.Size()
 	status := "ok"
@@ -876,32 +966,119 @@ func (s *Server) healthStatus() health.Status {
 	}
 }
 
+// InspectManifest returns the ChunkManifest stored for key, or nil if not found.
+// Intended for use in integration and E2E tests.
+func (s *Server) InspectManifest(key string) (*chunker.ChunkManifest, bool) {
+	return s.serverOpts.metaData.GetManifest(key)
+}
+
+// InspectMeta returns the vector clock and timestamp stored for key.
+// It is intended for use in integration and E2E tests.
+func (s *Server) InspectMeta(key string) (VClock map[string]uint64, Timestamp int64, found bool) {
+	fm, ok := s.serverOpts.metaData.Get(key)
+	if !ok {
+		return nil, 0, false
+	}
+	// Return a copy so callers don't alias the live metadata map.
+	vcCopy := make(map[string]uint64, len(fm.VClock))
+	for k, v := range fm.VClock {
+		vcCopy[k] = v
+	}
+	return vcCopy, fm.Timestamp, true
+}
+
 // GracefulShutdown signals all peers that this node is leaving and waits briefly
 // for any in-flight operations to complete before the process exits.
 func (s *Server) GracefulShutdown() {
 	log.Println("[GracefulShutdown] Signalling peers and shutting down...")
+
+	// Stop gossip FIRST so this node stops sending "I am Alive" digests to peers.
+	// If gossip keeps running after we broadcast leaving, peers may receive a
+	// stale Alive digest and immediately re-dial us — causing the ring to flicker.
+	if s.GossipSvc != nil {
+		s.GossipSvc.Stop()
+	}
+	if s.HeartbeatSvc != nil {
+		s.HeartbeatSvc.Stop()
+	}
+
+	// Now broadcast MessageLeaving so peers immediately remove this node from
+	// their rings (voluntary departure — no phi-accrual timeout needed).
+	// Include our current generation so peers can set StateLeft at gen+1,
+	// ensuring any stale gossip digest we already sent (at gen) is overridden.
+	selfAddr := s.serverOpts.transport.Addr()
+	var selfGen uint64
+	if s.Cluster != nil {
+		if info, ok := s.Cluster.GetNode(selfAddr); ok {
+			selfGen = info.Generation
+		}
+	}
+	_ = s.Broadcast(Message{Payload: &MessageLeaving{From: selfAddr, Generation: selfGen}})
+
+	// Pause to let the leaving message propagate before closing connections.
+	time.Sleep(200 * time.Millisecond)
 
 	if s.HealthSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = s.HealthSrv.Stop(ctx)
 	}
-	if s.HeartbeatSvc != nil {
-		s.HeartbeatSvc.Stop()
-	}
 	if s.HandoffSvc != nil {
 		s.HandoffSvc.Stop()
-	}
-	if s.GossipSvc != nil {
-		s.GossipSvc.Stop()
 	}
 	if s.AntiEntropy != nil {
 		s.AntiEntropy.Stop()
 	}
 
 	// Give replication goroutines a moment to finish.
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	s.Stop()
+}
+
+// handleLeaving processes a MessageLeaving from a peer that is voluntarily
+// departing. The node is immediately removed from the hash ring and its
+// cluster state is updated to StateLeft — no failure detection timeout needed.
+func (s *Server) handleLeaving(addr string, msgGen uint64) error {
+	self := s.serverOpts.transport.Addr()
+	log.Printf("[TRACE][handleLeaving] self=%s received LEAVING from addr=%s msgGen=%d", self, addr, msgGen)
+
+	s.peerLock.RLock()
+	_, inPeers := s.peers[addr]
+	s.peerLock.RUnlock()
+	log.Printf("[TRACE][handleLeaving] self=%s addr=%s inPeers=%v ring_size_before=%d", self, addr, inPeers, s.HashRing.Size())
+
+	s.HashRing.RemoveNode(addr)
+	log.Printf("[TRACE][handleLeaving] self=%s addr=%s ring_size_after=%d", self, addr, s.HashRing.Size())
+
+	if s.Cluster != nil {
+		info, ok := s.Cluster.GetNode(addr)
+		// Use msgGen+1 so StateLeft beats any stale gossip digest the leaving node
+		// already sent (which carries generation == msgGen == its epoch timestamp).
+		gen := msgGen + 1
+		if gen == 0 || (!ok && msgGen == 0) {
+			// Fallback if generation wasn't provided (old peer / zero value).
+			gen = uint64(1)
+			if ok {
+				gen = info.Generation + 1
+			}
+		}
+		log.Printf("[TRACE][handleLeaving] self=%s updating cluster state addr=%s to StateLeft gen=%d (msgGen=%d was_known=%v prev_gen=%d prev_state=%v)",
+			self, addr, gen, msgGen, ok, info.Generation, info.State)
+		s.Cluster.UpdateState(addr, membership.StateLeft, gen)
+	}
+
+	// Remove from local peer map so heartbeats stop.
+	s.peerLock.Lock()
+	if peer, ok := s.peers[addr]; ok {
+		log.Printf("[TRACE][handleLeaving] self=%s closing peer ptr=%p for addr=%s", self, peer, addr)
+		_ = peer.Close()
+		delete(s.peers, addr)
+	}
+	s.peerLock.Unlock()
+
+	metrics.PeerCount.Set(float64(len(s.peers)))
+	log.Printf("[TRACE][handleLeaving] self=%s DONE for addr=%s ring_size=%d peer_count=%d", self, addr, s.HashRing.Size(), len(s.peers))
+	return nil
 }
 
 func (s *Server) Broadcast(d Message) error {
@@ -927,15 +1104,8 @@ func (s *Server) Broadcast(d Message) error {
 	for addr, peer := range peersCopy {
 		log.Printf("[Broadcast] Sending message to peer: %s\n", addr)
 
-		err := peer.Send([]byte{peer2peer.IncomingMessage})
-		if err != nil {
-			log.Printf("[Broadcast] Error sending control byte to %s: %v\n", addr, err)
-			errs = append(errs, fmt.Errorf("peer %s: %w", addr, err))
-			continue
-		}
-
-		if err := peer.Send(buf.Bytes()); err != nil {
-			log.Printf("[Broadcast] Error sending actual message to %s: %v\n", addr, err)
+		if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+			log.Printf("[Broadcast] Error sending message to %s: %v\n", addr, err)
 			errs = append(errs, fmt.Errorf("peer %s: %w", addr, err))
 			continue
 		}
@@ -971,6 +1141,7 @@ func NewServer(opts ServerOpts) *Server {
 		}),
 		quitch:      make(chan struct{}),
 		pendingFile: make(map[string]chan io.Reader),
+		dialingSet:  make(map[string]struct{}),
 	}
 }
 
@@ -1056,7 +1227,7 @@ func (s *Server) loop() {
 			log.Printf("[loop] Decoded message: %+v\n", message)
 			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
-			if err := s.handleMessage(RPC.From.String(), &message); err != nil {
+			if err := s.handleMessage(RPC.From.String(), &message, RPC.StreamWg); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
 				continue
 			}
@@ -1068,14 +1239,14 @@ func (s *Server) loop() {
 	}
 }
 
-func (s *Server) handleMessage(from string, msg *Message) error {
+func (s *Server) handleMessage(from string, msg *Message, streamWg *sync.WaitGroup) error {
 	log.Printf("[handleMessage] Handling message from %s: Type=%s\n",
 		from, strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main."))
 
 	switch m := msg.Payload.(type) {
 	case *MessageStoreFile:
 		log.Printf("[handleMessage] Detected MessageStoreFile from %s\n", from)
-		return s.handleStoreMessage(from, m)
+		return s.handleStoreMessage(from, m, streamWg)
 
 	case *MessageGetFile:
 		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
@@ -1083,7 +1254,7 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 
 	case *MessageLocalFile:
 		log.Printf("[handleMessage] Detected MessageLocalFile from %s\n", from)
-		return s.handleLocalMessage(from, m)
+		return s.handleLocalMessage(from, m, streamWg)
 
 	case *MessageHeartbeat:
 		return s.handleHeartbeat(from, m)
@@ -1160,6 +1331,46 @@ func (s *Server) handleMessage(from string, msg *Message) error {
 		}
 		return nil
 
+	case *MessageLeaving:
+		return s.handleLeaving(m.From, m.Generation)
+
+	case *MessageStoreManifest:
+		var manifest chunker.ChunkManifest
+		if err := json.Unmarshal(m.ManifestJSON, &manifest); err != nil {
+			return fmt.Errorf("handleMessage: unmarshal manifest: %w", err)
+		}
+		if err := s.serverOpts.metaData.SetManifest(m.FileKey, &manifest); err != nil {
+			return fmt.Errorf("handleMessage: SetManifest: %w", err)
+		}
+		// Mark the key as chunked so GetData on this node takes the fast path
+		// without needing to fetch the manifest from a peer again.
+		fm, _ := s.serverOpts.metaData.Get(m.FileKey)
+		fm.Chunked = true
+		_ = s.serverOpts.metaData.Set(m.FileKey, fm)
+		return nil
+
+	case *MessageGetManifest:
+		// Peer is asking for our copy of the manifest. Reply immediately.
+		resp := &MessageManifestResponse{FileKey: m.FileKey}
+		if manifest, ok := s.serverOpts.metaData.GetManifest(m.FileKey); ok {
+			if data, err := json.Marshal(manifest); err == nil {
+				resp.ManifestJSON = data
+			}
+		}
+		_ = s.sendToAddr(from, &Message{Payload: resp})
+		return nil
+
+	case *MessageManifestResponse:
+		// Deliver to any pending fetchManifest caller waiting on this key.
+		s.mu.Lock()
+		ch, ok := s.pendingFile["__manifest__"+m.FileKey]
+		s.mu.Unlock()
+		if ok && len(m.ManifestJSON) > 0 {
+			// Wrap JSON in a bytes.Buffer and send on the channel.
+			ch <- bytes.NewReader(m.ManifestJSON)
+		}
+		return nil
+
 	default:
 		typeName := strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main.")
 		log.Printf("[handleMessage] Unknown message type %s from %s\n", typeName, from)
@@ -1184,11 +1395,8 @@ func (s *Server) sendToAddr(addr string, msg *Message) error {
 		return fmt.Errorf("sendToAddr: encode: %w", err)
 	}
 
-	if err := peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-		return fmt.Errorf("sendToAddr: send control byte to %s: %w", addr, err)
-	}
-	if err := peer.Send(buf.Bytes()); err != nil {
-		return fmt.Errorf("sendToAddr: send payload to %s: %w", addr, err)
+	if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+		return fmt.Errorf("sendToAddr: send to %s: %w", addr, err)
 	}
 	return nil
 }
@@ -1239,37 +1447,23 @@ func (s *Server) handleGetMessage(from string, msg *MessageGetFile) error {
 		return err
 	}
 
-	if err = peer.Send([]byte{peer2peer.IncomingMessage}); err != nil {
-		return err
-	}
-
-	if err := peer.Send(buf.Bytes()); err != nil {
-		log.Printf("[HANDLE_GET] Error sending actual message to %s: %v\n", from, err)
-		return err
-	}
-
-	log.Printf("[HANDLE_GET] Successfully sent message to %s\n", from)
-
-	time.Sleep(time.Millisecond * 50)
-
-	log.Printf("HANDLE_GET: Sending stream signal to peer '%s'", from)
-	if err = peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
-		log.Printf("HANDLE_GET: Failed to signal stream to '%s': %v", from, err)
-		// Not returning error here so we still attempt to send file
-	}
-
-	log.Printf("HANDLE_GET: Sending file data for key '%s' to peer '%s'", msg.Key, from)
-	n, err := io.Copy(peer, r)
+	// Read the file bytes so we can send the entire message+stream atomically.
+	fileData, err := io.ReadAll(r)
 	if err != nil {
-		log.Printf("HANDLE_GET: Failed to send file data to peer '%s': %v", from, err)
+		return fmt.Errorf("HANDLE_GET: reading file data: %w", err)
+	}
+
+	if err = peer.SendStream(buf.Bytes(), fileData); err != nil {
+		log.Printf("[HANDLE_GET] Error sending message+stream to %s: %v\n", from, err)
 		return err
 	}
-	log.Printf("HANDLE_GET: Successfully sent %d bytes to peer '%s' for key '%s'", n, from, msg.Key)
+
+	log.Printf("HANDLE_GET: Successfully sent %d bytes to peer '%s' for key '%s'", len(fileData), from, msg.Key)
 
 	return nil
 }
 
-func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
+func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile, streamWg *sync.WaitGroup) error {
 	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
 
 	s.peerLock.RLock()
@@ -1289,11 +1483,15 @@ func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
 	}
 
 	log.Println("HANDLE_STORE: Closing stream...")
-	peer.CloseStream()
+	if streamWg != nil {
+		streamWg.Done()
+	}
 
-	// Save the encrypted key to local metadata so this node can decrypt the file
+	// Merge EncryptedKey into existing FileMeta (preserves Path set by WriteStream).
 	if msg.EncryptedKey != "" {
-		if err := s.serverOpts.metaData.Set(msg.Key, storage.FileMeta{EncryptedKey: msg.EncryptedKey}); err != nil {
+		fm, _ := s.serverOpts.metaData.Get(msg.Key)
+		fm.EncryptedKey = msg.EncryptedKey
+		if err := s.serverOpts.metaData.Set(msg.Key, fm); err != nil {
 			log.Printf("HANDLE_STORE: Failed to save metadata for key %s: %v", msg.Key, err)
 			return err
 		}
@@ -1303,7 +1501,7 @@ func (s *Server) handleStoreMessage(from string, msg *MessageStoreFile) error {
 	return nil
 }
 
-func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
+func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile, streamWg *sync.WaitGroup) error {
 	s.peerLock.RLock()
 	peer, ok := s.peers[from]
 	s.peerLock.RUnlock()
@@ -1318,14 +1516,9 @@ func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
 	}
 	log.Printf("HANDLE_LOCAL: Stored %d bytes from %s", n, from)
 
-	// Get metadata
-	fm, ok := s.serverOpts.metaData.Get(msg.Key)
-	if !ok {
-		log.Printf("HANDLE_LOCAL: Missing metadata for %s", msg.Key)
-		return fmt.Errorf("missing metadata")
-	}
-
-	// Read encrypted data
+	// Read the raw encrypted bytes back from the store.
+	// Callers (fetchChunkFromPeers / fetchChunkFromPeer) expect encrypted bytes
+	// and perform decryption themselves — do NOT decrypt here.
 	_, r, err := s.Store.ReadStream(msg.Key)
 	if err != nil {
 		log.Printf("HANDLE_LOCAL: Read error for %s: %v", msg.Key, err)
@@ -1335,30 +1528,23 @@ func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
 
 	log.Printf("HANDLE_LOCAL: Key = %s, ExpectedSize = %d, WrittenSize = %d", msg.Key, msg.Size, n)
 
-	decodedKey, err := hex.DecodeString(fm.EncryptedKey)
-	if err != nil {
-		return fmt.Errorf("failed to decode hex key: %w", err)
-	}
-
-	log.Printf("HANDLE_LOCAL: EncryptedKey = %x", decodedKey)
-
-	// Decrypt using streaming (reads/decrypts in chunks)
-	var decryptedBuf bytes.Buffer
-	err = s.serverOpts.Encryption.DecryptStream(r, &decryptedBuf, decodedKey)
-	if err != nil {
-		log.Printf("HANDLE_LOCAL: Decryption error: %v", err)
+	var encBuf bytes.Buffer
+	if _, err = io.Copy(&encBuf, r); err != nil {
+		log.Printf("HANDLE_LOCAL: Copy error for %s: %v", msg.Key, err)
 		return err
 	}
 
-	peer.CloseStream()
-	log.Printf("HANDLE_LOCAL: Successfully retrieved '%s' from %s", msg.Key, from)
+	if streamWg != nil {
+		streamWg.Done()
+	}
+	log.Printf("HANDLE_LOCAL: Successfully retrieved '%s' from %s (enc bytes=%d)", msg.Key, from, encBuf.Len())
 
 	s.mu.Lock()
 	ch, ok := s.pendingFile[msg.Key]
 	s.mu.Unlock()
 
 	if ok {
-		ch <- &decryptedBuf
+		ch <- &encBuf
 	} else {
 		log.Printf("HANDLE_LOCAL: No waiting channel for key %s", msg.Key)
 	}
@@ -1367,19 +1553,48 @@ func (s *Server) handleLocalMessage(from string, msg *MessageLocalFile) error {
 }
 
 func (s *Server) Stop() {
-	close(s.quitch)
+	s.shutdownOnce.Do(func() { close(s.quitch) })
 }
 
 func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	addr := p.RemoteAddr().String()
+	self := s.serverOpts.transport.Addr()
+	log.Printf("[TRACE][OnPeerDisconnect] self=%s addr=%s outbound=%v ptr=%p", self, addr, p.Outbound(), p)
 
 	s.peerLock.Lock()
-	delete(s.peers, addr)
-	peerCount := len(s.peers)
+	// Only remove from map if the disconnecting peer is the SAME object
+	// currently stored. A duplicate connection that was rejected should
+	// not remove the surviving connection's map entry.
+	current, ok := s.peers[addr]
+	samePtr := ok && current == p
+	if samePtr {
+		delete(s.peers, addr)
+	}
 	s.peerLock.Unlock()
+	log.Printf("[TRACE][OnPeerDisconnect] self=%s addr=%s map_had_entry=%v same_ptr=%v current_ptr=%p disconnect_ptr=%p",
+		self, addr, ok, samePtr, current, p)
 
+	// Only outbound peers were added to the ring / membership.
+	if !p.Outbound() {
+		log.Printf("[TRACE][OnPeerDisconnect] INBOUND closed: self=%s addr=%s (no ring change)", self, addr)
+		return
+	}
+
+	// If this was a duplicate that was rejected (surviving connection is still in map),
+	// or if the entry was already cleaned up by handleLeaving (!ok), don't touch the ring.
+	if !samePtr {
+		if ok {
+			log.Printf("[TRACE][OnPeerDisconnect] DUPLICATE outbound closed: self=%s addr=%s ring_size=%d (ring untouched)", self, addr, s.HashRing.Size())
+		} else {
+			log.Printf("[TRACE][OnPeerDisconnect] ALREADY_CLEANED outbound closed: self=%s addr=%s (handleLeaving already removed, ring untouched)", self, addr)
+		}
+		return
+	}
+
+	log.Printf("[TRACE][OnPeerDisconnect] REMOVING from ring: self=%s addr=%s ring_size_before=%d", self, addr, s.HashRing.Size())
 	s.HashRing.RemoveNode(addr)
-	log.Printf("[OnPeerDisconnect] Removed peer: %s (ring size: %d)\n", addr, s.HashRing.Size())
+	peerCount := s.outboundPeerCount()
+	log.Printf("[TRACE][OnPeerDisconnect] RING UPDATED: self=%s removed=%s ring_size=%d peer_count=%d", self, addr, s.HashRing.Size(), peerCount)
 	metrics.SetPeerCount(peerCount)
 	metrics.SetRingSize(s.HashRing.Size())
 
@@ -1391,8 +1606,22 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	// Sprint 3: mark as suspect in membership table.
 	if s.Cluster != nil {
 		nextGen := s.Cluster.NextGeneration(addr)
+		log.Printf("[TRACE][OnPeerDisconnect] updating cluster: self=%s addr=%s to StateSuspect gen=%d", self, addr, nextGen)
 		s.Cluster.UpdateState(addr, membership.StateSuspect, nextGen)
 	}
+}
+
+// outboundPeerCount returns the number of outbound (real) peer connections.
+func (s *Server) outboundPeerCount() int {
+	s.peerLock.RLock()
+	defer s.peerLock.RUnlock()
+	count := 0
+	for _, p := range s.peers {
+		if p.Outbound() {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Server) BootstrapNetwork() error {
@@ -1418,14 +1647,39 @@ func (s *Server) BootstrapNetwork() error {
 
 func (s *Server) OnPeer(p peer2peer.Peer) error {
 	addr := p.RemoteAddr().String()
+	self := s.serverOpts.transport.Addr()
+	log.Printf("[TRACE][OnPeer] self=%s addr=%s outbound=%v ptr=%p", self, addr, p.Outbound(), p)
 
+	// Only outbound peers have a RemoteAddr() equal to the real listen
+	// address. Inbound connections carry an ephemeral OS-assigned port
+	// and must NOT enter the hash ring or cluster membership table.
+	if !p.Outbound() {
+		s.peerLock.Lock()
+		s.peers[addr] = p
+		s.peerLock.Unlock()
+		log.Printf("[TRACE][OnPeer] INBOUND accepted from %s (not added to ring) self=%s", addr, self)
+		return nil
+	}
+
+	// For outbound connections, check if we already have an outbound
+	// connection to this listen address. If so, skip — the existing
+	// connection is fine and we don't want duplicates fighting.
 	s.peerLock.Lock()
+	existing, alreadyConnected := s.peers[addr]
+	if alreadyConnected && existing.Outbound() {
+		s.peerLock.Unlock()
+		log.Printf("[TRACE][OnPeer] DUPLICATE outbound to %s on self=%s — closing new ptr=%p keeping ptr=%p", addr, self, p, existing)
+		p.Close()
+		return nil
+	}
+	log.Printf("[TRACE][OnPeer] STORING outbound to %s on self=%s ptr=%p (prev entry existed=%v prevOutbound=%v)",
+		addr, self, p, alreadyConnected, alreadyConnected && existing.Outbound())
 	s.peers[addr] = p
-	peerCount := len(s.peers)
 	s.peerLock.Unlock()
 
 	s.HashRing.AddNode(addr)
-	log.Printf("[OnPeer] Connected with remote peer: %s (ring size: %d)\n", addr, s.HashRing.Size())
+	peerCount := s.outboundPeerCount()
+	log.Printf("[TRACE][OnPeer] RING UPDATED self=%s added=%s ring_size=%d peer_count=%d", self, addr, s.HashRing.Size(), peerCount)
 	metrics.SetPeerCount(peerCount)
 	metrics.SetRingSize(s.HashRing.Size())
 
@@ -1466,6 +1720,10 @@ func init() {
 	gob.Register(&MessageQuorumReadResponse{})
 	gob.Register(&MessageMerkleSync{})
 	gob.Register(&MessageMerkleDiffResponse{})
+	gob.Register(&MessageLeaving{})
+	gob.Register(&MessageStoreManifest{})
+	gob.Register(&MessageGetManifest{})
+	gob.Register(&MessageManifestResponse{})
 }
 
 func MakeServer(listenAddr string, replicationFactor int, node ...string) *Server {
@@ -1553,13 +1811,15 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	s.HeartbeatSvc = failure.NewHeartbeatService(
 		hbCfg,
 		listenAddr,
-		// getPeers closure: returns all currently connected peer addresses
+		// getPeers closure: returns listen addresses of outbound peers only
 		func() []string {
 			s.peerLock.RLock()
 			defer s.peerLock.RUnlock()
 			addrs := make([]string, 0, len(s.peers))
-			for addr := range s.peers {
-				addrs = append(addrs, addr)
+			for addr, p := range s.peers {
+				if p.Outbound() {
+					addrs = append(addrs, addr)
+				}
 			}
 			return addrs
 		},
@@ -1595,13 +1855,24 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		s.HandoffSvc = handoff.NewHandoffService(hintStore,
 			// deliver closure: resend a hint's encrypted data to its target
 			func(h handoff.Hint) error {
-				return s.sendToAddr(h.TargetAddr, &Message{
+				msg := &Message{
 					Payload: &MessageStoreFile{
 						Key:          h.Key,
 						Size:         int64(len(h.Data)),
 						EncryptedKey: h.EncryptedKey,
 					},
-				})
+				}
+				buf := new(bytes.Buffer)
+				if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+					return err
+				}
+				s.peerLock.RLock()
+				peer, ok := s.peers[h.TargetAddr]
+				s.peerLock.RUnlock()
+				if !ok {
+					return fmt.Errorf("handoff deliver: peer %s not connected", h.TargetAddr)
+				}
+				return peer.SendStream(buf.Bytes(), h.Data)
 			},
 		)
 	}
@@ -1621,23 +1892,18 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 					EncryptedKey: encKey,
 				},
 			}
-			if err := s.sendToAddr(targetAddr, msg); err != nil {
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(msg); err != nil {
 				return err
 			}
-			// Give the peer a moment to process the metadata message
-			time.Sleep(50 * time.Millisecond)
 
 			s.peerLock.RLock()
 			peer, ok := s.peers[targetAddr]
 			s.peerLock.RUnlock()
 			if !ok {
-				return fmt.Errorf("rebalance: peer %s disconnected before stream", targetAddr)
+				return fmt.Errorf("rebalance: peer %s not connected", targetAddr)
 			}
-			if err := peer.Send([]byte{peer2peer.IncomingStream}); err != nil {
-				return err
-			}
-			_, err := io.Copy(peer, bytes.NewReader(data))
-			return err
+			return peer.SendStream(buf.Bytes(), data)
 		},
 	)
 
@@ -1668,11 +1934,11 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 			if _, err := s.Store.WriteStream(key, bytes.NewReader(data)); err != nil {
 				return err
 			}
-			return s.serverOpts.metaData.Set(key, storage.FileMeta{
-				EncryptedKey: encKey,
-				VClock:       map[string]uint64(clock),
-				Timestamp:    time.Now().UnixNano(),
-			})
+			fm, _ := s.serverOpts.metaData.Get(key)
+			fm.EncryptedKey = encKey
+			fm.VClock = map[string]uint64(clock)
+			fm.Timestamp = time.Now().UnixNano()
+			return s.serverOpts.metaData.Set(key, fm)
 		},
 		// localRead: return metadata for the conflict resolver
 		func(key string) (vclock.VectorClock, int64, string, bool) {
@@ -1813,11 +2079,43 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 				return fmt.Errorf("gossip sendMsg: unknown message type %T", msg)
 			}
 		},
-		// onNewPeer: dial a peer discovered through gossip
+		// onNewPeer: dial a peer discovered through gossip.
+		// Guards against concurrent duplicate dials via dialingSet.
 		func(addr string) {
-			log.Printf("[gossip] dialling newly discovered peer %s", addr)
+			self := s.serverOpts.transport.Addr()
+
+			// Check peers map first — fastest path.
+			s.peerLock.RLock()
+			existing, already := s.peers[addr]
+			s.peerLock.RUnlock()
+			log.Printf("[TRACE][onNewPeer] self=%s addr=%s already_connected=%v existing_ptr=%p", self, addr, already, existing)
+			if already {
+				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (already in peers map)", self, addr)
+				return
+			}
+
+			// Grab exclusive dialing lock to prevent concurrent dials to the same addr.
+			s.dialingLock.Lock()
+			if _, dialing := s.dialingSet[addr]; dialing {
+				s.dialingLock.Unlock()
+				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (dial already in progress)", self, addr)
+				return
+			}
+			s.dialingSet[addr] = struct{}{}
+			s.dialingLock.Unlock()
+
+			// Always remove from set when done (success or failure).
+			defer func() {
+				s.dialingLock.Lock()
+				delete(s.dialingSet, addr)
+				s.dialingLock.Unlock()
+			}()
+
+			log.Printf("[TRACE][onNewPeer] DIALLING self=%s -> addr=%s ring_size_before=%d", self, addr, s.HashRing.Size())
 			if err := s.serverOpts.transport.Dial(addr); err != nil {
-				log.Printf("[gossip] failed to dial %s: %v", addr, err)
+				log.Printf("[TRACE][onNewPeer] DIAL FAILED self=%s -> addr=%s err=%v", self, addr, err)
+			} else {
+				log.Printf("[TRACE][onNewPeer] DIAL OK self=%s -> addr=%s", self, addr)
 			}
 		},
 	)

@@ -39,7 +39,7 @@ type peerWindow struct {
 	mu          sync.Mutex
 	intervals   []float64 // ring buffer
 	head        int       // next write position
-	count        int       // number of filled slots (≤ capacity)
+	count       int       // number of filled slots (≤ capacity)
 	lastArrival time.Time // wall time of last recorded heartbeat
 	capacity    int
 }
@@ -194,7 +194,7 @@ const (
 )
 
 type peerEntry struct {
-	state       atomic.Int32  // peerStateVal stored atomically
+	state        atomic.Int32 // peerStateVal stored atomically
 	suspectSince time.Time
 	mu           sync.Mutex // protects suspectSince
 }
@@ -202,9 +202,9 @@ type peerEntry struct {
 // HeartbeatService sends periodic heartbeats to all peers and drives the
 // phi accrual reaper that fires onSuspect / onDead callbacks.
 type HeartbeatService struct {
-	cfg       Config
-	selfAddr  string
-	detector  *PhiAccrualDetector
+	cfg      Config
+	selfAddr string
+	detector *PhiAccrualDetector
 
 	// getPeers returns the current set of connected peer addresses.
 	// It is a closure over the server's peers map — called each tick.
@@ -221,8 +221,9 @@ type HeartbeatService struct {
 	mu     sync.RWMutex
 	states map[string]*peerEntry
 
-	stopCh chan struct{}
-	once   sync.Once
+	stopCh   chan struct{}
+	once     sync.Once
+	stopOnce sync.Once
 }
 
 // NewHeartbeatService creates a new HeartbeatService.
@@ -256,9 +257,9 @@ func (hs *HeartbeatService) Start() {
 	})
 }
 
-// Stop shuts down both goroutines.
+// Stop shuts down both goroutines. Safe to call multiple times.
 func (hs *HeartbeatService) Stop() {
-	close(hs.stopCh)
+	hs.stopOnce.Do(func() { close(hs.stopCh) })
 }
 
 // RecordHeartbeat must be called whenever a heartbeat arrives from addr.

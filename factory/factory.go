@@ -22,7 +22,7 @@ func newTCPTransport(listenAddr string, opts Options) peer2peer.Transport {
 	return peer2peer.NewTCPTransport(peer2peer.TCPTransportOpts{
 		ListenAddr:       listenAddr,
 		HandshakeFunc:    peer2peer.NOPEHandshakeFunc,
-		Decoder:          peer2peer.GOBDecoder{},
+		Decoder:          peer2peer.DefaultDecoder{},
 		TLSConfig:        opts.TLSConfig,
 		OnPeer:           opts.OnPeer,
 		OnPeerDisconnect: opts.OnPeerDisconnect,

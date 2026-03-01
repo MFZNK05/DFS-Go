@@ -42,8 +42,8 @@ func newQUICPeer(conn *quic.Conn, outbound bool) *QUICPeer {
 	return &QUICPeer{conn: conn, outbound: outbound}
 }
 
-func (p *QUICPeer) RemoteAddr() net.Addr { return p.conn.RemoteAddr() }
-func (p *QUICPeer) LocalAddr() net.Addr  { return p.conn.LocalAddr() }
+func (p *QUICPeer) RemoteAddr() net.Addr       { return p.conn.RemoteAddr() }
+func (p *QUICPeer) LocalAddr() net.Addr        { return p.conn.LocalAddr() }
 func (p *QUICPeer) Read(_ []byte) (int, error) { return 0, io.EOF }
 
 func (p *QUICPeer) Write(b []byte) (int, error) {
@@ -56,8 +56,26 @@ func (p *QUICPeer) Write(b []byte) (int, error) {
 }
 
 func (p *QUICPeer) Send(b []byte) error { _, err := p.Write(b); return err }
-func (p *QUICPeer) CloseStream()        { p.wg.Done() }
-func (p *QUICPeer) Close() error        { return p.conn.CloseWithError(0, "peer closed") }
+func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
+	if _, err := p.Write([]byte{controlByte}); err != nil {
+		return err
+	}
+	_, err := p.Write(payload)
+	return err
+}
+func (p *QUICPeer) SendStream(msgPayload []byte, streamData []byte) error {
+	if _, err := p.Write([]byte{peer2peer.IncomingMessageWithStream}); err != nil {
+		return err
+	}
+	if _, err := p.Write(msgPayload); err != nil {
+		return err
+	}
+	_, err := p.Write(streamData)
+	return err
+}
+func (p *QUICPeer) CloseStream()   { p.wg.Done() }
+func (p *QUICPeer) Close() error   { return p.conn.CloseWithError(0, "peer closed") }
+func (p *QUICPeer) Outbound() bool { return p.outbound }
 
 func (p *QUICPeer) SetDeadline(t time.Time) error      { return nil }
 func (p *QUICPeer) SetReadDeadline(t time.Time) error  { return nil }
@@ -99,8 +117,8 @@ func New(opts TransportOpts) (*Transport, error) {
 	}, nil
 }
 
-func (t *Transport) Addr() string                    { return t.opts.ListenAddr }
-func (t *Transport) Consume() <-chan peer2peer.RPC   { return t.rpcCh }
+func (t *Transport) Addr() string                  { return t.opts.ListenAddr }
+func (t *Transport) Consume() <-chan peer2peer.RPC { return t.rpcCh }
 
 func (t *Transport) ListenAndAccept() error {
 	cfg := t.tlsCfg.Clone()
@@ -205,19 +223,33 @@ func (t *Transport) handleStream(stream *quic.Stream, from net.Addr, peer *QUICP
 		return
 	}
 
-	if ctrl[0] == peer2peer.IncomingStream {
+	switch ctrl[0] {
+	case peer2peer.IncomingStream:
 		peer.wg.Add(1)
 		t.rpcCh <- peer2peer.RPC{From: from, Stream: true}
 		peer.wg.Wait()
 		return
-	}
 
-	payload, err := io.ReadAll(stream)
-	if err != nil {
-		log.Printf("[QUIC] read payload from %s: %v", from, err)
+	case peer2peer.IncomingMessageWithStream:
+		payload, err := io.ReadAll(stream)
+		if err != nil {
+			log.Printf("[QUIC] read payload (msg+stream) from %s: %v", from, err)
+			return
+		}
+		var streamWg sync.WaitGroup
+		streamWg.Add(1)
+		t.rpcCh <- peer2peer.RPC{From: from, Payload: payload, Stream: true, StreamWg: &streamWg}
+		streamWg.Wait()
 		return
+
+	default:
+		payload, err := io.ReadAll(stream)
+		if err != nil {
+			log.Printf("[QUIC] read payload from %s: %v", from, err)
+			return
+		}
+		t.rpcCh <- peer2peer.RPC{From: from, Payload: payload}
 	}
-	t.rpcCh <- peer2peer.RPC{From: from, Payload: payload}
 }
 
 func selfSignedTLS() (*tls.Config, error) {

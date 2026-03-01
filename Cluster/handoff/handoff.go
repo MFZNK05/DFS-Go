@@ -23,7 +23,7 @@ type Hint struct {
 	Key          string    `json:"key"`
 	TargetAddr   string    `json:"target_addr"`
 	EncryptedKey string    `json:"encrypted_key"` // hex-encoded per-file AES key
-	Data         []byte    `json:"data"`           // encrypted file bytes
+	Data         []byte    `json:"data"`          // encrypted file bytes
 	CreatedAt    time.Time `json:"created_at"`
 	Attempts     int       `json:"attempts"`
 }
@@ -240,7 +240,6 @@ func sanitiseAddr(addr string) string {
 	return r.Replace(addr)
 }
 
-
 // -------------------------------------------------------------------
 // HandoffService watches for peer reconnections and delivers hints.
 // -------------------------------------------------------------------
@@ -253,10 +252,11 @@ type DeliverFunc func(hint Hint) error
 
 // HandoffService coordinates hint storage and delivery.
 type HandoffService struct {
-	store   *Store
-	deliver DeliverFunc
-	stopCh  chan struct{}
-	once    sync.Once
+	store    *Store
+	deliver  DeliverFunc
+	stopCh   chan struct{}
+	once     sync.Once
+	stopOnce sync.Once
 }
 
 // NewHandoffService creates a HandoffService backed by store.
@@ -277,7 +277,9 @@ func (hs *HandoffService) Start() {
 
 // Stop shuts down the background goroutine.
 func (hs *HandoffService) Stop() {
-	close(hs.stopCh)
+	hs.stopOnce.Do(func() {
+		close(hs.stopCh)
+	})
 }
 
 // OnPeerReconnect is called by server.OnPeer when a peer reconnects.

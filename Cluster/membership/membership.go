@@ -72,10 +72,17 @@ func New(selfAddr string) *ClusterState {
 		selfAddr: selfAddr,
 		nodes:    make(map[string]*NodeInfo),
 	}
+	// Use Unix nanoseconds as initial generation so a restarted node always
+	// advertises a generation strictly higher than any stale record on its peers,
+	// even when the node leaves and rejoins within the same second.
+	gen := uint64(time.Now().UnixNano())
+	if gen < 2 {
+		gen = 2 // safety floor
+	}
 	cs.nodes[selfAddr] = &NodeInfo{
 		Addr:        selfAddr,
 		State:       StateAlive,
-		Generation:  1,
+		Generation:  gen,
 		LastUpdated: time.Now(),
 		Metadata:    make(map[string]string),
 	}
