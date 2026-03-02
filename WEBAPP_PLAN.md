@@ -5,6 +5,349 @@
 ### (Read after Sprint 8 distributed core is complete)
 ---
 
+## Architectural Foundations
+
+This document answers every critical design question head-on before diving into implementation. Each section maps a concrete doubt to a concrete decision with rationale.
+
+---
+
+## Pillar 1: Network Topology — "Browser as a Peer" Resolved
+
+**The Doubt:** Can all web app users actually be peers in the network?
+
+**The Answer: No. And they don't need to be.**
+
+Browsers cannot open raw TCP/QUIC listen sockets. A React/Next.js app running in Chrome cannot join the DFS-Go hash ring. This is a fundamental browser sandbox limitation.
+
+**Decision: Gateway Model (Option A)**
+
+We deploy a small cluster of Go DFS nodes on backend infrastructure (Raspberry Pi, lab PCs, or a single always-on machine). The web app is a thin HTTP client that talks to an API gateway co-located with a DFS node. Students never install anything — they open a browser.
+
+**Why not the Local Daemon Model?** Requiring 500+ students to download, install, and background-run a Go binary is a non-starter for adoption. The Gateway Model lets us launch with zero friction.
+
+---
+
+## Pillar 2: Identity, Access Control & Namespaces
+
+**The Doubt:** How do we handle different scopes — departments, societies, 1-on-1, and private files?
+
+**The Answer: The P2P layer stays dumb. All access control lives in the Metadata Service.**
+
+The DFS nodes only know about `chunk:hash` keys. They enforce zero access policy. The PostgreSQL metadata layer maps human identity → file ownership → group membership → access grants.
+
+### Scope Model
+
+```
+┌─────────────────────────────────────────────────┐
+│                   Visibility                     │
+├─────────────────────────────────────────────────┤
+│  public    │ Anyone in the college can see/download │
+│  dept      │ Only students in same department       │
+│  group     │ Only members of a specific group       │
+│  private   │ Only the uploader + explicit grantees  │
+└─────────────────────────────────────────────────┘
+```
+
+### Groups (Departments, Societies, Ad-Hoc)
+
+```sql
+CREATE TABLE groups (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL CHECK (type IN ('department', 'society', 'custom')),
+    created_by  UUID REFERENCES users(id),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE group_members (
+    group_id    UUID REFERENCES groups(id) ON DELETE CASCADE,
+    user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+    role        TEXT DEFAULT 'member' CHECK (role IN ('member', 'admin', 'owner')),
+    joined_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (group_id, user_id)
+);
+
+-- Departments are pre-seeded groups of type='department'
+-- INSERT INTO groups (name, type) VALUES ('CSE', 'department'), ('ECE', 'department'), ...
+-- Students are auto-added to their department group on signup
+```
+
+### File Access Control
+
+```sql
+-- resources table gets a visibility column
+ALTER TABLE resources ADD COLUMN visibility TEXT DEFAULT 'public'
+    CHECK (visibility IN ('public', 'dept', 'group', 'private'));
+
+-- For group/private files, explicit grants
+CREATE TABLE file_shares (
+    resource_id UUID REFERENCES resources(id) ON DELETE CASCADE,
+    grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'group')),
+    grantee_id  UUID NOT NULL,  -- user.id or group.id
+    granted_by  UUID REFERENCES users(id),
+    granted_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (resource_id, grantee_type, grantee_id)
+);
+```
+
+### Access Check Middleware (Go)
+
+```go
+func canAccessFile(userID, resourceID uuid.UUID) bool {
+    r := db.GetResource(resourceID)
+    switch r.Visibility {
+    case "public":
+        return true
+    case "dept":
+        return db.UserDept(userID) == r.Dept
+    case "group":
+        // Check if user is in ANY group that has a share grant
+        return db.HasGroupAccess(userID, resourceID)
+    case "private":
+        return r.UploaderID == userID || db.HasDirectShare(userID, resourceID)
+    }
+    return false
+}
+```
+
+**1-on-1 sharing:** The uploader sets `visibility=private`, then creates a `file_shares` row with `grantee_type=user, grantee_id=<friend>`. The friend can now download.
+
+**Society files:** A society president creates a group, adds members. Uploads with `visibility=group` and a `file_shares` row pointing to the group. All members can download.
+
+---
+
+## Pillar 3: Production Security & Key Management
+
+**The Doubt:** Currently testing by sharing encrypted keys and mTLS manually. How does this work in production?
+
+**The Answer: Hybrid Encryption + automated CA provisioning.**
+
+### Current Problem
+
+Right now, `DFS_ENCRYPTION_KEY` is a single env var. Every node uses the same master key. Every chunk is decryptable by anyone who runs the daemon. This is symmetric encryption with a shared secret — fine for a P2P mesh where all nodes are trusted infrastructure, but it means the **API gateway** (which has the key) is the sole gatekeeper.
+
+### Production Security Design
+
+**Layer 1 — Node-to-Node (mTLS): Already Solved**
+
+Your `Crypto/tls.go` already implements full mTLS with ECDSA P-256. In production:
+- Generate CA once on the gateway/Pi
+- Copy CA cert + key to all DFS nodes (or automate via config management)
+- Each node generates its own node cert signed by the CA
+- Peer connections are encrypted + mutually authenticated
+
+**Layer 2 — File Encryption: Keep Symmetric, Guard at the API**
+
+For a campus deployment with trusted infrastructure nodes, the current model is sufficient:
+- All DFS nodes share the same `DFS_ENCRYPTION_KEY`
+- The API gateway is the only path to files (students can't talk to DFS nodes directly)
+- Access control is enforced in the API middleware before calling `StoreData`/`GetData`
+
+Files are encrypted at rest on all nodes (protects against disk theft), and the API enforces who can request decryption.
+
+**Why not full hybrid encryption (per-user public keys)?**
+- Adds massive complexity (key distribution, key rotation, recovery)
+- For a college LAN where you control the infrastructure, it's overkill
+- The threat model is "protect data at rest" + "enforce access in the API", not "defend against compromised infrastructure nodes"
+
+**Layer 3 — API Security**
+- JWT tokens (HS256, 15-min access + 7-day refresh)
+- bcrypt password hashing
+- College email domain validation on signup
+- Rate limiting on auth endpoints
+- HTTPS via Nginx + self-signed cert (or Let's Encrypt if routable)
+
+### If You Later Need Per-User Encryption (Hybrid Model)
+
+```
+Upload:
+  1. Generate random AES-256 key for this file (already done)
+  2. Encrypt file with AES key (already done)
+  3. For each authorized user/group member:
+     - Encrypt the AES key with their RSA/ECDH public key
+     - Store encrypted_key_for_user in file_shares table
+  4. Store encrypted file in DFS (no master key needed)
+
+Download:
+  1. Look up user's encrypted_key entry in file_shares
+  2. User decrypts AES key with their private key (client-side)
+  3. Decrypt file stream with AES key
+```
+
+This is the Signal/WhatsApp model. Defer this to v2 — the symmetric approach works for v1.
+
+---
+
+## Pillar 4: File Mutability & Versioning
+
+**The Doubt:** If a user updates a study guide, the hash changes entirely. Is it a new file?
+
+**The Answer: Version chain in metadata, immutable chunks in DFS.**
+
+DFS chunks are content-addressed (CAS). Updating a file means new chunks with new hashes. The metadata layer tracks the version history.
+
+```sql
+ALTER TABLE resources ADD COLUMN version     INT DEFAULT 1;
+ALTER TABLE resources ADD COLUMN parent_id   UUID REFERENCES resources(id);
+ALTER TABLE resources ADD COLUMN is_latest   BOOLEAN DEFAULT true;
+
+-- When a user "updates" a file:
+-- 1. Set old resource: is_latest = false
+-- 2. Insert new resource: parent_id = old.id, version = old.version + 1, is_latest = true
+-- 3. New resource gets a new dfs_key (because content changed)
+-- 4. Old chunks are NOT deleted (see Garbage Collection below)
+```
+
+### API Changes
+
+```
+PUT /api/files/:id          multipart: new file + optional metadata updates
+                            → creates new version, preserves history
+
+GET /api/files/:id/versions → returns [{version: 1, uploaded_at, size}, {version: 2, ...}]
+GET /api/files/:id?version=1 → download specific version
+```
+
+### Implementation
+
+```go
+func updateFile(resourceID uuid.UUID, newFile io.Reader, meta ResourceMeta) error {
+    old := db.GetResource(resourceID)
+
+    // 1. Store new file in DFS
+    newKey := generateDFSKey(meta.Title, userID, time.Now())
+    server.StoreData(newKey, newFile)
+
+    // 2. Mark old as not-latest
+    db.Exec("UPDATE resources SET is_latest = false WHERE id = $1", old.ID)
+
+    // 3. Insert new version
+    db.Exec(`INSERT INTO resources (dfs_key, title, ..., version, parent_id, is_latest)
+             VALUES ($1, $2, ..., $3, $4, true)`,
+        newKey, meta.Title, old.Version+1, old.ID)
+
+    return nil
+}
+```
+
+### Default Behavior
+
+- Browse/search only shows `is_latest = true` resources
+- File detail page shows a "Version History" section
+- Downloading always gets the latest unless a specific version is requested
+
+---
+
+## Pillar 5: Distributed Garbage Collection
+
+**The Doubt:** If metadata is deleted, how do DFS nodes know it's safe to delete physical chunks?
+
+**The Answer: Reference counting + periodic sweep.**
+
+### The Problem
+
+```
+resources table:  DELETE WHERE id = X   (metadata gone)
+DFS nodes:        chunk:abc123 still on disk (orphaned, wasting space)
+```
+
+### Solution: Two-Phase GC
+
+**Phase 1 — Soft Delete + Reference Counting**
+
+```sql
+ALTER TABLE resources ADD COLUMN deleted_at TIMESTAMPTZ DEFAULT NULL;
+
+-- "Delete" = soft delete (set deleted_at, keep dfs_key reference)
+UPDATE resources SET deleted_at = NOW() WHERE id = :id;
+
+-- A chunk_refs view counts how many live resources reference each manifest
+CREATE VIEW chunk_refs AS
+SELECT dfs_key, COUNT(*) FILTER (WHERE deleted_at IS NULL) AS live_refs
+FROM resources
+GROUP BY dfs_key;
+```
+
+**Phase 2 — GC Sweep (Background Job)**
+
+```go
+// Runs every 24 hours on the API gateway
+func gcSweep() {
+    // 1. Find all soft-deleted resources older than 30 days with zero live refs
+    stale := db.Query(`
+        SELECT r.id, r.dfs_key FROM resources r
+        JOIN chunk_refs cr ON cr.dfs_key = r.dfs_key
+        WHERE r.deleted_at < NOW() - INTERVAL '30 days'
+          AND cr.live_refs = 0
+    `)
+
+    for _, r := range stale {
+        // 2. Delete chunks from DFS nodes
+        manifest := server.GetManifest(r.DFSKey)
+        if manifest != nil {
+            for _, chunk := range manifest.Chunks {
+                server.DeleteChunk(chunk.StorageKey)  // new RPC to delete from all replicas
+            }
+        }
+        server.DeleteManifest(r.DFSKey)
+
+        // 3. Hard delete metadata
+        db.Exec("DELETE FROM resources WHERE id = $1", r.ID)
+    }
+}
+```
+
+**Why 30 days?** Grace period allows:
+- Undo accidental deletes
+- Version history to remain accessible
+- DFS rebalancing to settle before chunks are removed
+
+### New DFS Message Type
+
+```go
+type MessageDeleteChunk struct {
+    Key string
+}
+// Handler: server.Store.Remove(key), metadata.Delete(key)
+// Propagated to all ring-responsible nodes
+```
+
+---
+
+## Pillar 6: Search Architecture
+
+**The Doubt:** You can't search inside encrypted P2P chunks.
+
+**The Answer: Correct. All search is in PostgreSQL.**
+
+Already addressed in the existing plan. The `tsvector` index on `resources` handles title, description, subject, and tags. Encrypted chunk data is never searched — the metadata layer is the search surface.
+
+```sql
+-- Already defined: resources.search_vec TSVECTOR with GIN index
+-- Query:
+SELECT * FROM resources
+WHERE search_vec @@ plainto_tsquery('english', $1)
+  AND is_latest = true
+  AND deleted_at IS NULL
+  AND (visibility = 'public' OR <access_check>)
+ORDER BY ts_rank(search_vec, plainto_tsquery('english', $1)) DESC
+LIMIT 20 OFFSET $2;
+```
+
+---
+
+## Pillar 7: Bootstrap & Seed Nodes
+
+**The Doubt:** Who runs the initial seed nodes for 24/7 uptime?
+
+**The Answer: You do. One Raspberry Pi.**
+
+Already addressed in the existing plan. The Pi runs 2-3 DFS nodes + API + PostgreSQL + Nginx via Docker Compose. This is the permanent anchor. Student laptops can optionally run additional DFS nodes for extra redundancy but are never required.
+
+The gossip protocol + mDNS ensures that any node that comes online automatically discovers and joins the existing cluster within seconds.
+
+---
+
 ## The Core Problem You're Solving
 
 No always-on server. ~500–2000 students. Laptops go offline constantly. Files must be available during college hours when students are active. This is exactly the BitTorrent problem — solved decades ago. The answer is **availability through replication across many peers**, not through one always-on server.
@@ -158,7 +501,9 @@ Browser (any device on LAN)
 ## Database Schema
 
 ```sql
--- users
+-- =====================================================
+-- USERS
+-- =====================================================
 CREATE TABLE users (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email        TEXT UNIQUE NOT NULL,       -- must end in @college.edu
@@ -170,10 +515,36 @@ CREATE TABLE users (
     created_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
--- resources (metadata index — actual files in DFS)
+-- =====================================================
+-- GROUPS (departments, societies, custom study groups)
+-- =====================================================
+CREATE TABLE groups (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL CHECK (type IN ('department', 'society', 'custom')),
+    description TEXT,
+    created_by  UUID REFERENCES users(id),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE group_members (
+    group_id    UUID REFERENCES groups(id) ON DELETE CASCADE,
+    user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
+    role        TEXT DEFAULT 'member' CHECK (role IN ('member', 'admin', 'owner')),
+    joined_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (group_id, user_id)
+);
+
+-- Department groups are auto-seeded on bootstrap:
+-- INSERT INTO groups (name, type) VALUES ('CSE', 'department'), ('ECE', 'department'), ...
+-- Students are auto-added to their dept group on signup
+
+-- =====================================================
+-- RESOURCES (metadata index — actual files in DFS)
+-- =====================================================
 CREATE TABLE resources (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dfs_key      TEXT UNIQUE NOT NULL,       -- key used in StoreData/GetData
+    dfs_key      TEXT NOT NULL,              -- key used in StoreData/GetData (NOT unique: versions share lineage)
     title        TEXT NOT NULL,
     description  TEXT,
     subject      TEXT,                       -- "Data Structures", "DBMS"
@@ -185,15 +556,54 @@ CREATE TABLE resources (
     tags         TEXT[],                     -- ["exam", "2024", "unit-3"]
     downloads    INT DEFAULT 0,
     repl_factor  INT DEFAULT 3,
+
+    -- Visibility / access control
+    visibility   TEXT DEFAULT 'public'
+                 CHECK (visibility IN ('public', 'dept', 'group', 'private')),
+
+    -- Versioning
+    version      INT DEFAULT 1,
+    parent_id    UUID REFERENCES resources(id),   -- previous version
+    is_latest    BOOLEAN DEFAULT true,
+
+    -- Soft delete for GC
+    deleted_at   TIMESTAMPTZ DEFAULT NULL,
+
     uploaded_at  TIMESTAMPTZ DEFAULT NOW(),
     search_vec   TSVECTOR                    -- auto-updated by trigger below
 );
 
+CREATE UNIQUE INDEX resources_dfs_key_version_idx ON resources(dfs_key, version);
 CREATE INDEX resources_search_idx ON resources USING GIN(search_vec);
 CREATE INDEX resources_dept_idx ON resources(dept);
 CREATE INDEX resources_subject_idx ON resources(subject);
+CREATE INDEX resources_latest_idx ON resources(is_latest) WHERE is_latest = true;
+CREATE INDEX resources_deleted_idx ON resources(deleted_at) WHERE deleted_at IS NULL;
+CREATE INDEX resources_parent_idx ON resources(parent_id);
 
--- trigger: auto-update search_vec on insert/update
+-- =====================================================
+-- FILE SHARES (access grants for group/private files)
+-- =====================================================
+CREATE TABLE file_shares (
+    resource_id  UUID REFERENCES resources(id) ON DELETE CASCADE,
+    grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'group')),
+    grantee_id   UUID NOT NULL,   -- references users.id or groups.id
+    granted_by   UUID REFERENCES users(id),
+    granted_at   TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (resource_id, grantee_type, grantee_id)
+);
+
+-- =====================================================
+-- CHUNK REFERENCE COUNTING (for garbage collection)
+-- =====================================================
+CREATE VIEW chunk_refs AS
+SELECT dfs_key, COUNT(*) FILTER (WHERE deleted_at IS NULL) AS live_refs
+FROM resources
+GROUP BY dfs_key;
+
+-- =====================================================
+-- FULL-TEXT SEARCH TRIGGER
+-- =====================================================
 CREATE OR REPLACE FUNCTION update_search_vec() RETURNS trigger AS $$
 BEGIN
     NEW.search_vec := to_tsvector('english',
@@ -223,16 +633,35 @@ Auth:
   POST /api/auth/logout
 
 Files:
-  POST   /api/files           multipart: file + {title, subject, dept, year, tags, repl_factor}
+  POST   /api/files           multipart: file + {title, subject, dept, year, tags, repl_factor, visibility}
                               → calls StoreData, inserts into resources table
   GET    /api/files           ?dept=CSE&subject=OS&type=pdf&year=3&sort=recent&page=1
-  GET    /api/files/:id       → metadata only
-  GET    /api/files/:id/download → calls GetData, streams file to browser
-  DELETE /api/files/:id       → uploader or admin only, calls Store.Remove
+                              → only returns is_latest=true, deleted_at IS NULL, access-checked
+  GET    /api/files/:id       → metadata only (with access check)
+  GET    /api/files/:id/download → calls GetData, streams file to browser (with access check)
+  PUT    /api/files/:id       multipart: new file + optional metadata updates → creates new version
+  DELETE /api/files/:id       → soft delete (uploader or admin only)
+
+Versioning:
+  GET /api/files/:id/versions → returns [{version, uploaded_at, size_bytes, dfs_key}, ...]
+  GET /api/files/:id/versions/:v/download → download specific version
+
+Sharing & Access Control:
+  POST   /api/files/:id/share   body: {grantee_type: "user"|"group", grantee_id}
+  DELETE /api/files/:id/share   body: {grantee_type, grantee_id}
+  GET    /api/files/:id/shares  → list current grants (owner only)
 
 Search:
-  GET /api/search?q=sorting+algorithms&dept=CSE
-      → PostgreSQL tsvector query, returns ranked results
+  GET /api/search?q=sorting+algorithms&dept=CSE&visibility=public
+      → PostgreSQL tsvector query, returns ranked results (access-filtered)
+
+Groups:
+  POST   /api/groups           body: {name, type: "society"|"custom", description}
+  GET    /api/groups           ?type=society → list groups user belongs to
+  GET    /api/groups/:id       → group detail + member list
+  POST   /api/groups/:id/members   body: {user_id}   → add member (group admin only)
+  DELETE /api/groups/:id/members/:uid              → remove member
+  GET    /api/groups/:id/files → files shared with this group
 
 Subjects:
   GET /api/subjects?dept=CSE  → distinct subjects in that dept
@@ -247,6 +676,8 @@ Admin:
   DELETE /api/admin/users/:id
   PUT    /api/admin/users/:id/role
   GET    /api/admin/nodes     → DFS ring members, health status
+  POST   /api/admin/gc        → trigger manual garbage collection sweep
+  GET    /api/admin/gc/status  → orphan chunk count, last sweep time
 ```
 
 ---
@@ -285,20 +716,26 @@ Pages:
   /login              → login form
   /signup             → signup form
   /dashboard          → recent uploads, trending, quick-upload widget
-  /browse             → resource grid with sidebar filters
-  /upload             → drag-drop zone + metadata form
-  /files/[id]         → file detail: preview + download button + uploader info
+  /browse             → resource grid with sidebar filters (dept, subject, year, type)
+  /upload             → drag-drop zone + metadata form + visibility picker
+  /files/[id]         → file detail: preview + download + version history + sharing panel
   /search             → search results page
-  /profile            → my uploads + download history
-  /admin              → user management table (admin only)
+  /groups             → my groups (societies, study groups)
+  /groups/[id]        → group detail: members + shared files
+  /profile            → my uploads + download history + shared-with-me
+  /admin              → user management + node status + GC controls (admin only)
 
 Key Components:
-  <FileCard>          → thumbnail, title, subject tag, size, downloads, uploader
+  <FileCard>          → thumbnail, title, subject tag, size, downloads, visibility badge, uploader
   <FilePreview>       → PDF.js for PDF, <video> for MP4/WebM, <img> for images
   <UploadZone>        → react-dropzone, shows progress bar during upload
+  <VisibilityPicker>  → radio: public/dept/group/private + group selector dropdown
+  <ShareDialog>       → search users by name/email, grant access to private files
+  <VersionHistory>    → timeline of file versions with download links
   <SubjectFilter>     → sidebar checkboxes for subject/year/type
   <SearchBar>         → debounced input → /api/search
-  <NodeStatus>        → shows ring size, peer count (admin widget)
+  <GroupCard>         → group name, member count, file count
+  <NodeStatus>        → shows ring size, peer count, health (admin widget)
 ```
 
 ---
@@ -306,14 +743,21 @@ Key Components:
 ## Upload Flow (End to End)
 
 ```
-1. Student drags file into <UploadZone>
+1. Student drags file into <UploadZone>, selects:
+   - Title, Subject, Dept, Year, Tags
+   - Visibility: public / dept / group / private
+   - If group: picks which group(s) from dropdown
+   - If private: optionally share with specific users
 2. Frontend: POST /api/files (multipart form)
 3. API handler:
-   a. parse metadata from form fields
-   b. generate dfs_key = sha256(title + uploader_id + timestamp)
-   c. call server.StoreData(dfs_key, fileReader)     ← DFS stores + replicates
-   d. INSERT INTO resources (dfs_key, title, ...)    ← PostgreSQL records metadata
-   e. return {id, dfs_key, title}
+   a. Verify JWT → extract user identity
+   b. Parse metadata from form fields
+   c. Generate dfs_key = sha256(title + uploader_id + timestamp)
+   d. Call server.StoreData(dfs_key, fileReader)     ← DFS stores + replicates
+   e. INSERT INTO resources (dfs_key, title, visibility, ...)
+   f. If visibility=group: INSERT file_shares for each selected group
+   g. If visibility=private + shares: INSERT file_shares for each grantee
+   h. Return {id, dfs_key, title, visibility}
 4. Frontend shows "Upload complete, replicated to N nodes"
 ```
 
@@ -325,11 +769,51 @@ Key Components:
 1. Student clicks Download on a file card
 2. Frontend: GET /api/files/:id/download
 3. API handler:
-   a. SELECT dfs_key FROM resources WHERE id = :id
-   b. UPDATE resources SET downloads = downloads + 1
-   c. reader, err := server.GetData(dfs_key)    ← DFS fetches from ring
-   d. stream reader → http.ResponseWriter with Content-Disposition header
+   a. SELECT resource FROM resources WHERE id = :id AND deleted_at IS NULL
+   b. Access check: canAccessFile(user, resource) → 403 if denied
+   c. UPDATE resources SET downloads = downloads + 1
+   d. reader, err := server.GetData(dfs_key)    ← DFS fetches from ring
+   e. Stream reader → http.ResponseWriter with:
+      - Content-Disposition: attachment; filename="original_name.pdf"
+      - Content-Type: detected from file_type
 4. Browser receives file stream
+```
+
+---
+
+## Update (Versioning) Flow
+
+```
+1. Student opens file detail page, clicks "Upload New Version"
+2. Frontend: PUT /api/files/:id (multipart form with new file)
+3. API handler:
+   a. Verify user is original uploader (or admin)
+   b. Fetch old resource record
+   c. Set old.is_latest = false
+   d. Store new file: server.StoreData(newKey, fileReader)
+   e. INSERT new resource: version = old.version + 1, parent_id = old.id, is_latest = true
+   f. Copy visibility + shares from old version
+4. Frontend shows "Version 2 uploaded. Previous version preserved."
+   - Version history sidebar appears on file detail page
+```
+
+---
+
+## Soft Delete + GC Flow
+
+```
+1. Student (or admin) clicks Delete on a file
+2. Frontend: DELETE /api/files/:id
+3. API handler:
+   a. Verify ownership or admin role
+   b. UPDATE resources SET deleted_at = NOW() WHERE id = :id
+   c. File disappears from browse/search immediately
+   d. DFS chunks remain on disk (30-day grace period)
+
+4. Background GC (runs daily at 3 AM):
+   a. Query: resources WHERE deleted_at < NOW() - 30 days AND live_refs = 0
+   b. For each: fetch manifest → delete all chunks from DFS ring → hard delete row
+   c. Log: "GC sweep: removed N files, freed M bytes"
 ```
 
 ---
@@ -457,36 +941,55 @@ dfs start --port 4000 --seeds 192.168.1.X:3000
 ## Recommended Implementation Order (Post Sprint 8)
 
 ```
-Phase A — API Layer (2-3 weeks)
-  1. api/ package: Go + Gin REST server
-  2. PostgreSQL schema + goose migrations
-  3. Auth: signup/login/JWT middleware
-  4. /files upload + download endpoints
-  5. /search endpoint
+Phase A — API Foundation (2-3 weeks)
+  1. api/ package: Go + Gin REST server, embedded alongside DFS server
+  2. PostgreSQL schema + goose migrations (all tables: users, groups, resources, file_shares)
+  3. Auth: signup (college email gate) / login / JWT middleware
+  4. /files upload endpoint → StoreData + INSERT resources
+  5. /files download endpoint → access check + GetData
+  6. /search endpoint → tsvector query with access filtering
 
-Phase B — Frontend (2-3 weeks)
+Phase B — Access Control (1-2 weeks)
+  1. Groups CRUD: create/join/leave, auto-dept-group on signup
+  2. Visibility on upload: public/dept/group/private
+  3. file_shares CRUD: share/unshare/list
+  4. canAccessFile middleware enforced on GET/download
+
+Phase C — Frontend Core (2-3 weeks)
   1. Next.js + Tailwind setup
   2. Login/signup pages
-  3. Dashboard + browse page with FileCard grid
-  4. Upload page with drag-drop + progress
-  5. File detail page with preview
+  3. Dashboard + browse page with FileCard grid + SubjectFilter
+  4. Upload page with drag-drop + VisibilityPicker
+  5. File detail page with preview + ShareDialog
 
-Phase C — Networking Enhancements (1 week)
+Phase D — Versioning & GC (1 week)
+  1. PUT /files/:id → version chain creation
+  2. VersionHistory component on file detail page
+  3. Soft delete on DELETE /files/:id
+  4. GC sweep background job (daily cron)
+  5. MessageDeleteChunk message type in DFS
+
+Phase E — Groups & Social (1 week)
+  1. Groups page: list my groups, create new
+  2. Group detail: manage members, view shared files
+  3. Society file feeds
+
+Phase F — Networking Enhancements (1 week)
   1. mDNS auto-discovery (Peer2Peer/mdns/)
   2. Graceful shutdown with re-replication signal
   3. Configurable seed list in config file
 
-Phase D — Docker + Deploy (1 week)
-  1. Dockerfile for DFS node + API
-  2. docker-compose.yml
+Phase G — Docker + Deploy (1 week)
+  1. Dockerfile for DFS node + API (single binary)
+  2. docker-compose.yml (DFS + API + PostgreSQL + Nginx)
   3. nginx.conf for reverse proxy
-  4. Deploy on 2-3 student machines as anchors
+  4. Deploy on Raspberry Pi as permanent 24/7 anchor
 
-Phase E — Polish (ongoing)
-  1. PDF.js preview
-  2. Admin panel
-  3. Download count, trending resources
-  4. Department/subject stats
+Phase H — Polish (ongoing)
+  1. PDF.js preview for file detail page
+  2. Admin panel: user management, node health, GC controls
+  3. Download count, trending resources, department stats
+  4. Rate limiting, request logging, error monitoring
 ```
 
 ---
