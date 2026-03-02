@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 // ChunkSize is the size of each chunk for streaming encryption (4MB)
@@ -211,6 +212,77 @@ func (e *EncryptionService) EncryptStream(src io.Reader, dst io.Writer) ([]byte,
 		return nil, err
 	}
 
+	return encryptedKey, nil
+}
+
+// EncryptStreamWithPool is like EncryptStream but borrows a slab from pool
+// (if non-nil) as the destination buffer for gcm.Seal, eliminating one
+// per-chunk heap allocation (~4 MiB + 16 bytes overhead).
+// pool.New must return *[]byte of capacity >= ChunkSize+16.
+func (e *EncryptionService) EncryptStreamWithPool(src io.Reader, dst io.Writer, pool *sync.Pool) ([]byte, error) {
+	if pool == nil {
+		return e.EncryptStream(src, dst)
+	}
+
+	fileKey, err := e.fileKey()
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(fileKey)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	readBuf := make([]byte, ChunkSize)
+
+	// Borrow slab for gcm.Seal output. Seal appends into dst[:0], so the
+	// result slice shares the underlying array — we copy it out before
+	// returning the slab.
+	pb := pool.Get().(*[]byte)
+	defer pool.Put(pb)
+
+	chunkIndex := uint64(0)
+	for {
+		n, readErr := io.ReadFull(src, readBuf)
+		if n > 0 {
+			nonce := make([]byte, nonceSize)
+			binary.LittleEndian.PutUint64(nonce, chunkIndex)
+
+			// Seal into the pooled slab (reset to empty first).
+			*pb = (*pb)[:0]
+			ciphertext := gcm.Seal(*pb, nonce, readBuf[:n], nil)
+
+			chunkSize := uint32(nonceSize + len(ciphertext))
+			if err := binary.Write(dst, binary.LittleEndian, chunkSize); err != nil {
+				return nil, err
+			}
+			if _, err := dst.Write(nonce); err != nil {
+				return nil, err
+			}
+			if _, err := dst.Write(ciphertext); err != nil {
+				return nil, err
+			}
+			chunkIndex++
+		}
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+
+	encryptedKey, err := e.EncryptKey(fileKey)
+	if err != nil {
+		return nil, err
+	}
 	return encryptedKey, nil
 }
 

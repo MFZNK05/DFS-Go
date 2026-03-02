@@ -7,6 +7,7 @@ package compression
 import (
 	"bytes"
 	"math"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -70,6 +71,47 @@ func CompressChunk(data []byte, level Level) (out []byte, wasCompressed bool, er
 		return data, false, nil
 	}
 	return compressed, true, nil
+}
+
+// CompressChunkWithPool is like CompressChunk but obtains the output buffer
+// from pool (if non-nil), reducing allocations when compressing many chunks.
+// pool.New must return *[]byte. The returned slice is a copy; the pool buffer
+// is returned before this function exits.
+func CompressChunkWithPool(data []byte, level Level, pool *sync.Pool) (out []byte, wasCompressed bool, err error) {
+	if pool == nil {
+		return CompressChunk(data, level)
+	}
+
+	encLevel := zstd.SpeedFastest
+	switch level {
+	case LevelDefault:
+		encLevel = zstd.SpeedDefault
+	case LevelBest:
+		encLevel = zstd.SpeedBestCompression
+	}
+
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(encLevel))
+	if err != nil {
+		return data, false, err
+	}
+	defer enc.Close()
+
+	// Borrow dst buffer from pool, reset to empty, compress into it.
+	pb := pool.Get().(*[]byte)
+	*pb = (*pb)[:0]
+	compressed := enc.EncodeAll(data, *pb)
+
+	if len(compressed) >= len(data) {
+		// Compression made it bigger — return pool buffer and original data.
+		pool.Put(pb)
+		return data, false, nil
+	}
+
+	// Copy result so the pool buffer can be returned immediately.
+	result := make([]byte, len(compressed))
+	copy(result, compressed)
+	pool.Put(pb)
+	return result, true, nil
 }
 
 // DecompressChunk decompresses a zstd-compressed chunk.

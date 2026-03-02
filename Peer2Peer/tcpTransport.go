@@ -156,6 +156,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			msg.Peer = peer
 			msg.Stream = true
 			msg.StreamWg = &streamWg
+			msg.StreamReader = conn // TCP: remaining bytes come from the connection
 			t.rpcch <- msg
 
 			streamWg.Wait()
@@ -174,6 +175,7 @@ func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
 			streamWg.Add(1)
 			msg.Stream = true
 			msg.StreamWg = &streamWg
+			msg.StreamReader = conn // TCP: remaining bytes come from the connection
 			log.Printf("HANDLE_CONN: Forwarding message-with-stream from %s", msg.From)
 			t.rpcch <- msg
 			streamWg.Wait()
@@ -241,18 +243,11 @@ func (t *TCPPeer) SendMsg(controlByte byte, payload []byte) error {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
-	// Write control byte.
-	if _, err := t.Conn.Write([]byte{controlByte}); err != nil {
-		return err
-	}
-	// Write 4-byte big-endian length.
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-	if _, err := t.Conn.Write(lenBuf[:]); err != nil {
-		return err
-	}
-	// Write payload.
-	_, err := t.Conn.Write(payload)
+	// Single writev syscall — eliminates Nagle interleave between control/len/payload.
+	bufs := net.Buffers{{controlByte}, lenBuf[:], payload}
+	_, err := bufs.WriteTo(t.Conn)
 	return err
 }
 
@@ -264,22 +259,11 @@ func (t *TCPPeer) SendStream(msgPayload []byte, streamData []byte) error {
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
-	// 1. Control byte indicating message-with-stream.
-	if _, err := t.Conn.Write([]byte{IncomingMessageWithStream}); err != nil {
-		return err
-	}
-	// 2. Length-prefixed message payload.
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(msgPayload)))
-	if _, err := t.Conn.Write(lenBuf[:]); err != nil {
-		return err
-	}
-	if _, err := t.Conn.Write(msgPayload); err != nil {
-		return err
-	}
-
-	// 3. Raw stream data (no separate control byte needed).
-	_, err := t.Conn.Write(streamData)
+	// Single writev syscall: control byte + length + message + stream data.
+	bufs := net.Buffers{{IncomingMessageWithStream}, lenBuf[:], msgPayload, streamData}
+	_, err := bufs.WriteTo(t.Conn)
 	return err
 }
 

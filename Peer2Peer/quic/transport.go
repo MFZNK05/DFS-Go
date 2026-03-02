@@ -3,10 +3,14 @@
 //
 // Key differences from TCP:
 //   - Each peer connection is a QUIC *Conn over a single UDP socket.
-//   - Each message send opens a new short-lived QUIC Stream, eliminating
-//     head-of-line blocking between parallel chunk fetches.
+//   - Each logical message (SendMsg / SendStream / Send) opens a new short-lived
+//     QUIC stream, writes all bytes in a single writev syscall via net.Buffers,
+//     then closes the stream.  This eliminates head-of-line blocking between
+//     parallel messages.
 //   - TLS 1.3 is built in; a self-signed cert is generated when none provided.
-//   - 0-RTT reconnect for known peers (QUIC session resumption).
+//   - RPC.StreamReader is set to the quic.Stream for IncomingStream and
+//     IncomingMessageWithStream RPCs so handlers can read raw bytes without
+//     touching the QUICPeer object at all.
 package quic
 
 import (
@@ -17,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"io"
 	"log"
@@ -32,9 +37,10 @@ import (
 )
 
 // QUICPeer wraps a QUIC *Conn and satisfies peer2peer.Peer.
+// It is intentionally minimal — no per-peer mutexes are needed because
+// quic.Conn.OpenStreamSync is safe for concurrent use by multiple goroutines.
 type QUICPeer struct {
 	conn     *quic.Conn
-	wg       sync.WaitGroup
 	outbound bool
 }
 
@@ -42,41 +48,67 @@ func newQUICPeer(conn *quic.Conn, outbound bool) *QUICPeer {
 	return &QUICPeer{conn: conn, outbound: outbound}
 }
 
-func (p *QUICPeer) RemoteAddr() net.Addr       { return p.conn.RemoteAddr() }
-func (p *QUICPeer) LocalAddr() net.Addr        { return p.conn.LocalAddr() }
+func (p *QUICPeer) RemoteAddr() net.Addr { return p.conn.RemoteAddr() }
+func (p *QUICPeer) LocalAddr() net.Addr  { return p.conn.LocalAddr() }
+func (p *QUICPeer) Outbound() bool       { return p.outbound }
+func (p *QUICPeer) Close() error         { return p.conn.CloseWithError(0, "peer closed") }
+func (p *QUICPeer) CloseStream()         {} // no-op: stream closed by handleStream's defer
+
+// Read satisfies net.Conn but should not be used directly.
+// Use RPC.StreamReader to read stream data in handlers.
 func (p *QUICPeer) Read(_ []byte) (int, error) { return 0, io.EOF }
 
-func (p *QUICPeer) Write(b []byte) (int, error) {
+// Write opens a new stream, writes b, closes it.
+func (p *QUICPeer) Write(b []byte) (int, error) { return len(b), p.Send(b) }
+
+// Send writes raw bytes on a single QUIC stream.
+func (p *QUICPeer) Send(b []byte) error {
 	stream, err := p.conn.OpenStreamSync(context.Background())
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer stream.Close()
-	return stream.Write(b)
+	_, err = stream.Write(b)
+	return err
 }
 
-func (p *QUICPeer) Send(b []byte) error { _, err := p.Write(b); return err }
+// SendMsg sends [controlByte][4-byte big-endian len][payload] on one stream.
+// Flattened into a single Write call so quic-go packs everything into one UDP
+// frame — prevents partial-read splits that break the length-prefixed decoder.
 func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
-	if _, err := p.Write([]byte{controlByte}); err != nil {
+	stream, err := p.conn.OpenStreamSync(context.Background())
+	if err != nil {
 		return err
 	}
-	_, err := p.Write(payload)
-	return err
-}
-func (p *QUICPeer) SendStream(msgPayload []byte, streamData []byte) error {
-	if _, err := p.Write([]byte{peer2peer.IncomingMessageWithStream}); err != nil {
-		return err
-	}
-	if _, err := p.Write(msgPayload); err != nil {
-		return err
-	}
-	_, err := p.Write(streamData)
-	return err
-}
-func (p *QUICPeer) CloseStream()   { p.wg.Done() }
-func (p *QUICPeer) Close() error   { return p.conn.CloseWithError(0, "peer closed") }
-func (p *QUICPeer) Outbound() bool { return p.outbound }
+	defer stream.Close()
 
+	buf := make([]byte, 1+4+len(payload))
+	buf[0] = controlByte
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(payload)))
+	copy(buf[5:], payload)
+	_, err = stream.Write(buf)
+	return err
+}
+
+// SendStream sends [0x3][4-byte len][msgPayload][streamData] on one stream.
+// Flattened into a single Write call for the same reason as SendMsg.
+func (p *QUICPeer) SendStream(msgPayload []byte, streamData []byte) error {
+	stream, err := p.conn.OpenStreamSync(context.Background())
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	buf := make([]byte, 1+4+len(msgPayload)+len(streamData))
+	buf[0] = peer2peer.IncomingMessageWithStream
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(msgPayload)))
+	copy(buf[5:], msgPayload)
+	copy(buf[5+len(msgPayload):], streamData)
+	_, err = stream.Write(buf)
+	return err
+}
+
+// Deadline stubs — quic.Conn manages its own timeouts via MaxIdleTimeout.
 func (p *QUICPeer) SetDeadline(t time.Time) error      { return nil }
 func (p *QUICPeer) SetReadDeadline(t time.Time) error  { return nil }
 func (p *QUICPeer) SetWriteDeadline(t time.Time) error { return nil }
@@ -95,6 +127,7 @@ type Transport struct {
 	listener *quic.Listener
 	rpcCh    chan peer2peer.RPC
 	tlsCfg   *tls.Config
+	decoder  peer2peer.Decoder // DefaultDecoder: reads [4-byte len][payload]
 
 	peerLock sync.RWMutex
 	peers    map[string]*QUICPeer
@@ -110,10 +143,11 @@ func New(opts TransportOpts) (*Transport, error) {
 		}
 	}
 	return &Transport{
-		opts:   opts,
-		rpcCh:  make(chan peer2peer.RPC, 1024),
-		tlsCfg: tlsCfg,
-		peers:  make(map[string]*QUICPeer),
+		opts:    opts,
+		rpcCh:   make(chan peer2peer.RPC, 1024),
+		tlsCfg:  tlsCfg,
+		decoder: peer2peer.DefaultDecoder{},
+		peers:   make(map[string]*QUICPeer),
 	}, nil
 }
 
@@ -210,45 +244,71 @@ func (t *Transport) acceptStreams(conn *quic.Conn, peer *QUICPeer) {
 			}
 			return
 		}
+		// Each stream is handled in its own goroutine — full concurrency,
+		// no head-of-line blocking between independent messages.
 		go t.handleStream(stream, conn.RemoteAddr(), peer)
 	}
 }
 
+// handleStream processes a single incoming QUIC stream. It reads the control
+// byte, decodes the frame, and dispatches an RPC. For stream RPCs it blocks
+// via StreamWg until the handler signals completion, keeping the stream open
+// so the handler can read raw bytes via RPC.StreamReader.
 func (t *Transport) handleStream(stream *quic.Stream, from net.Addr, peer *QUICPeer) {
 	defer stream.Close()
 
 	ctrl := make([]byte, 1)
 	if _, err := io.ReadFull(stream, ctrl); err != nil {
-		log.Printf("[QUIC] read ctrl from %s: %v", from, err)
+		if !isClosedErr(err) {
+			log.Printf("[QUIC] read ctrl from %s: %v", from, err)
+		}
 		return
 	}
 
 	switch ctrl[0] {
 	case peer2peer.IncomingStream:
-		peer.wg.Add(1)
-		t.rpcCh <- peer2peer.RPC{From: from, Stream: true}
-		peer.wg.Wait()
-		return
-
-	case peer2peer.IncomingMessageWithStream:
-		payload, err := io.ReadAll(stream)
-		if err != nil {
-			log.Printf("[QUIC] read payload (msg+stream) from %s: %v", from, err)
-			return
-		}
+		// Standalone stream: handler reads raw bytes via RPC.StreamReader.
 		var streamWg sync.WaitGroup
 		streamWg.Add(1)
-		t.rpcCh <- peer2peer.RPC{From: from, Payload: payload, Stream: true, StreamWg: &streamWg}
-		streamWg.Wait()
-		return
+		t.rpcCh <- peer2peer.RPC{
+			From:         from,
+			Peer:         peer,
+			Stream:       true,
+			StreamWg:     &streamWg,
+			StreamReader: stream, // handler reads from this stream
+		}
+		streamWg.Wait() // keep stream alive until handler calls streamWg.Done()
 
-	default:
-		payload, err := io.ReadAll(stream)
-		if err != nil {
-			log.Printf("[QUIC] read payload from %s: %v", from, err)
+	case peer2peer.IncomingMessageWithStream:
+		// Framed message + raw stream data on the same stream.
+		// Decode the framed message (4-byte len + payload), then expose the
+		// remaining stream bytes via StreamReader for the handler to read.
+		var msg peer2peer.RPC
+		if err := t.decoder.Decode(stream, &msg); err != nil {
+			log.Printf("[QUIC] decode msg+stream from %s: %v", from, err)
 			return
 		}
-		t.rpcCh <- peer2peer.RPC{From: from, Payload: payload}
+		msg.From = from
+		msg.Peer = peer
+		msg.Stream = true
+		msg.StreamReader = stream // remaining bytes = raw file data
+
+		var streamWg sync.WaitGroup
+		streamWg.Add(1)
+		msg.StreamWg = &streamWg
+		t.rpcCh <- msg
+		streamWg.Wait()
+
+	default:
+		// Regular message (0x1): decode framed payload only.
+		var msg peer2peer.RPC
+		if err := t.decoder.Decode(stream, &msg); err != nil {
+			log.Printf("[QUIC] decode msg from %s: %v", from, err)
+			return
+		}
+		msg.From = from
+		msg.Peer = peer
+		t.rpcCh <- msg
 	}
 }
 

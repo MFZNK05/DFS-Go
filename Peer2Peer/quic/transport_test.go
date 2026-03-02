@@ -98,10 +98,10 @@ func TestSendReceiveMessage(t *testing.T) {
 		t.Fatal("timeout: server never got OnPeer")
 	}
 
-	// Server sends a control message to client.
-	payload := []byte{peer2peer.IncomingMessage, 'h', 'e', 'l', 'l', 'o'}
-	if err := serverSidePeer.Send(payload); err != nil {
-		t.Fatalf("Send from server: %v", err)
+	// Server sends a framed message to client using the proper wire protocol.
+	payload := []byte("hello")
+	if err := serverSidePeer.SendMsg(peer2peer.IncomingMessage, payload); err != nil {
+		t.Fatalf("SendMsg from server: %v", err)
 	}
 
 	// Client should receive it on its RPC channel.
@@ -222,4 +222,168 @@ func TestImplementsTransportInterface(t *testing.T) {
 		Dial(string) error
 	} = (*quictransport.Transport)(nil)
 	_ = fmt.Sprintf("interface check passed")
+}
+
+// TestSendMsgRoundTrip verifies that SendMsg produces a framed RPC on the
+// receiver's Consume() channel with a non-empty Payload and Stream==false.
+func TestSendMsgRoundTrip(t *testing.T) {
+	serverPeerCh := make(chan peer2peer.Peer, 1)
+	server := newTransport(t, func(p peer2peer.Peer) error {
+		serverPeerCh <- p
+		return nil
+	}, nil)
+	if err := server.ListenAndAccept(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	defer server.Close()
+
+	client := newTransport(t, nil, nil)
+	if err := client.ListenAndAccept(); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Dial(server.Addr()); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	var serverPeer peer2peer.Peer
+	select {
+	case serverPeer = <-serverPeerCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for server OnPeer")
+	}
+
+	want := []byte("hello-sendmsg")
+	if err := serverPeer.SendMsg(peer2peer.IncomingMessage, want); err != nil {
+		t.Fatalf("SendMsg: %v", err)
+	}
+
+	select {
+	case rpc := <-client.Consume():
+		if rpc.Stream {
+			t.Error("expected non-stream RPC")
+		}
+		if len(rpc.Payload) == 0 {
+			t.Error("expected non-empty payload")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for SendMsg RPC")
+	}
+}
+
+// TestSendStreamRoundTrip verifies that SendStream produces a stream RPC with
+// a non-nil StreamReader that returns the raw stream bytes.
+func TestSendStreamRoundTrip(t *testing.T) {
+	serverPeerCh := make(chan peer2peer.Peer, 1)
+	server := newTransport(t, func(p peer2peer.Peer) error {
+		serverPeerCh <- p
+		return nil
+	}, nil)
+	if err := server.ListenAndAccept(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	defer server.Close()
+
+	client := newTransport(t, nil, nil)
+	if err := client.ListenAndAccept(); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Dial(server.Addr()); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	var serverPeer peer2peer.Peer
+	select {
+	case serverPeer = <-serverPeerCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for server OnPeer")
+	}
+
+	// Encode a minimal gob Message so the framing decoder can parse it.
+	// SendStream sends: [0x3][4-byte len][msgPayload][streamData]
+	// The receiver decodes msgPayload as a gob Message, then StreamReader has streamData.
+	msgPayload := []byte{peer2peer.IncomingMessage, 0, 0, 0, 0} // 1 ctrl + 4 len = empty payload
+	streamData := []byte("stream-payload-data")
+	if err := serverPeer.SendStream(msgPayload, streamData); err != nil {
+		t.Fatalf("SendStream: %v", err)
+	}
+
+	select {
+	case rpc := <-client.Consume():
+		if !rpc.Stream {
+			t.Error("expected stream RPC")
+		}
+		if rpc.StreamReader == nil {
+			t.Fatal("expected non-nil StreamReader")
+		}
+		if rpc.StreamWg == nil {
+			t.Fatal("expected non-nil StreamWg")
+		}
+		// Signal handler done so the stream goroutine can exit.
+		rpc.StreamWg.Done()
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for SendStream RPC")
+	}
+}
+
+// TestConcurrentSendMsg verifies 10 concurrent SendMsg calls all produce
+// distinct RPCs on the receiver's Consume() channel without corruption.
+func TestConcurrentSendMsg(t *testing.T) {
+	const n = 10
+	serverPeerCh := make(chan peer2peer.Peer, 1)
+	server := newTransport(t, func(p peer2peer.Peer) error {
+		serverPeerCh <- p
+		return nil
+	}, nil)
+	if err := server.ListenAndAccept(); err != nil {
+		t.Fatalf("server start: %v", err)
+	}
+	defer server.Close()
+
+	client := newTransport(t, nil, nil)
+	if err := client.ListenAndAccept(); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Dial(server.Addr()); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	var serverPeer peer2peer.Peer
+	select {
+	case serverPeer = <-serverPeerCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for server OnPeer")
+	}
+
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			payload := []byte{peer2peer.IncomingMessage, 0, 0, 0, 0}
+			errCh <- serverPeer.SendMsg(peer2peer.IncomingMessage, payload)
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errCh; err != nil {
+			t.Errorf("concurrent SendMsg error: %v", err)
+		}
+	}
+
+	got := 0
+	deadline := time.After(5 * time.Second)
+	for got < n {
+		select {
+		case rpc := <-client.Consume():
+			if rpc.Stream {
+				t.Error("expected non-stream RPC")
+			}
+			got++
+		case <-deadline:
+			t.Fatalf("timeout: only received %d/%d RPCs", got, n)
+		}
+	}
 }

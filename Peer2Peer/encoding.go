@@ -24,11 +24,12 @@ func (dec GOBDecoder) Decode(w io.Reader, rpc *RPC) error {
 type DefaultDecoder struct{}
 
 func (dec DefaultDecoder) Decode(r io.Reader, rpc *RPC) error {
-	var length uint32
-	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		log.Printf("Error reading frame length: %+v\n", err)
 		return err
 	}
+	length := binary.BigEndian.Uint32(lenBuf[:])
 	if length == 0 {
 		return fmt.Errorf("DefaultDecoder: zero-length frame")
 	}

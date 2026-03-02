@@ -44,6 +44,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// Package-level sync.Pools for the StoreData upload pipeline (Fix 3).
+// Reusing these large slabs across chunks eliminates GC stop-the-world pauses
+// (~100-200 ms each) that dominated small-file upload latency.
+var (
+	// chunkReadBufPool pools the 4 MiB read buffer used by ChunkReaderWithPool.
+	chunkReadBufPool = sync.Pool{
+		New: func() any { b := make([]byte, chunker.DefaultChunkSize); return &b },
+	}
+	// compBufPool pools the compression output slab used by CompressChunkWithPool.
+	compBufPool = sync.Pool{
+		New: func() any { b := make([]byte, 0, chunker.DefaultChunkSize); return &b },
+	}
+	// encBufPool pools the GCM ciphertext slab used by EncryptStreamWithPool.
+	// Capacity = ChunkSize + GCM overhead (16) + nonce (12) + 4-byte size prefix.
+	encBufPool = sync.Pool{
+		New: func() any { b := make([]byte, 0, crypto.ChunkSize+64); return &b },
+	}
+)
+
 type ServerOpts struct {
 	storageRoot       string
 	pathTransform     storage.PathTransform
@@ -599,6 +618,16 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 	}
 }
 
+// encryptedChunk carries all per-chunk results from Stage 1 (compress+encrypt)
+// to Stage 2 (local store + replicate) of the StoreData pipeline.
+type encryptedChunk struct {
+	info       chunker.ChunkInfo
+	encData    []byte
+	encKeyHex  string
+	storageKey string
+	targets    []string
+}
+
 func (s *Server) StoreData(key string, w io.Reader) error {
 	t0 := time.Now()
 	log.Println("STORE_DATA: Starting chunked storage for key:", key)
@@ -607,88 +636,86 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 	selfAddr := s.serverOpts.transport.Addr()
 	replFactor := s.HashRing.ReplicationFactor()
 
-	chunkCh, errCh := chunker.ChunkReader(w, chunker.DefaultChunkSize)
+	// encCh connects Stage 1 (compress+encrypt) with Stage 2 (store+replicate).
+	// Buffered=2 lets Stage 1 stay up to 1 chunk ahead of Stage 2, overlapping
+	// CPU work (encryption) with network I/O (replication).
+	encCh := make(chan encryptedChunk, 2)
+	stage1ErrCh := make(chan error, 1)
 
+	// Stage 1: read → compress → encrypt → push to encCh.
+	go func() {
+		defer close(encCh)
+		chunkCh, errCh := chunker.ChunkReaderWithPool(w, chunker.DefaultChunkSize, &chunkReadBufPool)
+		for chunk := range chunkCh {
+			toEncrypt := chunk.Data
+			wasCompressed := false
+			if compression.ShouldCompress(chunk.Data) {
+				if c, wc, err := compression.CompressChunkWithPool(chunk.Data, compression.LevelFastest, &compBufPool); err == nil && wc {
+					toEncrypt = c
+					wasCompressed = true
+				}
+			}
+
+			// Encrypt into an in-memory buffer using the pooled ciphertext slab.
+			var encBuf bytes.Buffer
+			encKey, err := s.serverOpts.Encryption.EncryptStreamWithPool(bytes.NewReader(toEncrypt), &encBuf, &encBufPool)
+			if err != nil {
+				stage1ErrCh <- fmt.Errorf("STORE_DATA: encrypt chunk %d: %w", chunk.Index, err)
+				return
+			}
+			encData := encBuf.Bytes()
+
+			encHashRaw := sha256.Sum256(encData)
+			encHashHex := hex.EncodeToString(encHashRaw[:])
+			storageKey := chunker.ChunkStorageKey(encHashHex)
+			encKeyHex := hex.EncodeToString(encKey)
+			targets := s.HashRing.GetNodes(storageKey, replFactor)
+
+			log.Printf("STORE_DATA: chunk %d encrypted (compressed=%v storageKey=%s)", chunk.Index, wasCompressed, storageKey)
+
+			encCh <- encryptedChunk{
+				info: chunker.ChunkInfo{
+					Index:      chunk.Index,
+					Hash:       hex.EncodeToString(chunk.Hash[:]),
+					Size:       chunk.Size,
+					EncHash:    encHashHex,
+					Compressed: wasCompressed,
+				},
+				encData:    encData,
+				encKeyHex:  encKeyHex,
+				storageKey: storageKey,
+				targets:    targets,
+			}
+		}
+		stage1ErrCh <- <-errCh
+	}()
+
+	// Stage 2: local store + replicate. Runs concurrently with Stage 1.
 	var chunkInfos []chunker.ChunkInfo
-
-	for chunk := range chunkCh {
-		// Sprint 7: compress before encryption when data is compressible.
-		toEncrypt := chunk.Data
-		wasCompressed := false
-		if compression.ShouldCompress(chunk.Data) {
-			if c, wc, err := compression.CompressChunk(chunk.Data, compression.LevelFastest); err == nil && wc {
-				toEncrypt = c
-				wasCompressed = true
-			}
-		}
-
-		// Encrypt the (possibly compressed) chunk into a temp file.
-		tempFile, err := os.CreateTemp("", "dfs-chunk-*")
-		if err != nil {
-			return fmt.Errorf("STORE_DATA: create temp file: %w", err)
-		}
-		tempPath := tempFile.Name()
-
-		encKey, err := s.serverOpts.Encryption.EncryptStream(bytes.NewReader(toEncrypt), tempFile)
-		if err != nil {
-			tempFile.Close()
-			os.Remove(tempPath)
-			return fmt.Errorf("STORE_DATA: encrypt chunk %d: %w", chunk.Index, err)
-		}
-
-		// Read encrypted bytes back for CAS key + replication.
-		if _, err := tempFile.Seek(0, 0); err != nil {
-			tempFile.Close()
-			os.Remove(tempPath)
-			return fmt.Errorf("STORE_DATA: seek chunk %d: %w", chunk.Index, err)
-		}
-		encData, err := io.ReadAll(tempFile)
-		tempFile.Close()
-		os.Remove(tempPath)
-		if err != nil {
-			return fmt.Errorf("STORE_DATA: read chunk %d: %w", chunk.Index, err)
-		}
-
-		// CAS storage key = "chunk:" + sha256(encrypted bytes).
-		encHashRaw := sha256.Sum256(encData)
-		encHashHex := hex.EncodeToString(encHashRaw[:])
-		storageKey := chunker.ChunkStorageKey(encHashHex)
-		encKeyHex := hex.EncodeToString(encKey)
-
+	for ec := range encCh {
 		// Store locally (skip if already present — dedup).
-		if !s.Store.Has(storageKey) {
-			if _, err := s.Store.WriteStream(storageKey, bytes.NewReader(encData)); err != nil {
-				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", chunk.Index, err)
+		if !s.Store.Has(ec.storageKey) {
+			if _, err := s.Store.WriteStream(ec.storageKey, bytes.NewReader(ec.encData)); err != nil {
+				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", ec.info.Index, err)
 			}
-			// Merge EncryptedKey into the FileMeta that WriteStream just set
-			// (which carries the Path). Replacing it wholesale would lose Path.
-			fm, _ := s.serverOpts.metaData.Get(storageKey)
-			fm.EncryptedKey = encKeyHex
+			fm, _ := s.serverOpts.metaData.Get(ec.storageKey)
+			fm.EncryptedKey = ec.encKeyHex
 			fm.Timestamp = time.Now().UnixNano()
-			if err := s.serverOpts.metaData.Set(storageKey, fm); err != nil {
-				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", chunk.Index, err)
+			if err := s.serverOpts.metaData.Set(ec.storageKey, fm); err != nil {
+				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", ec.info.Index, err)
 			}
 		}
 
-		// Replicate to ring-responsible peers.
-		targetNodes := s.HashRing.GetNodes(storageKey, replFactor)
-		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s encKeyHex=%q targets=%v", storageKey, encKeyHex, targetNodes)
-		s.replicateChunk(selfAddr, storageKey, encKeyHex, encData, targetNodes)
-
-		chunkInfos = append(chunkInfos, chunker.ChunkInfo{
-			Index:      chunk.Index,
-			Hash:       hex.EncodeToString(chunk.Hash[:]),
-			Size:       chunk.Size,
-			EncHash:    encHashHex,
-			Compressed: wasCompressed,
-		})
-
-		log.Printf("STORE_DATA: chunk %d stored (compressed=%v storageKey=%s)", chunk.Index, wasCompressed, storageKey)
+		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s encKeyHex=%q targets=%v",
+			ec.storageKey, ec.encKeyHex, ec.targets)
+		s.replicateChunk(selfAddr, ec.storageKey, ec.encKeyHex, ec.encData, ec.targets)
+		chunkInfos = append(chunkInfos, ec.info)
+		log.Printf("STORE_DATA: chunk %d replicated (storageKey=%s)", ec.info.Index, ec.storageKey)
 	}
 
-	// Check for read error from chunker goroutine.
-	if err := <-errCh; err != nil {
-		return fmt.Errorf("STORE_DATA: chunker read error: %w", err)
+	// Check for error from Stage 1.
+	if err := <-stage1ErrCh; err != nil {
+		return fmt.Errorf("STORE_DATA: stage1: %w", err)
 	}
 
 	// Build and persist the manifest locally.
@@ -697,11 +724,10 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		return fmt.Errorf("STORE_DATA: store manifest: %w", err)
 	}
 
-	// Replicate the manifest to all ring-responsible peers so GetData works from any node.
+	// Manifest replication is fire-and-forget (non-blocking).
 	s.replicateManifest(key, selfAddr, manifest)
 
-	// Update top-level FileMeta: merge with existing to preserve any prior VClock,
-	// then increment the clock for this writer.
+	// Update top-level FileMeta.
 	topFm, _ := s.serverOpts.metaData.Get(key)
 	if topFm.VClock == nil {
 		topFm.VClock = make(map[string]uint64)
@@ -719,8 +745,18 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 
 // replicateChunk sends storageKey's encrypted bytes to all targetNodes that
 // are not selfAddr. Unreachable nodes get a hint entry.
+// writeQuorum returns the number of successful replica ACKs required before
+// replicateChunk may return to the caller. For n<=2 we need all replicas (no
+// spare); for n>=3 we use majority (n/2 + 1) so one slow node doesn't stall
+// the uploader.
+func (s *Server) writeQuorum(n int) int {
+	if n <= 2 {
+		return n
+	}
+	return n/2 + 1
+}
+
 func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData []byte, targetNodes []string) {
-	log.Printf("REPLICATE_CHUNK_DEBUG: storageKey=%s encKeyHex=%q encKeyLen=%d", storageKey, encKeyHex, len(encKeyHex))
 	msg := &Message{
 		Payload: &MessageStoreFile{
 			Key:          storageKey,
@@ -734,7 +770,6 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		return
 	}
 	msgBytes := buf.Bytes()
-	log.Printf("REPLICATE_CHUNK_DEBUG: encoded msgBytes len=%d", len(msgBytes))
 
 	s.peerLock.RLock()
 	peers := make(map[string]peer2peer.Peer, len(s.peers))
@@ -743,41 +778,53 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 	}
 	s.peerLock.RUnlock()
 
-	log.Printf("REPLICATE_CHUNK: key=%s selfAddr=%s targets=%v peerKeys=%v",
-		storageKey, selfAddr, targetNodes, func() []string {
-			keys := make([]string, 0, len(peers))
-			for k := range peers {
-				keys = append(keys, k)
-			}
-			return keys
-		}())
+	log.Printf("REPLICATE_CHUNK: key=%s selfAddr=%s targets=%v", storageKey, selfAddr, targetNodes)
 
-	var wg sync.WaitGroup
+	type result struct{ err error }
+	needed := 0
+	// Buffer = len(targetNodes) so goroutines never block on send after caller returns.
+	resultCh := make(chan result, len(targetNodes))
+
 	for _, nodeAddr := range targetNodes {
 		if nodeAddr == selfAddr {
 			continue
 		}
 		p, ok := peers[nodeAddr]
 		if !ok {
-			log.Printf("REPLICATE_CHUNK: peer %s NOT FOUND in peers map, storing hint", nodeAddr)
+			log.Printf("REPLICATE_CHUNK: peer %s NOT FOUND, storing hint", nodeAddr)
 			s.storeHint(nodeAddr, storageKey, encKeyHex, encData)
 			metrics.RecordReplication("hint")
 			continue
 		}
-		wg.Add(1)
+		needed++
 		go func(addr string, peer peer2peer.Peer) {
-			defer wg.Done()
-			if err := peer.SendStream(msgBytes, encData); err != nil {
+			err := peer.SendStream(msgBytes, encData)
+			if err != nil {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s failed: %v, storing hint", addr, err)
 				s.storeHint(addr, storageKey, encKeyHex, encData)
 				metrics.RecordReplication("hint")
-				return
+			} else {
+				log.Printf("REPLICATE_CHUNK: SendStream to %s OK for key=%s", addr, storageKey)
+				metrics.RecordReplication("ok")
 			}
-			log.Printf("REPLICATE_CHUNK: SendStream to %s OK for key=%s", addr, storageKey)
-			metrics.RecordReplication("ok")
+			resultCh <- result{err}
 		}(nodeAddr, p)
 	}
-	wg.Wait()
+
+	// Return as soon as writeQuorum(needed) successes arrive.
+	// Remaining goroutines drain into the buffered channel without leaking.
+	w := s.writeQuorum(needed)
+	successes := 0
+	for i := 0; i < needed; i++ {
+		r := <-resultCh
+		if r.err == nil {
+			successes++
+			if successes >= w {
+				log.Printf("REPLICATE_CHUNK: quorum met (%d/%d) for key=%s", successes, needed, storageKey)
+				return
+			}
+		}
+	}
 }
 
 // replicateManifest sends a ChunkManifest to every ring-responsible peer for key.
@@ -804,7 +851,8 @@ func (s *Server) replicateManifest(key, selfAddr string, manifest *chunker.Chunk
 	}
 	s.peerLock.RUnlock()
 
-	var wg sync.WaitGroup
+	// Manifest replication is fire-and-forget — the uploader does not need to
+	// wait for peers to acknowledge storing the manifest before returning.
 	for _, nodeAddr := range targetNodes {
 		if nodeAddr == selfAddr {
 			continue
@@ -814,9 +862,7 @@ func (s *Server) replicateManifest(key, selfAddr string, manifest *chunker.Chunk
 			log.Printf("replicateManifest: peer %s not connected, skipping", nodeAddr)
 			continue
 		}
-		wg.Add(1)
 		go func(addr string, peer peer2peer.Peer) {
-			defer wg.Done()
 			buf := new(bytes.Buffer)
 			if err := gob.NewEncoder(buf).Encode(msg); err != nil {
 				log.Printf("replicateManifest: encode for %s: %v", addr, err)
@@ -827,7 +873,6 @@ func (s *Server) replicateManifest(key, selfAddr string, manifest *chunker.Chunk
 			}
 		}(nodeAddr, p)
 	}
-	wg.Wait()
 }
 
 // readRepair checks all responsible replicas for key and asynchronously
@@ -1343,7 +1388,7 @@ func (s *Server) loop() {
 			log.Printf("[loop] Decoded message: %+v\n", message)
 			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
-			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg); err != nil {
+			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg, RPC.StreamReader); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
 				continue
 			}
@@ -1355,14 +1400,14 @@ func (s *Server) loop() {
 	}
 }
 
-func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, streamWg *sync.WaitGroup) error {
+func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, streamWg *sync.WaitGroup, streamReader io.Reader) error {
 	log.Printf("[handleMessage] Handling message from %s: Type=%s\n",
 		from, strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main."))
 
 	switch m := msg.Payload.(type) {
 	case *MessageStoreFile:
 		log.Printf("[handleMessage] Detected MessageStoreFile from %s\n", from)
-		return s.handleStoreMessage(from, peer, m, streamWg)
+		return s.handleStoreMessage(from, peer, m, streamWg, streamReader)
 
 	case *MessageGetFile:
 		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
@@ -1370,7 +1415,7 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 
 	case *MessageLocalFile:
 		log.Printf("[handleMessage] Detected MessageLocalFile from %s\n", from)
-		return s.handleLocalMessage(from, peer, m, streamWg)
+		return s.handleLocalMessage(from, peer, m, streamWg, streamReader)
 
 	case *MessageHeartbeat:
 		return s.handleHeartbeat(from, peer, m)
@@ -1682,11 +1727,15 @@ func (s *Server) handleGetMessage(from string, peer peer2peer.Peer, msg *Message
 	return nil
 }
 
-func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *MessageStoreFile, streamWg *sync.WaitGroup) error {
+func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *MessageStoreFile, streamWg *sync.WaitGroup, streamReader io.Reader) error {
 	log.Printf("HANDLE_STORE: Received store request for key %s from %s — EncryptedKey=%q encKeyLen=%d", msg.Key, from, msg.EncryptedKey, len(msg.EncryptedKey))
 
+	// Use streamReader (set to quic.Stream for QUIC, peer for TCP) to read file data.
+	if streamReader == nil {
+		streamReader = peer.(io.Reader) // TCP fallback
+	}
 	log.Println("HANDLE_STORE: Starting file storage...")
-	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer.(io.Reader), msg.Size))
+	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(streamReader, msg.Size))
 	if err != nil {
 		log.Println("HANDLE_STORE: Storage failed:", err)
 		return fmt.Errorf("error storing file to disk: %+v", err)
@@ -1719,8 +1768,11 @@ func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *Messa
 	return nil
 }
 
-func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *MessageLocalFile, streamWg *sync.WaitGroup) error {
-	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(peer.(io.Reader), msg.Size))
+func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *MessageLocalFile, streamWg *sync.WaitGroup, streamReader io.Reader) error {
+	if streamReader == nil {
+		streamReader = peer.(io.Reader) // TCP fallback
+	}
+	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(streamReader, msg.Size))
 	if err != nil {
 		log.Printf("HANDLE_LOCAL: Storage error from %s: %v", from, err)
 		return err

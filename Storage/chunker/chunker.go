@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 )
 
 // DefaultChunkSize is 4 MiB — a good trade-off between overhead and memory
@@ -70,6 +71,13 @@ type ChunkManifest struct {
 // The caller must drain both channels (or select on them) to avoid goroutine
 // leaks. The hash in each Chunk is computed over the plaintext bytes.
 func ChunkReader(r io.Reader, chunkSize int) (<-chan Chunk, <-chan error) {
+	return ChunkReaderWithPool(r, chunkSize, nil)
+}
+
+// ChunkReaderWithPool is like ChunkReader but uses pool (if non-nil) to obtain
+// and return the temporary read buffer, eliminating one 4 MiB allocation per
+// chunk. pool.New must return *[]byte of at least chunkSize bytes.
+func ChunkReaderWithPool(r io.Reader, chunkSize int, pool *sync.Pool) (<-chan Chunk, <-chan error) {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
@@ -80,12 +88,24 @@ func ChunkReader(r io.Reader, chunkSize int) (<-chan Chunk, <-chan error) {
 		defer close(out)
 		defer close(errCh)
 
-		buf := make([]byte, chunkSize)
+		// Borrow the read buffer from the pool (or allocate if no pool).
+		var buf []byte
+		if pool != nil {
+			pb := pool.Get().(*[]byte)
+			if len(*pb) < chunkSize {
+				*pb = make([]byte, chunkSize)
+			}
+			buf = (*pb)[:chunkSize]
+			defer pool.Put(pb)
+		} else {
+			buf = make([]byte, chunkSize)
+		}
+
 		index := 0
 		for {
 			n, err := io.ReadFull(r, buf)
 			if n > 0 {
-				// Make a copy — the caller owns this slice.
+				// Make a copy — the caller owns this slice; buf is reused.
 				data := make([]byte, n)
 				copy(data, buf[:n])
 				hash := sha256.Sum256(data)

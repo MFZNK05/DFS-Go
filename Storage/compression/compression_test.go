@@ -2,6 +2,7 @@ package compression_test
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 
 	"github.com/Faizan2005/DFS-Go/Storage/compression"
@@ -150,6 +151,62 @@ func TestDecompressInvalidData(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Compression ratio sanity check
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CompressChunkWithPool — output must match CompressChunk exactly
+// ---------------------------------------------------------------------------
+
+func TestCompressChunkWithPool(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() any { b := make([]byte, 0, 4*1024*1024); return &b },
+	}
+	original := bytes.Repeat([]byte("the quick brown fox jumps over the lazy dog "), 500)
+
+	want, wantCompressed, err := compression.CompressChunk(original, compression.LevelFastest)
+	if err != nil {
+		t.Fatalf("CompressChunk: %v", err)
+	}
+
+	got, gotCompressed, err := compression.CompressChunkWithPool(original, compression.LevelFastest, pool)
+	if err != nil {
+		t.Fatalf("CompressChunkWithPool: %v", err)
+	}
+
+	if gotCompressed != wantCompressed {
+		t.Errorf("wasCompressed mismatch: got %v, want %v", gotCompressed, wantCompressed)
+	}
+	// Both compressed outputs are valid zstd; decompress both and compare plaintext.
+	wantPlain, err := compression.DecompressChunk(want)
+	if err != nil {
+		t.Fatalf("decompress want: %v", err)
+	}
+	gotPlain, err := compression.DecompressChunk(got)
+	if err != nil {
+		t.Fatalf("decompress got: %v", err)
+	}
+	if !bytes.Equal(gotPlain, wantPlain) {
+		t.Errorf("decompressed output mismatch: got %d bytes, want %d bytes", len(gotPlain), len(wantPlain))
+	}
+}
+
+func TestCompressChunkWithPool_NilPool(t *testing.T) {
+	// nil pool must fall back to standard CompressChunk behaviour.
+	original := bytes.Repeat([]byte("pool fallback test data "), 300)
+	out, wasCompressed, err := compression.CompressChunkWithPool(original, compression.LevelFastest, nil)
+	if err != nil {
+		t.Fatalf("CompressChunkWithPool(nil pool): %v", err)
+	}
+	if !wasCompressed {
+		t.Fatal("expected compression for repetitive data")
+	}
+	plain, err := compression.DecompressChunk(out)
+	if err != nil {
+		t.Fatalf("decompress: %v", err)
+	}
+	if !bytes.Equal(plain, original) {
+		t.Error("roundtrip mismatch with nil pool")
+	}
+}
 
 func TestCompressionRatioPDF(t *testing.T) {
 	// Simulate PDF-like content: repetitive text mixed with structure bytes.

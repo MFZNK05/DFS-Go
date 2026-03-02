@@ -2,6 +2,7 @@ package Crypto
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -157,5 +158,80 @@ func TestEncryptDecryptStream_EmptyData(t *testing.T) {
 
 	if !bytes.Equal(originalData, decryptedBuf.Bytes()) {
 		t.Errorf("Decrypted data does not match original. Expected empty, got %d bytes", len(decryptedBuf.Bytes()))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EncryptStreamWithPool — decrypted output must match EncryptStream exactly
+// ---------------------------------------------------------------------------
+
+func TestEncryptStreamWithPool(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() any { b := make([]byte, 0, ChunkSize+64); return &b },
+	}
+	original := make([]byte, ChunkSize/2) // half a chunk, single iteration
+	for i := range original {
+		original[i] = byte(i % 251)
+	}
+	es := NewEncryptionService("pool-test-key")
+
+	var encBuf bytes.Buffer
+	encKey, err := es.EncryptStreamWithPool(bytes.NewReader(original), &encBuf, pool)
+	if err != nil {
+		t.Fatalf("EncryptStreamWithPool: %v", err)
+	}
+
+	var decBuf bytes.Buffer
+	if err := es.DecryptStream(&encBuf, &decBuf, encKey); err != nil {
+		t.Fatalf("DecryptStream: %v", err)
+	}
+	if !bytes.Equal(decBuf.Bytes(), original) {
+		t.Errorf("pool roundtrip mismatch: got %d bytes, want %d", decBuf.Len(), len(original))
+	}
+}
+
+func TestEncryptStreamWithPool_LargeMultiChunk(t *testing.T) {
+	pool := &sync.Pool{
+		New: func() any { b := make([]byte, 0, ChunkSize+64); return &b },
+	}
+	// Two full chunks + a partial third to exercise the inner loop.
+	original := make([]byte, ChunkSize*2+1024*100)
+	for i := range original {
+		original[i] = byte(i % 199)
+	}
+	es := NewEncryptionService("pool-large-key")
+
+	var encBuf bytes.Buffer
+	encKey, err := es.EncryptStreamWithPool(bytes.NewReader(original), &encBuf, pool)
+	if err != nil {
+		t.Fatalf("EncryptStreamWithPool: %v", err)
+	}
+
+	var decBuf bytes.Buffer
+	if err := es.DecryptStream(&encBuf, &decBuf, encKey); err != nil {
+		t.Fatalf("DecryptStream: %v", err)
+	}
+	if !bytes.Equal(decBuf.Bytes(), original) {
+		t.Errorf("pool large roundtrip mismatch: got %d bytes, want %d", decBuf.Len(), len(original))
+	}
+}
+
+func TestEncryptStreamWithPool_NilPool(t *testing.T) {
+	// nil pool must fall back to standard EncryptStream.
+	original := []byte("nil pool fallback test data")
+	es := NewEncryptionService("nil-pool-key")
+
+	var encBuf bytes.Buffer
+	encKey, err := es.EncryptStreamWithPool(bytes.NewReader(original), &encBuf, nil)
+	if err != nil {
+		t.Fatalf("EncryptStreamWithPool(nil): %v", err)
+	}
+
+	var decBuf bytes.Buffer
+	if err := es.DecryptStream(&encBuf, &decBuf, encKey); err != nil {
+		t.Fatalf("DecryptStream: %v", err)
+	}
+	if !bytes.Equal(decBuf.Bytes(), original) {
+		t.Error("nil pool roundtrip mismatch")
 	}
 }
