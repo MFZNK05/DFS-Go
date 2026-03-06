@@ -16,7 +16,7 @@ import (
 	"github.com/Faizan2005/DFS-Go/factory"
 )
 
-func StartDaemon(port string, peers []string, replicationFactor int) error {
+func StartDaemon(port string, peers []string, replicationFactor int, disableSTUN bool) error {
 	// Sprint 5: structured logging (MakeServer also calls this; idempotent).
 	logging.Init("daemon", logging.LevelInfo)
 
@@ -39,10 +39,10 @@ func StartDaemon(port string, peers []string, replicationFactor int) error {
 	defer listener.Close()
 
 	// Load identity for gossip metadata (optional — warn if missing).
-	var makeOpts *serve.MakeServerOpts
+	makeOpts := &serve.MakeServerOpts{DisableSTUN: disableSTUN}
 	if id, err := identity.Load(identity.DefaultPath()); err == nil {
 		logging.Global.Info("identity loaded", "alias", id.Alias, "fingerprint", id.Fingerprint())
-		makeOpts = &serve.MakeServerOpts{IdentityMeta: id.GossipMetadata()}
+		makeOpts.IdentityMeta = id.GossipMetadata()
 	} else {
 		logging.Global.Warn("no identity found — ECDH sharing disabled. Run 'dfs identity init --alias <name>'")
 	}

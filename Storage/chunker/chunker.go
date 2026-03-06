@@ -90,12 +90,24 @@ func ChunkReader(r io.Reader, chunkSize int) (<-chan Chunk, <-chan error) {
 // ChunkReaderWithPool is like ChunkReader but uses pool (if non-nil) to obtain
 // and return the temporary read buffer, eliminating one 4 MiB allocation per
 // chunk. pool.New must return *[]byte of at least chunkSize bytes.
-func ChunkReaderWithPool(r io.Reader, chunkSize int, pool *sync.Pool) (<-chan Chunk, <-chan error) {
+//
+// When dataPool is non-nil, each Chunk.Data is a pooled slice borrowed from
+// dataPool instead of a fresh allocation.  The CALLER is responsible for
+// returning the slice to the pool (via dataPool.Put(&data)) once it is done
+// with the chunk — typically after replication completes.  This creates a
+// zero-allocation pipeline where buffers are recycled end-to-end.
+func ChunkReaderWithPool(r io.Reader, chunkSize int, pool *sync.Pool, dataPool ...*sync.Pool) (<-chan Chunk, <-chan error) {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
 	out := make(chan Chunk, 4) // small buffer so reads pipeline with processing
 	errCh := make(chan error, 1)
+
+	// Optional data pool for zero-alloc output.
+	var dp *sync.Pool
+	if len(dataPool) > 0 {
+		dp = dataPool[0]
+	}
 
 	go func() {
 		defer close(out)
@@ -118,8 +130,17 @@ func ChunkReaderWithPool(r io.Reader, chunkSize int, pool *sync.Pool) (<-chan Ch
 		for {
 			n, err := io.ReadFull(r, buf)
 			if n > 0 {
-				// Make a copy — the caller owns this slice; buf is reused.
-				data := make([]byte, n)
+				var data []byte
+				if dp != nil {
+					// Borrow from the data pool — caller returns it.
+					pb := dp.Get().(*[]byte)
+					if cap(*pb) < n {
+						*pb = make([]byte, chunkSize)
+					}
+					data = (*pb)[:n]
+				} else {
+					data = make([]byte, n)
+				}
 				copy(data, buf[:n])
 				hash := sha256.Sum256(data)
 				out <- Chunk{
@@ -216,6 +237,17 @@ func BuildManifest(fileKey string, chunks []ChunkInfo, createdAt int64) *ChunkMa
 		MerkleRoot: root,
 		CreatedAt:  createdAt,
 	}
+}
+
+// VerifyMerkleRoot recomputes the Merkle root from the ordered chunk hashes
+// and returns an error if it does not match expectedRoot. Call this after all
+// chunks have been individually verified to confirm end-to-end manifest integrity.
+func VerifyMerkleRoot(chunks []ChunkInfo, expectedRoot string) error {
+	computed := computeMerkleRoot(chunks)
+	if computed != expectedRoot {
+		return fmt.Errorf("merkle root mismatch: expected %s, got %s", expectedRoot, computed)
+	}
+	return nil
 }
 
 // computeMerkleRoot builds a SHA-256 Merkle root over the ordered chunk

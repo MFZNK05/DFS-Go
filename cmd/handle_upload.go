@@ -135,6 +135,37 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error 
 		}
 	}
 
+	// Start a goroutine to read progress updates from the daemon.
+	// The Unix socket is full-duplex: we send file data on the main goroutine
+	// while reading progress updates here.
+	type uploadResult struct {
+		ok  bool
+		msg string
+		err error
+	}
+	resultCh := make(chan uploadResult, 1)
+	go func() {
+		for {
+			completed, total, isProgress, finalOK, msg, err := readProgressOrStatus(conn)
+			if err != nil {
+				resultCh <- uploadResult{err: err}
+				return
+			}
+			if isProgress {
+				if total > 0 {
+					pct := float64(completed) / float64(total) * 100
+					fmt.Printf("\rUploading: %d/%d chunks (%.0f%%)", completed, total, pct)
+				} else {
+					fmt.Printf("\rUploading: %d chunks", completed)
+				}
+				continue
+			}
+			// Final status.
+			resultCh <- uploadResult{ok: finalOK, msg: msg}
+			return
+		}
+	}()
+
 	if _, err := io.Copy(conn, f); err != nil {
 		return fmt.Errorf("stream file: %w", err)
 	}
@@ -144,14 +175,16 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error 
 		uc.CloseWrite()
 	}
 
-	ok, msg, err := readStatus(conn)
-	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+	// Wait for the daemon's final response.
+	res := <-resultCh
+	fmt.Println() // newline after progress
+	if res.err != nil {
+		return fmt.Errorf("read response: %w", res.err)
 	}
-	if !ok {
-		return fmt.Errorf("upload failed: %s", msg)
+	if !res.ok {
+		return fmt.Errorf("upload failed: %s", res.msg)
 	}
-	fmt.Println("Uploaded:", msg)
+	fmt.Println("Uploaded:", res.msg)
 	return nil
 }
 

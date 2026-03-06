@@ -33,6 +33,10 @@ func HandleClient(conn net.Conn, s *server.Server) {
 		handleGetManifestInfo(conn, s)
 	case opcodeResolveAlias:
 		handleResolveAlias(conn, s)
+	case opcodeDownloadToFile:
+		handleDownloadToFile(conn, s)
+	case opcodeECDHDownloadToFile:
+		handleECDHDownloadToFile(conn, s)
 	default:
 		log.Printf("IPC: unknown opcode 0x%02x", opcode[0])
 	}
@@ -52,7 +56,11 @@ func handleUpload(conn net.Conn, s *server.Server) {
 		body = io.LimitReader(conn, fileSize)
 	}
 
-	if err := s.StoreData(key, body, nil); err != nil {
+	progress := func(completed, total int) {
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.StoreDataWithProgress(key, body, nil, fileSize, progress); err != nil {
 		log.Println("IPC upload: StoreData:", err)
 		writeStatus(conn, statusError, err.Error())
 		return
@@ -81,7 +89,12 @@ func handleECDHUpload(conn net.Conn, s *server.Server) {
 		AccessList:    req.AccessList,
 		Signature:     req.Signature,
 	}
-	if err := s.StoreData(req.StorageKey, body, enc); err != nil {
+
+	progress := func(completed, total int) {
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.StoreDataWithProgress(req.StorageKey, body, enc, req.FileSize, progress); err != nil {
 		log.Println("IPC ECDH upload: StoreData:", err)
 		writeStatus(conn, statusError, err.Error())
 		return
@@ -104,6 +117,7 @@ func handleDownload(conn net.Conn, s *server.Server) {
 		writeDownloadError(conn, err.Error())
 		return
 	}
+	defer reader.Close()
 
 	contentLen := s.ContentLength(key)
 	writeDownloadResponse(conn, contentLen)
@@ -129,6 +143,7 @@ func handleECDHDownload(conn net.Conn, s *server.Server) {
 		writeDownloadError(conn, err.Error())
 		return
 	}
+	defer reader.Close()
 
 	contentLen := s.ContentLength(name)
 	writeDownloadResponse(conn, contentLen)
@@ -136,6 +151,52 @@ func handleECDHDownload(conn net.Conn, s *server.Server) {
 	if _, err := io.Copy(conn, reader); err != nil {
 		log.Println("IPC ECDH download: stream:", err)
 	}
+}
+
+// handleDownloadToFile handles direct-to-disk downloads (opcode 0x07).
+// The daemon writes directly to the specified file path using random-access I/O.
+// Progress updates are sent back over the IPC socket.
+func handleDownloadToFile(conn net.Conn, s *server.Server) {
+	key, filePath, err := readDownloadToFileRequest(conn)
+	if err != nil {
+		log.Println("IPC download-to-file: read header:", err)
+		writeStatus(conn, statusError, "bad request: "+err.Error())
+		return
+	}
+
+	progress := func(completed, total int) {
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.GetDataToFile(key, filePath, nil, progress); err != nil {
+		log.Println("IPC download-to-file: GetDataToFile:", err)
+		writeStatus(conn, statusError, err.Error())
+		return
+	}
+
+	writeStatus(conn, statusOK, fmt.Sprintf("downloaded to %s", filePath))
+}
+
+// handleECDHDownloadToFile handles encrypted direct-to-disk downloads (opcode 0x08).
+func handleECDHDownloadToFile(conn net.Conn, s *server.Server) {
+	key, filePath, dek, err := readECDHDownloadToFileRequest(conn)
+	if err != nil {
+		log.Println("IPC ECDH download-to-file: read header:", err)
+		writeStatus(conn, statusError, "bad request: "+err.Error())
+		return
+	}
+
+	progress := func(completed, total int) {
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.GetDataToFile(key, filePath, dek, progress); err != nil {
+		log.Println("IPC ECDH download-to-file: GetDataToFile:", err)
+		writeStatus(conn, statusError, err.Error())
+		return
+	}
+
+	writeStatus(conn, statusOK, fmt.Sprintf("downloaded to %s", filePath))
 }
 
 // handleGetManifestInfo returns the ECDH encryption metadata from a file's manifest.

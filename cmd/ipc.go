@@ -21,14 +21,17 @@ import (
 //   0x06 — Resolve alias → fingerprint + keys
 
 const (
-	opcodeUpload       byte = 0x01
-	opcodeDownload     byte = 0x02
-	opcodeECDHUpload   byte = 0x03
-	opcodeECDHDownload byte = 0x04
-	opcodeGetManifest  byte = 0x05
-	opcodeResolveAlias byte = 0x06
-	statusOK           byte = 0x00
-	statusError        byte = 0x01
+	opcodeUpload             byte = 0x01
+	opcodeDownload           byte = 0x02
+	opcodeECDHUpload         byte = 0x03
+	opcodeECDHDownload       byte = 0x04
+	opcodeGetManifest        byte = 0x05
+	opcodeResolveAlias       byte = 0x06
+	opcodeDownloadToFile     byte = 0x07 // direct-to-disk plaintext download
+	opcodeECDHDownloadToFile byte = 0x08 // direct-to-disk ECDH download
+	statusOK                 byte = 0x00
+	statusError              byte = 0x01
+	statusProgress           byte = 0x02 // progress update (not final)
 )
 
 // ── Plaintext upload (0x01) ──────────────────────────────────────────
@@ -570,4 +573,114 @@ func readString16(conn net.Conn) (string, error) {
 		return "", err
 	}
 	return string(buf), nil
+}
+
+// ── Download-to-File (0x07) ───────────────────────────────────────────
+// Request:  [0x07][2B key-len][key][2B path-len][absoluteFilePath]
+// Response: N × [statusProgress][4B completed][4B total]
+//           then [statusOK/statusError][4B msg-len][msg]
+
+func writeDownloadToFileRequest(conn net.Conn, key, filePath string) error {
+	if _, err := conn.Write([]byte{opcodeDownloadToFile}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	return writeString16(conn, filePath)
+}
+
+func readDownloadToFileRequest(conn net.Conn) (key, filePath string, err error) {
+	key, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	filePath, err = readString16(conn)
+	return
+}
+
+// ── ECDH Download-to-File (0x08) ─────────────────────────────────────
+// Request:  [0x08][2B key-len][key][2B path-len][absoluteFilePath][2B dek-len][dek]
+
+func writeECDHDownloadToFileRequest(conn net.Conn, key, filePath string, dek []byte) error {
+	if _, err := conn.Write([]byte{opcodeECDHDownloadToFile}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	if err := writeString16(conn, filePath); err != nil {
+		return err
+	}
+	var dlen [2]byte
+	binary.BigEndian.PutUint16(dlen[:], uint16(len(dek)))
+	if _, err := conn.Write(dlen[:]); err != nil {
+		return err
+	}
+	_, err := conn.Write(dek)
+	return err
+}
+
+func readECDHDownloadToFileRequest(conn net.Conn) (key, filePath string, dek []byte, err error) {
+	key, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	filePath, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	var dlenBuf [2]byte
+	if _, err = io.ReadFull(conn, dlenBuf[:]); err != nil {
+		return
+	}
+	dlen := binary.BigEndian.Uint16(dlenBuf[:])
+	dek = make([]byte, dlen)
+	_, err = io.ReadFull(conn, dek)
+	return
+}
+
+// ── Progress updates (sent during download-to-file) ───────────────────
+
+func writeProgressUpdate(conn net.Conn, completed, total int) {
+	var buf [9]byte
+	buf[0] = statusProgress
+	binary.BigEndian.PutUint32(buf[1:], uint32(completed))
+	binary.BigEndian.PutUint32(buf[5:], uint32(total))
+	conn.Write(buf[:]) //nolint:errcheck
+}
+
+// readProgressOrStatus reads either a progress update or a final status.
+// Returns (completed, total, true, "", nil) for progress updates.
+// Returns (0, 0, false, msg, nil) for final status (ok/error indicated by first return).
+func readProgressOrStatus(conn net.Conn) (completed, total int, isProgress bool, finalOK bool, msg string, err error) {
+	var statusBuf [1]byte
+	if _, err = io.ReadFull(conn, statusBuf[:]); err != nil {
+		return
+	}
+
+	if statusBuf[0] == statusProgress {
+		var buf [8]byte
+		if _, err = io.ReadFull(conn, buf[:]); err != nil {
+			return
+		}
+		completed = int(binary.BigEndian.Uint32(buf[:4]))
+		total = int(binary.BigEndian.Uint32(buf[4:]))
+		isProgress = true
+		return
+	}
+
+	// Final status (OK or Error).
+	var mlenBuf [4]byte
+	if _, err = io.ReadFull(conn, mlenBuf[:]); err != nil {
+		return
+	}
+	mlen := binary.BigEndian.Uint32(mlenBuf[:])
+	msgBuf := make([]byte, mlen)
+	if _, err = io.ReadFull(conn, msgBuf); err != nil {
+		return
+	}
+	finalOK = statusBuf[0] == statusOK
+	msg = string(msgBuf)
+	return
 }

@@ -36,20 +36,30 @@ import (
 	"github.com/Faizan2005/DFS-Go/Observability/logging"
 	"github.com/Faizan2005/DFS-Go/Observability/metrics"
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
+	"github.com/Faizan2005/DFS-Go/Peer2Peer/nat"
 	"github.com/Faizan2005/DFS-Go/Server/downloader"
 	storage "github.com/Faizan2005/DFS-Go/Storage"
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 	"github.com/Faizan2005/DFS-Go/Storage/compression"
+	"github.com/Faizan2005/DFS-Go/Storage/pending"
+	"github.com/Faizan2005/DFS-Go/Storage/resume"
 	"github.com/Faizan2005/DFS-Go/factory"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Package-level sync.Pools for the StoreData upload pipeline (Fix 3).
+// Package-level sync.Pools for the StoreData upload pipeline.
 // Reusing these large slabs across chunks eliminates GC stop-the-world pauses
 // (~100-200 ms each) that dominated small-file upload latency.
 var (
 	// chunkReadBufPool pools the 4 MiB read buffer used by ChunkReaderWithPool.
 	chunkReadBufPool = sync.Pool{
+		New: func() any { b := make([]byte, chunker.DefaultChunkSize); return &b },
+	}
+	// chunkDataPool pools the 4 MiB output slices that travel through the
+	// entire upload pipeline (chunker → Stage 1 → Stage 2 → replication).
+	// Returned to the pool only after replication completes, creating a
+	// zero-allocation pipeline bounded by maxInFlight + channel capacity.
+	chunkDataPool = sync.Pool{
 		New: func() any { b := make([]byte, chunker.DefaultChunkSize); return &b },
 	}
 	// compBufPool pools the compression output slab used by CompressChunkWithPool.
@@ -118,6 +128,9 @@ type Server struct {
 
 	// Phase 2: identity metadata for this node (alias, fingerprint, keys).
 	identityMeta map[string]string
+
+	// Phase 3: NAT traversal via STUN.
+	NATService *nat.Puncher
 
 	// externalAddr is the externally-visible address learned via MessageAnnounceAck.
 	// Before the first ack, this is empty and canonAddr (127.0.0.1:port) is used.
@@ -287,7 +300,7 @@ func (s *Server) ContentLength(key string) int64 {
 	return 0
 }
 
-func (s *Server) GetData(key string, dek []byte) (io.Reader, error) {
+func (s *Server) GetData(key string, dek []byte) (io.ReadCloser, error) {
 	t0 := time.Now()
 
 	// Check whether this key is stored as chunked.
@@ -314,96 +327,324 @@ func (s *Server) GetData(key string, dek []byte) (io.Reader, error) {
 	return s.getChunked(key, dek)
 }
 
-// getChunked reassembles a chunked file. When a Downloader is wired in
-// (Sprint 7) it fetches all chunks in parallel; otherwise it falls back to a
-// serial loop. Either path optionally decrypts (when dek != nil) +
-// decompresses + verifies each chunk.
-func (s *Server) getChunked(key string, dek []byte) (io.Reader, error) {
-	manifest, ok := s.serverOpts.metaData.GetManifest(key)
-	if !ok {
-		return nil, fmt.Errorf("getChunked: no manifest for key '%s'", key)
+// GetDataToFile downloads a chunked file directly to the specified path using
+// random-access I/O (io.WriterAt). Resume-aware: writes to <filePath>.part,
+// tracks progress in an append-only <filePath>.part.resume sidecar, fast-verifies
+// on restart, and atomically renames to filePath on completion.
+//
+// The progress callback receives (completedChunks, totalChunks) after each chunk.
+func (s *Server) GetDataToFile(key string, filePath string, dek []byte, progress downloader.ProgressFunc) error {
+	manifest, err := s.ensureManifest(key)
+	if err != nil {
+		return err
 	}
-	log.Printf("[LIFECYCLE] GET_CHUNKED: key=%s numChunks=%d usingDownloader=%v encrypted=%v", key, len(manifest.Chunks), s.Downloader != nil, dek != nil)
 
-	// Sprint 7: parallel path via Downloader.
-	if s.Downloader != nil {
-		var out bytes.Buffer
-		if err := s.Downloader.Download(manifest, &out, nil, dek); err != nil {
-			return nil, fmt.Errorf("getChunked: %w", err)
+	partPath := resume.PartPath(filePath)
+	n := len(manifest.Chunks)
+
+	// ── Resume boot: check for existing sidecar ──────────────────────
+	skipSet := make(map[int]bool)
+	var sidecar *resume.Sidecar
+
+	existing, claimed, err := resume.Open(filePath)
+	if err != nil {
+		log.Printf("[RESUME] corrupt sidecar for %q, starting fresh: %v", filePath, err)
+		_ = resume.Cleanup(filePath)
+	} else if existing != nil {
+		if existing.Matches(key, manifest.MerkleRoot, n, manifest.TotalSize) {
+			// Fast-verify: read each claimed chunk from .part, hash it, keep only verified ones.
+			skipSet = s.fastVerifyChunks(partPath, manifest, claimed)
+			sidecar = existing
+			log.Printf("[RESUME] verified %d/%d chunks for %q, resuming", len(skipSet), n, filePath)
+		} else {
+			// Manifest changed — stale sidecar.
+			log.Printf("[RESUME] manifest changed for %q, starting fresh", filePath)
+			existing.Close()
+			_ = resume.Cleanup(filePath)
+			_ = os.Remove(partPath)
 		}
-		go s.readRepair(key)
-		return &out, nil
 	}
 
-	// Serial fallback (single-node or Downloader not yet wired).
-	chunks := make([]chunker.Chunk, len(manifest.Chunks))
+	// ── Create sidecar if we don't have one ──────────────────────────
+	if sidecar == nil {
+		sidecar, err = resume.Create(filePath, key, manifest.MerkleRoot, n, manifest.TotalSize, manifest.ChunkSize)
+		if err != nil {
+			return fmt.Errorf("GetDataToFile: create sidecar: %w", err)
+		}
+	}
+	defer sidecar.Close()
+
+	// ── Open/pre-allocate .part file ─────────────────────────────────
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("GetDataToFile: open %q: %w", partPath, err)
+	}
+	defer f.Close()
+
+	if err := f.Truncate(manifest.TotalSize); err != nil {
+		return fmt.Errorf("GetDataToFile: truncate: %w", err)
+	}
+
+	// ── Download (skip already-verified chunks) ──────────────────────
+	onChunkDone := func(index int, hash string) {
+		if err := sidecar.RecordChunk(index); err != nil {
+			log.Printf("[RESUME] failed to record chunk %d: %v", index, err)
+		}
+	}
+
+	if s.Downloader != nil {
+		if err := s.Downloader.DownloadToFileResumable(manifest, f, skipSet, progress, onChunkDone, dek); err != nil {
+			return fmt.Errorf("GetDataToFile: %w", err)
+		}
+	} else {
+		if err := s.serialDownloadToFile(manifest, f, skipSet, onChunkDone, dek, progress); err != nil {
+			return fmt.Errorf("GetDataToFile: %w", err)
+		}
+	}
+
+	// ── Success: cleanup sidecar, atomic rename .part → final ────────
+	f.Close()
+	sidecar.Close()
+	_ = resume.Cleanup(filePath)
+
+	if err := os.Rename(partPath, filePath); err != nil {
+		return fmt.Errorf("GetDataToFile: rename %q → %q: %w", partPath, filePath, err)
+	}
+
+	go s.readRepair(key)
+	return nil
+}
+
+// fastVerifyChunks reads each claimed chunk from the .part file, hashes it,
+// and returns only the indices whose hash matches the manifest. This ensures
+// we never trust a sidecar over actual disk state.
+func (s *Server) fastVerifyChunks(partPath string, manifest *chunker.ChunkManifest, claimed map[int]bool) map[int]bool {
+	verified := make(map[int]bool)
+	if len(claimed) == 0 {
+		return verified
+	}
+
+	f, err := os.Open(partPath)
+	if err != nil {
+		return verified // .part missing — no chunks verified
+	}
+	defer f.Close()
+
+	buf := make([]byte, manifest.ChunkSize)
+	for idx := range claimed {
+		if idx < 0 || idx >= len(manifest.Chunks) {
+			continue
+		}
+		info := manifest.Chunks[idx]
+		offset := int64(idx) * int64(manifest.ChunkSize)
+
+		// Determine actual chunk size (last chunk may be smaller).
+		chunkLen := int64(manifest.ChunkSize)
+		if int64(idx) == int64(len(manifest.Chunks)-1) {
+			remainder := manifest.TotalSize - offset
+			if remainder > 0 && remainder < chunkLen {
+				chunkLen = remainder
+			}
+		}
+
+		n, err := f.ReadAt(buf[:chunkLen], offset)
+		if err != nil || int64(n) != chunkLen {
+			continue // can't read — will re-download
+		}
+
+		got := sha256.Sum256(buf[:chunkLen])
+		if hex.EncodeToString(got[:]) == info.Hash {
+			verified[idx] = true
+		}
+	}
+	return verified
+}
+
+// ensureManifest returns the manifest for key, fetching from peers if needed.
+func (s *Server) ensureManifest(key string) (*chunker.ChunkManifest, error) {
+	fm, hasMeta := s.serverOpts.metaData.Get(key)
+	if hasMeta && fm.Chunked {
+		m, ok := s.serverOpts.metaData.GetManifest(key)
+		if ok {
+			return m, nil
+		}
+	}
+
+	manifest, err := s.fetchManifestFromPeers(key)
+	if err != nil {
+		return nil, fmt.Errorf("manifest for '%s' unavailable: %w", key, err)
+	}
+	_ = s.serverOpts.metaData.SetManifest(key, manifest)
+	_ = s.serverOpts.metaData.Set(key, storage.FileMeta{Chunked: true, Timestamp: time.Now().UnixNano()})
+	return manifest, nil
+}
+
+// serialDownloadToFile is the fallback when no Downloader is wired. Fetches
+// chunks one-by-one and writes each to dst at the correct offset.
+// Chunks in skipSet are skipped (already verified on disk).
+func (s *Server) serialDownloadToFile(manifest *chunker.ChunkManifest, dst io.WriterAt, skipSet map[int]bool, onChunkDone downloader.ChunkRecordFunc, dek []byte, progress downloader.ProgressFunc) error {
+	n := len(manifest.Chunks)
+	completed := len(skipSet)
 
 	for i, info := range manifest.Chunks {
+		if skipSet[i] {
+			continue
+		}
+
 		storageKey := chunker.ChunkStorageKey(info.EncHash)
 
 		var chunkData []byte
-
 		if s.Store.Has(storageKey) {
 			_, r, err := s.Store.ReadStream(storageKey)
 			if err != nil {
-				return nil, fmt.Errorf("getChunked: read local chunk %d: %w", info.Index, err)
+				return fmt.Errorf("read local chunk %d: %w", info.Index, err)
 			}
 			chunkData, err = io.ReadAll(r)
 			r.Close()
 			if err != nil {
-				return nil, fmt.Errorf("getChunked: read bytes chunk %d: %w", info.Index, err)
+				return fmt.Errorf("read bytes chunk %d: %w", info.Index, err)
 			}
 		} else {
 			data, err := s.fetchChunkFromPeers(storageKey)
 			if err != nil {
-				return nil, fmt.Errorf("getChunked: fetch chunk %d from peers: %w", info.Index, err)
+				return fmt.Errorf("fetch chunk %d from peers: %w", info.Index, err)
 			}
 			chunkData = data
 			_, _ = s.Store.WriteStream(storageKey, bytes.NewReader(chunkData))
 		}
 
 		plainBytes := chunkData
-
-		// Decrypt only when a DEK was provided (CSE path).
 		if dek != nil {
 			var plain bytes.Buffer
 			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek); err != nil {
-				return nil, fmt.Errorf("getChunked: decrypt chunk %d: %w", info.Index, err)
+				return fmt.Errorf("decrypt chunk %d: %w", info.Index, err)
 			}
 			plainBytes = plain.Bytes()
 		}
-
-		// Decompress if the chunk was compressed at upload time.
 		if info.Compressed {
 			var err error
 			plainBytes, err = compression.DecompressChunk(plainBytes)
 			if err != nil {
-				return nil, fmt.Errorf("getChunked: decompress chunk %d: %w", info.Index, err)
+				return fmt.Errorf("decompress chunk %d: %w", info.Index, err)
 			}
 		}
 
 		got := sha256.Sum256(plainBytes)
 		gotHex := hex.EncodeToString(got[:])
 		if gotHex != info.Hash {
-			return nil, fmt.Errorf("getChunked: integrity check failed for chunk %d (want %s got %s)",
+			return fmt.Errorf("integrity check failed for chunk %d (want %s got %s)",
 				info.Index, info.Hash, gotHex)
 		}
 
-		chunks[i] = chunker.Chunk{
-			Index: info.Index,
-			Hash:  got,
-			Size:  int64(len(plainBytes)),
-			Data:  plainBytes,
+		offset := int64(i) * int64(manifest.ChunkSize)
+		if _, err := dst.WriteAt(plainBytes, offset); err != nil {
+			return fmt.Errorf("write chunk %d: %w", info.Index, err)
+		}
+
+		if onChunkDone != nil {
+			onChunkDone(i, info.Hash)
+		}
+
+		completed++
+		if progress != nil {
+			progress(completed, n)
 		}
 	}
 
-	var out bytes.Buffer
-	if err := chunker.Reassemble(chunks, &out); err != nil {
-		return nil, fmt.Errorf("getChunked: reassemble: %w", err)
+	return chunker.VerifyMerkleRoot(manifest.Chunks, manifest.MerkleRoot)
+}
+
+
+// getChunked streams a chunked file via io.Pipe. When a Downloader is wired in
+// it uses DownloadToStream (sliding-window, bounded memory); otherwise it falls
+// back to a serial loop. Either path decrypts + decompresses + verifies each
+// chunk on-the-fly before writing to the pipe.
+func (s *Server) getChunked(key string, dek []byte) (io.ReadCloser, error) {
+	manifest, ok := s.serverOpts.metaData.GetManifest(key)
+	if !ok {
+		return nil, fmt.Errorf("getChunked: no manifest for key '%s'", key)
+	}
+	log.Printf("[LIFECYCLE] GET_CHUNKED: key=%s numChunks=%d usingDownloader=%v encrypted=%v", key, len(manifest.Chunks), s.Downloader != nil, dek != nil)
+
+	pr, pw := io.Pipe()
+
+	if s.Downloader != nil {
+		// Parallel path: sliding-window streaming via DownloadToStream.
+		go func() {
+			err := s.Downloader.DownloadToStream(manifest, pw, nil, dek)
+			pw.CloseWithError(err) // nil err closes cleanly
+			if err == nil {
+				go s.readRepair(key)
+			}
+		}()
+		return pr, nil
 	}
 
-	go s.readRepair(key)
-	return &out, nil
+	// Serial fallback: write chunks one-by-one to the pipe.
+	go func() {
+		for _, info := range manifest.Chunks {
+			storageKey := chunker.ChunkStorageKey(info.EncHash)
+
+			var chunkData []byte
+			if s.Store.Has(storageKey) {
+				_, r, err := s.Store.ReadStream(storageKey)
+				if err != nil {
+					pw.CloseWithError(fmt.Errorf("getChunked: read local chunk %d: %w", info.Index, err))
+					return
+				}
+				chunkData, err = io.ReadAll(r)
+				r.Close()
+				if err != nil {
+					pw.CloseWithError(fmt.Errorf("getChunked: read bytes chunk %d: %w", info.Index, err))
+					return
+				}
+			} else {
+				data, err := s.fetchChunkFromPeers(storageKey)
+				if err != nil {
+					pw.CloseWithError(fmt.Errorf("getChunked: fetch chunk %d from peers: %w", info.Index, err))
+					return
+				}
+				chunkData = data
+				_, _ = s.Store.WriteStream(storageKey, bytes.NewReader(chunkData))
+			}
+
+			plainBytes := chunkData
+			if dek != nil {
+				var plain bytes.Buffer
+				if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek); err != nil {
+					pw.CloseWithError(fmt.Errorf("getChunked: decrypt chunk %d: %w", info.Index, err))
+					return
+				}
+				plainBytes = plain.Bytes()
+			}
+
+			if info.Compressed {
+				var err error
+				plainBytes, err = compression.DecompressChunk(plainBytes)
+				if err != nil {
+					pw.CloseWithError(fmt.Errorf("getChunked: decompress chunk %d: %w", info.Index, err))
+					return
+				}
+			}
+
+			got := sha256.Sum256(plainBytes)
+			gotHex := hex.EncodeToString(got[:])
+			if gotHex != info.Hash {
+				pw.CloseWithError(fmt.Errorf("getChunked: integrity check failed for chunk %d (want %s got %s)",
+					info.Index, info.Hash, gotHex))
+				return
+			}
+
+			if _, err := pw.Write(plainBytes); err != nil {
+				pw.CloseWithError(fmt.Errorf("getChunked: write chunk %d: %w", info.Index, err))
+				return
+			}
+		}
+		pw.Close() // success
+		go s.readRepair(key)
+	}()
+
+	return pr, nil
 }
 
 // fetchChunkFromPeers requests a chunk's encrypted bytes from the ring-
@@ -633,6 +874,7 @@ type processedChunk struct {
 	data       []byte
 	storageKey string
 	targets    []string
+	pooled     bool // true if data is from chunkDataPool and must be returned
 }
 
 // EncryptionMeta carries ECDH encryption metadata for StoreData.
@@ -645,7 +887,16 @@ type EncryptionMeta struct {
 	Signature     string                // hex Ed25519 signature over manifest fields
 }
 
+// UploadProgressFunc is called after each chunk is stored and replicated.
+// completed is the number of chunks finished so far, total is the estimated
+// total (may be 0 if file size was unknown).
+type UploadProgressFunc func(completed, total int)
+
 func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
+	return s.StoreDataWithProgress(key, w, enc, 0, nil)
+}
+
+func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc) error {
 	t0 := time.Now()
 	log.Println("STORE_DATA: Starting chunked storage for key:", key)
 	defer func() { metrics.RecordStore("store", nil, time.Since(t0)) }()
@@ -653,17 +904,65 @@ func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
 	replFactor := s.HashRing.ReplicationFactor()
 
+	// ── Resume: load any existing pending sidecar for this key ──
+	storageRoot := s.serverOpts.storageRoot
+	prevResult, err := pending.Load(storageRoot, key)
+	if err != nil {
+		log.Printf("STORE_DATA: failed to load pending sidecar (starting fresh): %v", err)
+	}
+	skipSet := make(map[int]bool)
+	var resumedInfos []chunker.ChunkInfo
+	if prevResult != nil {
+		skipSet = prevResult.Completed
+		resumedInfos = prevResult.ChunkInfos
+		log.Printf("STORE_DATA: resuming upload for %q — %d chunks already done", key, len(skipSet))
+	}
+
+	// Create (or re-create) the pending sidecar.
+	sidecar, err := pending.Create(storageRoot, pending.Header{
+		StorageKey: key,
+		ChunkSize:  chunker.DefaultChunkSize,
+		CreatedAt:  time.Now().UnixNano(),
+	})
+	if err != nil {
+		return fmt.Errorf("STORE_DATA: create pending sidecar: %w", err)
+	}
+	// Pre-record all resumed chunks so a second crash doesn't lose them.
+	for _, ci := range resumedInfos {
+		sidecar.RecordChunk(ci) //nolint:errcheck
+	}
+	defer sidecar.Close()
+
+	// Estimate total chunks for progress reporting.
+	totalChunks := 0
+	if fileSize > 0 {
+		totalChunks = int((fileSize + int64(chunker.DefaultChunkSize) - 1) / int64(chunker.DefaultChunkSize))
+	}
+
 	// procCh connects Stage 1 (compress + optional encrypt) with Stage 2 (store+replicate).
 	// Buffered=2 lets Stage 1 stay up to 1 chunk ahead of Stage 2.
 	procCh := make(chan processedChunk, 2)
 	stage1ErrCh := make(chan error, 1)
 
 	// Stage 1: read → compress → (optionally encrypt) → push to procCh.
+	// The chunker borrows data slices from chunkDataPool.  When compression
+	// or encryption transforms the data into a new buffer, the original
+	// pooled slice is returned immediately.  Otherwise the pooled slice
+	// travels through to Stage 2 and is returned after replication.
 	go func() {
 		defer close(procCh)
-		chunkCh, errCh := chunker.ChunkReaderWithPool(w, chunker.DefaultChunkSize, &chunkReadBufPool)
+		chunkCh, errCh := chunker.ChunkReaderWithPool(w, chunker.DefaultChunkSize, &chunkReadBufPool, &chunkDataPool)
 		for chunk := range chunkCh {
+			// Skip chunks already completed in a previous partial upload.
+			if skipSet[chunk.Index] {
+				// Return pooled data immediately.
+				b := chunk.Data[:cap(chunk.Data)]
+				chunkDataPool.Put(&b)
+				continue
+			}
+
 			processed := chunk.Data
+			pooledData := chunk.Data // keep reference for return-to-pool
 			wasCompressed := false
 			if compression.ShouldCompress(chunk.Data) {
 				if c, wc, err := compression.CompressChunkWithPool(chunk.Data, compression.LevelFastest, &compBufPool); err == nil && wc {
@@ -676,10 +975,24 @@ func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 			if enc != nil {
 				var encBuf bytes.Buffer
 				if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, enc.DEK, &encBufPool); err != nil {
+					// Return pooled data before bailing.
+					b := pooledData[:cap(pooledData)]
+					chunkDataPool.Put(&b)
 					stage1ErrCh <- fmt.Errorf("STORE_DATA: encrypt chunk %d: %w", chunk.Index, err)
 					return
 				}
 				processed = encBuf.Bytes()
+			}
+
+			// If processed is a different buffer (compression or encryption
+			// created a new slice), return the original pooled data now.
+			// Otherwise mark it as pooled so Stage 2 returns it after replication.
+			dataIsPooled := false
+			if cap(processed) != cap(pooledData) {
+				b := pooledData[:cap(pooledData)]
+				chunkDataPool.Put(&b)
+			} else {
+				dataIsPooled = true
 			}
 
 			hashRaw := sha256.Sum256(processed)
@@ -700,17 +1013,31 @@ func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 				data:       processed,
 				storageKey: storageKey,
 				targets:    targets,
+				pooled:     dataIsPooled,
 			}
 		}
 		stage1ErrCh <- <-errCh
 	}()
 
 	// Stage 2: local store + replicate.
+	// The semaphore is acquired BEFORE spawning the goroutine so the for-loop
+	// blocks when all replication slots are busy.  This creates backpressure
+	// all the way back to Stage 1 / the disk reader, capping resident memory
+	// at (maxInFlight + procCh cap) × chunkSize regardless of file size.
 	const maxInFlight = 4
 	sem := make(chan struct{}, maxInFlight)
 	var replWg sync.WaitGroup
 
-	var chunkInfos []chunker.ChunkInfo
+	// Start with any chunks recovered from a previous partial upload.
+	chunkInfos := make([]chunker.ChunkInfo, 0, len(resumedInfos))
+	chunkInfos = append(chunkInfos, resumedInfos...)
+	completed := len(chunkInfos)
+
+	// Report initial progress for resumed chunks.
+	if progress != nil && completed > 0 {
+		progress(completed, totalChunks)
+	}
+
 	for pc := range procCh {
 		// Store locally (skip if already present — dedup).
 		if !s.Store.Has(pc.storageKey) {
@@ -727,18 +1054,34 @@ func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s targets=%v",
 			pc.storageKey, pc.targets)
 
-		// Fire replication in background — don't block the pipeline.
+		// Block HERE until a replication slot is free — this is the
+		// backpressure point that prevents unbounded goroutine/memory growth.
+		sem <- struct{}{}
+
 		replWg.Add(1)
-		pcCopy := pc
-		go func() {
+		go func(sk string, data []byte, targets []string, idx int, pooled bool) {
 			defer replWg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
-			s.replicateChunk(selfAddr, pcCopy.storageKey, pcCopy.data, pcCopy.targets)
-			log.Printf("STORE_DATA: chunk %d replicated (storageKey=%s)", pcCopy.info.Index, pcCopy.storageKey)
-		}()
+			defer func() {
+				if pooled {
+					b := data[:cap(data)]
+					chunkDataPool.Put(&b)
+				}
+			}()
+			s.replicateChunk(selfAddr, sk, data, targets)
+			log.Printf("STORE_DATA: chunk %d replicated (storageKey=%s)", idx, sk)
+		}(pc.storageKey, pc.data, pc.targets, pc.info.Index, pc.pooled)
 
 		chunkInfos = append(chunkInfos, pc.info)
+		completed++
+
+		// Record in sidecar (crash-safe).
+		sidecar.RecordChunk(pc.info) //nolint:errcheck
+
+		// Report progress.
+		if progress != nil {
+			progress(completed, totalChunks)
+		}
 	}
 
 	// Wait for all replication goroutines to finish before building the manifest.
@@ -776,6 +1119,10 @@ func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 	if err := s.serverOpts.metaData.Set(key, topFm); err != nil {
 		return fmt.Errorf("STORE_DATA: update file meta: %w", err)
 	}
+
+	// Upload succeeded — delete the pending sidecar.
+	sidecar.Close()
+	pending.Finalize(storageRoot, key) //nolint:errcheck
 
 	log.Printf("STORE_DATA: key '%s' stored as %d chunks", key, len(chunkInfos))
 	return nil
@@ -1441,6 +1788,11 @@ func (s *Server) Start() error {
 		log.Println("[Run] AntiEntropyService started")
 	}
 
+	// Phase 3: proactive NAT traversal via STUN.
+	if s.NATService != nil {
+		go s.discoverNAT()
+	}
+
 	if len(s.serverOpts.bootstrapNodes) != 0 {
 		if err := s.BootstrapNetwork(); err != nil {
 			return err
@@ -1928,6 +2280,23 @@ func (s *Server) effectiveSelfAddr() string {
 	return normalizeAddr(s.serverOpts.transport.Addr())
 }
 
+// discoverNAT runs STUN discovery in the background. On success it sets the
+// external address and injects the public_addr into gossip metadata, unifying
+// with the reactive announce-ack discovery path.
+func (s *Server) discoverNAT() {
+	pubAddr, err := s.NATService.DiscoverPublicAddr()
+	if err != nil {
+		log.Printf("[NAT] STUN discovery failed (LAN-only mode): %v", err)
+		return
+	}
+	log.Printf("[NAT] Public address discovered: %s", pubAddr)
+
+	// Store in gossip metadata so peers can reach us across subnets.
+	selfAddr := s.effectiveSelfAddr()
+	meta := s.NATService.AnnotateGossip()
+	s.Cluster.SetMetadata(selfAddr, meta)
+}
+
 // handleAnnounceAck processes a MessageAnnounceAck from a peer we connected to.
 // The ack tells us our externally-visible address (what the remote sees us as).
 // If it differs from our current canonAddr (e.g. we think we're 127.0.0.1:3000
@@ -2353,6 +2722,7 @@ func init() {
 // MakeServerOpts holds optional configuration for MakeServer.
 type MakeServerOpts struct {
 	IdentityMeta map[string]string // gossip metadata from identity (alias, fingerprint, keys)
+	DisableSTUN  bool              // skip STUN-based NAT traversal (default: false = STUN enabled)
 }
 
 func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOpts, node ...string) *Server {
@@ -2675,6 +3045,14 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 			return s.HashRing.GetNodes(storageKey, s.HashRing.ReplicationFactor())
 		},
 	)
+
+	// Phase 3: wire NAT traversal (STUN-based public address discovery).
+	if makeOpts == nil || !makeOpts.DisableSTUN {
+		s.NATService = nat.New(nat.DefaultConfig())
+		log.Println("[MakeServer] STUN-based NAT traversal enabled")
+	} else {
+		log.Println("[MakeServer] STUN-based NAT traversal disabled (--no-stun)")
+	}
 
 	// Sprint 5: wire health server on port+1000 (e.g. :3000 → :4000).
 	s.startedAt = time.Now()
