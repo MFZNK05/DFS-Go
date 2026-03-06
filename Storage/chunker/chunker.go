@@ -53,6 +53,12 @@ type ChunkInfo struct {
 	Compressed bool   // true if this chunk was zstd-compressed before encryption
 }
 
+// AccessEntry records one recipient's wrapped DEK in an ECDH-encrypted manifest.
+type AccessEntry struct {
+	RecipientPubKey string `json:"recipient_pub_key"` // hex X25519 pub
+	WrappedDEK      string `json:"wrapped_dek"`       // hex [12B nonce][ciphertext+tag]
+}
+
 // ChunkManifest is the table of contents for a chunked file.
 // Stored under "manifest:<fileKey>" in the metadata store.
 type ChunkManifest struct {
@@ -62,6 +68,13 @@ type ChunkManifest struct {
 	Chunks     []ChunkInfo // ordered list; Index field is authoritative
 	MerkleRoot string      // hex SHA-256 over concatenated chunk plaintext hashes
 	CreatedAt  int64       // UnixNano
+	Encrypted  bool        // true if file was encrypted with ECDH sharing
+
+	// ECDH sharing fields (set when Encrypted=true).
+	OwnerPubKey   string        `json:"owner_pub_key,omitempty"`    // hex X25519 pub of uploader
+	OwnerEdPubKey string        `json:"owner_ed_pub_key,omitempty"` // hex Ed25519 pub of uploader
+	AccessList    []AccessEntry `json:"access_list,omitempty"`      // one entry per recipient
+	Signature     string        `json:"signature,omitempty"`        // hex Ed25519 signature
 }
 
 // ChunkReader reads from r in chunkSize-byte increments and sends each chunk

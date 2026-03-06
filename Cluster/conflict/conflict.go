@@ -20,8 +20,6 @@ type Version struct {
 	// Timestamp is the wall-clock time (UnixNano) of the write. Used as a
 	// tiebreaker when two versions have Concurrent vector clocks.
 	Timestamp int64
-	// EncryptedKey is the per-file AES key, hex-encoded.
-	EncryptedKey string
 }
 
 // Resolver picks the authoritative version from a set of candidates.

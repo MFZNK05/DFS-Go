@@ -19,7 +19,7 @@ type mockMeta struct {
 func newMockMeta(keys ...string) *mockMeta {
 	m := &mockMeta{store: make(map[string]storage.FileMeta)}
 	for _, k := range keys {
-		m.store[k] = storage.FileMeta{EncryptedKey: "enckey-" + k}
+		m.store[k] = storage.FileMeta{}
 	}
 	return m
 }
@@ -78,14 +78,14 @@ func TestMigrateOnNodeJoin(t *testing.T) {
 	var mu sync.Mutex
 
 	r := New(self, ring, meta,
-		func(key string) (string, []byte, error) {
-			fm, ok := meta.Get(key)
+		func(key string) ([]byte, error) {
+			_, ok := meta.Get(key)
 			if !ok {
-				return "", nil, fmt.Errorf("not found")
+				return nil, fmt.Errorf("not found")
 			}
-			return fm.EncryptedKey, []byte("data-" + key), nil
+			return []byte("data-" + key), nil
 		},
-		func(target, key, encKey string, data []byte) error {
+		func(target, key string, data []byte) error {
 			mu.Lock()
 			sent[target] = append(sent[target], key)
 			mu.Unlock()
@@ -127,8 +127,8 @@ func TestNoMigrationWhenNotOwner(t *testing.T) {
 	var mu sync.Mutex
 
 	r := New(self, ring, meta,
-		func(key string) (string, []byte, error) { return "k", []byte("d"), nil },
-		func(target, key, encKey string, data []byte) error {
+		func(key string) ([]byte, error) { return []byte("d"), nil },
+		func(target, key string, data []byte) error {
 			mu.Lock()
 			sentCount++
 			mu.Unlock()
@@ -157,8 +157,8 @@ func TestRereplOnNodeLeave(t *testing.T) {
 	var mu sync.Mutex
 
 	r := New(self, ring, meta,
-		func(key string) (string, []byte, error) { return "k", []byte("d"), nil },
-		func(target, key, encKey string, data []byte) error {
+		func(key string) ([]byte, error) { return []byte("d"), nil },
+		func(target, key string, data []byte) error {
 			mu.Lock()
 			sent[target]++
 			mu.Unlock()

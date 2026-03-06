@@ -4,20 +4,26 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Faizan2005/DFS-Go/Cluster/hashring"
 	storage "github.com/Faizan2005/DFS-Go/Storage"
 )
 
-// SendFileFunc is a closure provided by server.go that sends an already-encrypted
-// file (identified by key) to the given target address.
-// encKey is the hex-encoded per-file encrypted key.
-// data is the raw encrypted bytes.
-type SendFileFunc func(targetAddr, key, encKey string, data []byte) error
+// DefaultMigrationDelay is the pause between consecutive chunk migrations.
+// This prevents rebalance from saturating the peer connection during active uploads.
+// At 50ms, 466 chunks take ~23s total but each individual migration is interleaved
+// with upload replication rather than monopolising the connection in bursts.
+const DefaultMigrationDelay = 50 * time.Millisecond
 
-// ReadFileFunc reads an encrypted file from local storage.
-// Returns the hex-encoded encrypted key and the raw encrypted bytes.
-type ReadFileFunc func(key string) (encKey string, data []byte, err error)
+// SendFileFunc is a closure provided by server.go that sends a file
+// (identified by key) to the given target address.
+// data is the raw (possibly encrypted) bytes.
+type SendFileFunc func(targetAddr, key string, data []byte) error
+
+// ReadFileFunc reads a file from local storage.
+// Returns the raw bytes (possibly encrypted — opaque to rebalancer).
+type ReadFileFunc func(key string) (data []byte, err error)
 
 // SendManifestFunc sends a ChunkManifest (already serialised as JSON) to a peer.
 // fileKey is the original file key (not the "manifest:" prefixed key).
@@ -39,6 +45,10 @@ type Rebalancer struct {
 	readManifest ReadManifestFunc
 	sendManifest SendManifestFunc
 
+	// MigrationDelay is the pause inserted between consecutive chunk migrations.
+	// Zero means no delay (full speed). Defaults to DefaultMigrationDelay.
+	MigrationDelay time.Duration
+
 	mu         sync.Mutex
 	inProgress bool
 
@@ -54,12 +64,13 @@ func New(
 	sendFile SendFileFunc,
 ) *Rebalancer {
 	return &Rebalancer{
-		selfAddr: selfAddr,
-		ring:     ring,
-		meta:     meta,
-		readFile: readFile,
-		sendFile: sendFile,
-		stopCh:   make(chan struct{}),
+		selfAddr:       selfAddr,
+		ring:           ring,
+		meta:           meta,
+		readFile:       readFile,
+		sendFile:       sendFile,
+		MigrationDelay: DefaultMigrationDelay,
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -135,19 +146,29 @@ func (r *Rebalancer) migrateToNewNode(newAddr string) {
 			continue
 		}
 
-		encKey, data, err := r.readFile(key)
+		data, err := r.readFile(key)
 		if err != nil {
 			log.Printf("[rebalance] failed to read key=%s for migration: %v", key, err)
 			continue
 		}
 
-		if err := r.sendFile(newAddr, key, encKey, data); err != nil {
+		if err := r.sendFile(newAddr, key, data); err != nil {
 			log.Printf("[rebalance] failed to send key=%s to %s: %v", key, newAddr, err)
 			continue
 		}
 
 		migrated++
 		log.Printf("[rebalance] migrated key=%s to %s", key, newAddr)
+
+		// Throttle: yield the connection so active uploads can interleave.
+		if r.MigrationDelay > 0 {
+			select {
+			case <-r.stopCh:
+				log.Printf("[rebalance] migration to %s interrupted at %d/%d keys", newAddr, migrated, len(keys))
+				return
+			case <-time.After(r.MigrationDelay):
+			}
+		}
 	}
 
 	log.Printf("[rebalance] migration to %s complete: %d/%d keys sent", newAddr, migrated, len(keys))
@@ -195,7 +216,7 @@ func (r *Rebalancer) rereplicate(deadAddr string) {
 			continue
 		}
 
-		encKey, data, err := r.readFile(key)
+		data, err := r.readFile(key)
 		if err != nil {
 			log.Printf("[rebalance] failed to read key=%s for rereplicate: %v", key, err)
 			continue
@@ -206,7 +227,7 @@ func (r *Rebalancer) rereplicate(deadAddr string) {
 			if target == r.selfAddr || target == deadAddr {
 				continue
 			}
-			if err := r.sendFile(target, key, encKey, data); err != nil {
+			if err := r.sendFile(target, key, data); err != nil {
 				log.Printf("[rebalance] failed to rereplicate key=%s to %s: %v", key, target, err)
 				continue
 			}

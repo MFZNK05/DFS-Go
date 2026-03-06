@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
+	bolt "go.etcd.io/bbolt"
 )
 
 const defaultRoot = "DFSNetworkRoot"
@@ -31,12 +33,11 @@ type StructOpts struct {
 }
 
 type FileMeta struct {
-	Path         string
-	EncryptedKey string            // hex-encoded per-file AES key
-	VClock       map[string]uint64 // vector clock at time of write (Sprint 4)
-	Timestamp    int64             // UnixNano wall clock — LWW tiebreaker (Sprint 4)
-	Chunked      bool              // true when the file was split into chunks (Sprint 6)
-	Manifest     *chunker.ChunkManifest // non-nil iff Chunked == true (Sprint 6)
+	Path      string
+	VClock    map[string]uint64      // vector clock at time of write (Sprint 4)
+	Timestamp int64                  // UnixNano wall clock — LWW tiebreaker (Sprint 4)
+	Chunked   bool                   // true when the file was split into chunks (Sprint 6)
+	Manifest  *chunker.ChunkManifest // non-nil iff Chunked == true (Sprint 6)
 }
 
 type PathKey struct {
@@ -291,4 +292,115 @@ func (m *MetaFile) GetManifest(fileKey string) (*chunker.ChunkManifest, bool) {
 func (m *MetaFile) SetManifest(fileKey string, manifest *chunker.ChunkManifest) error {
 	mkey := chunker.ManifestStorageKey(fileKey)
 	return m.Set(mkey, FileMeta{Manifest: manifest})
+}
+
+// ---------------------------------------------------------------------------
+// BoltMetaStore — bbolt-backed MetadataStore implementation.
+// Each Set() writes only the affected key (O(1)), replacing the O(N) full
+// JSON rewrite of MetaFile. Crash-safe via bbolt's WAL.
+// ---------------------------------------------------------------------------
+
+const (
+	boltBucketMeta     = "filemeta"
+	boltBucketManifest = "manifests"
+)
+
+// BoltMetaStore implements MetadataStore using an embedded bbolt database.
+type BoltMetaStore struct {
+	db *bolt.DB
+}
+
+// NewBoltMetaStore opens (or creates) a bbolt database at dbPath and returns
+// a ready-to-use BoltMetaStore.
+func NewBoltMetaStore(dbPath string) (*BoltMetaStore, error) {
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		return nil, fmt.Errorf("bolt open %s: %w", dbPath, err)
+	}
+	// Ensure both buckets exist.
+	err = db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte(boltBucketMeta)); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucketIfNotExists([]byte(boltBucketManifest))
+		return err
+	})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bolt init buckets: %w", err)
+	}
+	return &BoltMetaStore{db: db}, nil
+}
+
+// Close releases the database file. Call on server shutdown.
+func (b *BoltMetaStore) Close() error {
+	return b.db.Close()
+}
+
+func (b *BoltMetaStore) Get(key string) (FileMeta, bool) {
+	var fm FileMeta
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketMeta))
+		v := bkt.Get([]byte(key))
+		if v == nil {
+			return os.ErrNotExist
+		}
+		return json.Unmarshal(v, &fm)
+	})
+	if err != nil {
+		return FileMeta{}, false
+	}
+	return fm, true
+}
+
+func (b *BoltMetaStore) Set(key string, meta FileMeta) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketMeta))
+		return bkt.Put([]byte(key), data)
+	})
+}
+
+// Keys returns all keys in the filemeta bucket.
+// Used by Rebalancer via type assertion (not part of MetadataStore interface).
+func (b *BoltMetaStore) Keys() []string {
+	var keys []string
+	b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketMeta))
+		return bkt.ForEach(func(k, _ []byte) error {
+			keys = append(keys, string(k))
+			return nil
+		})
+	})
+	return keys
+}
+
+func (b *BoltMetaStore) GetManifest(fileKey string) (*chunker.ChunkManifest, bool) {
+	var manifest chunker.ChunkManifest
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketManifest))
+		v := bkt.Get([]byte(fileKey))
+		if v == nil {
+			return os.ErrNotExist
+		}
+		return json.Unmarshal(v, &manifest)
+	})
+	if err != nil {
+		return nil, false
+	}
+	return &manifest, true
+}
+
+func (b *BoltMetaStore) SetManifest(fileKey string, manifest *chunker.ChunkManifest) error {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketManifest))
+		return bkt.Put([]byte(fileKey), data)
+	})
 }

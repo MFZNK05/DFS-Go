@@ -56,7 +56,7 @@ var (
 	compBufPool = sync.Pool{
 		New: func() any { b := make([]byte, 0, chunker.DefaultChunkSize); return &b },
 	}
-	// encBufPool pools the GCM ciphertext slab used by EncryptStreamWithPool.
+	// encBufPool pools the GCM ciphertext slab used by EncryptStreamWithDEKPool.
 	// Capacity = ChunkSize + GCM overhead (16) + nonce (12) + 4-byte size prefix.
 	encBufPool = sync.Pool{
 		New: func() any { b := make([]byte, 0, crypto.ChunkSize+64); return &b },
@@ -69,7 +69,6 @@ type ServerOpts struct {
 	transport         peer2peer.Transport
 	metaData          storage.MetadataStore
 	bootstrapNodes    []string
-	Encryption        *crypto.EncryptionService
 	ReplicationFactor int
 }
 
@@ -92,6 +91,7 @@ type Server struct {
 	HashRing     *hashring.HashRing
 	quitch       chan struct{}
 	pendingFile  map[string]chan io.Reader
+	pendingOffer map[string]chan []string // key: peerAddr → missing hashes reply
 	mu           sync.Mutex
 	shutdownOnce sync.Once
 
@@ -115,6 +115,16 @@ type Server struct {
 	// Sprint 7: parallel downloads + compression
 	Downloader *downloader.Manager
 	Selector   *selector.Selector
+
+	// Phase 2: identity metadata for this node (alias, fingerprint, keys).
+	identityMeta map[string]string
+
+	// externalAddr is the externally-visible address learned via MessageAnnounceAck.
+	// Before the first ack, this is empty and canonAddr (127.0.0.1:port) is used.
+	// After the ack, the node re-registers under this routable address in the
+	// ring, cluster, and gossip — critical for Docker/NAT/cloud.
+	externalAddr   string
+	externalAddrMu sync.Mutex
 }
 
 type Message struct {
@@ -122,9 +132,8 @@ type Message struct {
 }
 
 type MessageStoreFile struct {
-	Key          string
-	Size         int64
-	EncryptedKey string
+	Key  string
+	Size int64
 }
 
 type MessageGetFile struct {
@@ -144,6 +153,15 @@ type MessageLocalFile struct {
 // address and add it to the hash ring — no heartbeat wait required.
 type MessageAnnounce struct {
 	ListenAddr string // e.g. "172.17.0.2:3000"
+}
+
+// MessageAnnounceAck is sent back by the inbound node after processing an announce.
+// It tells the outbound node its externally-visible address so the node can
+// re-register itself in the cluster/ring under a routable address instead of
+// 127.0.0.1:port. This is critical for Docker/NAT/cloud deployments where the
+// node doesn't know its own externally-reachable IP.
+type MessageAnnounceAck struct {
+	YourAddr string // the address the remote side sees us as (e.g. "172.22.0.3:3000")
 }
 
 type MessageHeartbeat struct {
@@ -172,10 +190,9 @@ type MessageGossipResponse struct {
 // Sprint 4 message types
 
 type MessageQuorumWrite struct {
-	Key          string
-	EncryptedKey string
-	Data         []byte
-	Clock        map[string]uint64
+	Key   string
+	Data  []byte
+	Clock map[string]uint64
 }
 
 type MessageQuorumWriteAck struct {
@@ -190,12 +207,11 @@ type MessageQuorumRead struct {
 }
 
 type MessageQuorumReadResponse struct {
-	Key          string
-	From         string
-	Found        bool
-	Clock        map[string]uint64
-	Timestamp    int64
-	EncryptedKey string
+	Key       string
+	From      string
+	Found     bool
+	Clock     map[string]uint64
+	Timestamp int64
 }
 
 type MessageMerkleSync struct {
@@ -237,6 +253,27 @@ type MessageManifestResponse struct {
 	ManifestJSON []byte // nil/empty if not found
 }
 
+// MessageIdentityMeta carries a node's identity metadata (alias, fingerprint,
+// public keys) and is sent right after the announce handshake so that the remote
+// node can store the metadata under the canonical address for alias resolution.
+type MessageIdentityMeta struct {
+	From     string            // canonical listen address
+	Metadata map[string]string // {"alias","fingerprint","x25519_pub","ed25519_pub"}
+}
+
+// MessageChunkOffer is sent by the uploader before streaming chunk data.
+// The receiver replies with MessageChunkNeed listing which hashes it is missing.
+// Only missing chunks are then streamed, eliminating redundant transfers.
+type MessageChunkOffer struct {
+	Hashes []string // SHA-256 hex hashes of encrypted chunks being offered
+}
+
+// MessageChunkNeed is the receiver's reply to MessageChunkOffer.
+// Missing contains the subset of offered hashes the receiver does not yet have.
+type MessageChunkNeed struct {
+	Missing []string // hashes the receiver needs; empty means "I have all of them"
+}
+
 // ContentLength returns the total plaintext byte count for a stored key.
 // Returns 0 when the size is unknown (legacy single-blob files or key not found).
 func (s *Server) ContentLength(key string) int64 {
@@ -250,7 +287,7 @@ func (s *Server) ContentLength(key string) int64 {
 	return 0
 }
 
-func (s *Server) GetData(key string) (io.Reader, error) {
+func (s *Server) GetData(key string, dek []byte) (io.Reader, error) {
 	t0 := time.Now()
 
 	// Check whether this key is stored as chunked.
@@ -258,31 +295,7 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	log.Printf("[LIFECYCLE] GET_DATA: key=%s hasMeta=%v Chunked=%v", key, hasMeta, fm.Chunked)
 	if hasMeta && fm.Chunked {
 		defer func() { metrics.RecordGet("local", nil, time.Since(t0)) }()
-		return s.getChunked(key)
-	}
-
-	// Legacy single-blob path (backwards compatibility with pre-Sprint-6 data).
-	if s.Store.Has(key) {
-		log.Printf("GET_DATA: key '%s' found locally (legacy blob)", key)
-		defer func() { metrics.RecordGet("local", nil, time.Since(t0)) }()
-		_, r, err := s.Store.ReadStream(key)
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-
-		if !hasMeta {
-			return nil, fmt.Errorf("metadata not found for key '%s'", key)
-		}
-		decodedKey, err := hex.DecodeString(fm.EncryptedKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode encrypted key for '%s': %w", key, err)
-		}
-		var decryptedBuf bytes.Buffer
-		if err := s.serverOpts.Encryption.DecryptStream(r, &decryptedBuf, decodedKey); err != nil {
-			return nil, fmt.Errorf("failed to decrypt file for key '%s': %w", key, err)
-		}
-		return &decryptedBuf, nil
+		return s.getChunked(key, dek)
 	}
 
 	// Not local — try to fetch the manifest from a peer, then reassemble.
@@ -298,23 +311,24 @@ func (s *Server) GetData(key string) (io.Reader, error) {
 	_ = s.serverOpts.metaData.SetManifest(key, manifest)
 	_ = s.serverOpts.metaData.Set(key, storage.FileMeta{Chunked: true, Timestamp: time.Now().UnixNano()})
 
-	return s.getChunked(key)
+	return s.getChunked(key, dek)
 }
 
 // getChunked reassembles a chunked file. When a Downloader is wired in
 // (Sprint 7) it fetches all chunks in parallel; otherwise it falls back to a
-// serial loop. Either path decrypts + decompresses + verifies each chunk.
-func (s *Server) getChunked(key string) (io.Reader, error) {
+// serial loop. Either path optionally decrypts (when dek != nil) +
+// decompresses + verifies each chunk.
+func (s *Server) getChunked(key string, dek []byte) (io.Reader, error) {
 	manifest, ok := s.serverOpts.metaData.GetManifest(key)
 	if !ok {
 		return nil, fmt.Errorf("getChunked: no manifest for key '%s'", key)
 	}
-	log.Printf("[LIFECYCLE] GET_CHUNKED: key=%s numChunks=%d usingDownloader=%v", key, len(manifest.Chunks), s.Downloader != nil)
+	log.Printf("[LIFECYCLE] GET_CHUNKED: key=%s numChunks=%d usingDownloader=%v encrypted=%v", key, len(manifest.Chunks), s.Downloader != nil, dek != nil)
 
 	// Sprint 7: parallel path via Downloader.
 	if s.Downloader != nil {
 		var out bytes.Buffer
-		if err := s.Downloader.Download(manifest, &out, nil); err != nil {
+		if err := s.Downloader.Download(manifest, &out, nil, dek); err != nil {
 			return nil, fmt.Errorf("getChunked: %w", err)
 		}
 		go s.readRepair(key)
@@ -327,14 +341,14 @@ func (s *Server) getChunked(key string) (io.Reader, error) {
 	for i, info := range manifest.Chunks {
 		storageKey := chunker.ChunkStorageKey(info.EncHash)
 
-		var encData []byte
+		var chunkData []byte
 
 		if s.Store.Has(storageKey) {
 			_, r, err := s.Store.ReadStream(storageKey)
 			if err != nil {
 				return nil, fmt.Errorf("getChunked: read local chunk %d: %w", info.Index, err)
 			}
-			encData, err = io.ReadAll(r)
+			chunkData, err = io.ReadAll(r)
 			r.Close()
 			if err != nil {
 				return nil, fmt.Errorf("getChunked: read bytes chunk %d: %w", info.Index, err)
@@ -344,30 +358,24 @@ func (s *Server) getChunked(key string) (io.Reader, error) {
 			if err != nil {
 				return nil, fmt.Errorf("getChunked: fetch chunk %d from peers: %w", info.Index, err)
 			}
-			encData = data
-			chunkMeta, _ := s.serverOpts.metaData.Get(storageKey)
-			_, _ = s.Store.WriteStream(storageKey, bytes.NewReader(encData))
-			_ = s.serverOpts.metaData.Set(storageKey, chunkMeta)
+			chunkData = data
+			_, _ = s.Store.WriteStream(storageKey, bytes.NewReader(chunkData))
 		}
 
-		chunkMeta, ok := s.serverOpts.metaData.Get(storageKey)
-		if !ok {
-			return nil, fmt.Errorf("getChunked: no metadata for storageKey %s", storageKey)
-		}
-		encKey, err := hex.DecodeString(chunkMeta.EncryptedKey)
-		if err != nil {
-			return nil, fmt.Errorf("getChunked: decode enc key chunk %d: %w", info.Index, err)
-		}
+		plainBytes := chunkData
 
-		var plain bytes.Buffer
-		if err := s.serverOpts.Encryption.DecryptStream(bytes.NewReader(encData), &plain, encKey); err != nil {
-			return nil, fmt.Errorf("getChunked: decrypt chunk %d: %w", info.Index, err)
+		// Decrypt only when a DEK was provided (CSE path).
+		if dek != nil {
+			var plain bytes.Buffer
+			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek); err != nil {
+				return nil, fmt.Errorf("getChunked: decrypt chunk %d: %w", info.Index, err)
+			}
+			plainBytes = plain.Bytes()
 		}
 
-		plainBytes := plain.Bytes()
-
-		// Sprint 7: decompress if the chunk was compressed at upload time.
+		// Decompress if the chunk was compressed at upload time.
 		if info.Compressed {
+			var err error
 			plainBytes, err = compression.DecompressChunk(plainBytes)
 			if err != nil {
 				return nil, fmt.Errorf("getChunked: decompress chunk %d: %w", info.Index, err)
@@ -618,71 +626,78 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 	}
 }
 
-// encryptedChunk carries all per-chunk results from Stage 1 (compress+encrypt)
+// processedChunk carries all per-chunk results from Stage 1 (compress + optional encrypt)
 // to Stage 2 (local store + replicate) of the StoreData pipeline.
-type encryptedChunk struct {
+type processedChunk struct {
 	info       chunker.ChunkInfo
-	encData    []byte
-	encKeyHex  string
+	data       []byte
 	storageKey string
 	targets    []string
 }
 
-func (s *Server) StoreData(key string, w io.Reader) error {
+// EncryptionMeta carries ECDH encryption metadata for StoreData.
+// Pass nil for plaintext uploads (no encryption).
+type EncryptionMeta struct {
+	DEK           []byte                // raw DEK for chunk encryption
+	OwnerPubKey   string                // hex X25519 pub of uploader
+	OwnerEdPubKey string                // hex Ed25519 pub of uploader
+	AccessList    []chunker.AccessEntry // one entry per recipient
+	Signature     string                // hex Ed25519 signature over manifest fields
+}
+
+func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
 	t0 := time.Now()
 	log.Println("STORE_DATA: Starting chunked storage for key:", key)
 	defer func() { metrics.RecordStore("store", nil, time.Since(t0)) }()
 
-	selfAddr := s.serverOpts.transport.Addr()
+	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
 	replFactor := s.HashRing.ReplicationFactor()
 
-	// encCh connects Stage 1 (compress+encrypt) with Stage 2 (store+replicate).
-	// Buffered=2 lets Stage 1 stay up to 1 chunk ahead of Stage 2, overlapping
-	// CPU work (encryption) with network I/O (replication).
-	encCh := make(chan encryptedChunk, 2)
+	// procCh connects Stage 1 (compress + optional encrypt) with Stage 2 (store+replicate).
+	// Buffered=2 lets Stage 1 stay up to 1 chunk ahead of Stage 2.
+	procCh := make(chan processedChunk, 2)
 	stage1ErrCh := make(chan error, 1)
 
-	// Stage 1: read → compress → encrypt → push to encCh.
+	// Stage 1: read → compress → (optionally encrypt) → push to procCh.
 	go func() {
-		defer close(encCh)
+		defer close(procCh)
 		chunkCh, errCh := chunker.ChunkReaderWithPool(w, chunker.DefaultChunkSize, &chunkReadBufPool)
 		for chunk := range chunkCh {
-			toEncrypt := chunk.Data
+			processed := chunk.Data
 			wasCompressed := false
 			if compression.ShouldCompress(chunk.Data) {
 				if c, wc, err := compression.CompressChunkWithPool(chunk.Data, compression.LevelFastest, &compBufPool); err == nil && wc {
-					toEncrypt = c
+					processed = c
 					wasCompressed = true
 				}
 			}
 
-			// Encrypt into an in-memory buffer using the pooled ciphertext slab.
-			var encBuf bytes.Buffer
-			encKey, err := s.serverOpts.Encryption.EncryptStreamWithPool(bytes.NewReader(toEncrypt), &encBuf, &encBufPool)
-			if err != nil {
-				stage1ErrCh <- fmt.Errorf("STORE_DATA: encrypt chunk %d: %w", chunk.Index, err)
-				return
+			// Encrypt only when encryption metadata was provided (ECDH path).
+			if enc != nil {
+				var encBuf bytes.Buffer
+				if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, enc.DEK, &encBufPool); err != nil {
+					stage1ErrCh <- fmt.Errorf("STORE_DATA: encrypt chunk %d: %w", chunk.Index, err)
+					return
+				}
+				processed = encBuf.Bytes()
 			}
-			encData := encBuf.Bytes()
 
-			encHashRaw := sha256.Sum256(encData)
-			encHashHex := hex.EncodeToString(encHashRaw[:])
-			storageKey := chunker.ChunkStorageKey(encHashHex)
-			encKeyHex := hex.EncodeToString(encKey)
+			hashRaw := sha256.Sum256(processed)
+			hashHex := hex.EncodeToString(hashRaw[:])
+			storageKey := chunker.ChunkStorageKey(hashHex)
 			targets := s.HashRing.GetNodes(storageKey, replFactor)
 
-			log.Printf("STORE_DATA: chunk %d encrypted (compressed=%v storageKey=%s)", chunk.Index, wasCompressed, storageKey)
+			log.Printf("STORE_DATA: chunk %d processed (compressed=%v encrypted=%v storageKey=%s)", chunk.Index, wasCompressed, enc != nil, storageKey)
 
-			encCh <- encryptedChunk{
+			procCh <- processedChunk{
 				info: chunker.ChunkInfo{
 					Index:      chunk.Index,
 					Hash:       hex.EncodeToString(chunk.Hash[:]),
 					Size:       chunk.Size,
-					EncHash:    encHashHex,
+					EncHash:    hashHex,
 					Compressed: wasCompressed,
 				},
-				encData:    encData,
-				encKeyHex:  encKeyHex,
+				data:       processed,
 				storageKey: storageKey,
 				targets:    targets,
 			}
@@ -690,28 +705,44 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 		stage1ErrCh <- <-errCh
 	}()
 
-	// Stage 2: local store + replicate. Runs concurrently with Stage 1.
+	// Stage 2: local store + replicate.
+	const maxInFlight = 4
+	sem := make(chan struct{}, maxInFlight)
+	var replWg sync.WaitGroup
+
 	var chunkInfos []chunker.ChunkInfo
-	for ec := range encCh {
+	for pc := range procCh {
 		// Store locally (skip if already present — dedup).
-		if !s.Store.Has(ec.storageKey) {
-			if _, err := s.Store.WriteStream(ec.storageKey, bytes.NewReader(ec.encData)); err != nil {
-				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", ec.info.Index, err)
+		if !s.Store.Has(pc.storageKey) {
+			if _, err := s.Store.WriteStream(pc.storageKey, bytes.NewReader(pc.data)); err != nil {
+				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", pc.info.Index, err)
 			}
-			fm, _ := s.serverOpts.metaData.Get(ec.storageKey)
-			fm.EncryptedKey = ec.encKeyHex
+			fm, _ := s.serverOpts.metaData.Get(pc.storageKey)
 			fm.Timestamp = time.Now().UnixNano()
-			if err := s.serverOpts.metaData.Set(ec.storageKey, fm); err != nil {
-				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", ec.info.Index, err)
+			if err := s.serverOpts.metaData.Set(pc.storageKey, fm); err != nil {
+				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", pc.info.Index, err)
 			}
 		}
 
-		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s encKeyHex=%q targets=%v",
-			ec.storageKey, ec.encKeyHex, ec.targets)
-		s.replicateChunk(selfAddr, ec.storageKey, ec.encKeyHex, ec.encData, ec.targets)
-		chunkInfos = append(chunkInfos, ec.info)
-		log.Printf("STORE_DATA: chunk %d replicated (storageKey=%s)", ec.info.Index, ec.storageKey)
+		log.Printf("[LIFECYCLE] STORE_DATA: chunk stored locally storageKey=%s targets=%v",
+			pc.storageKey, pc.targets)
+
+		// Fire replication in background — don't block the pipeline.
+		replWg.Add(1)
+		pcCopy := pc
+		go func() {
+			defer replWg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			s.replicateChunk(selfAddr, pcCopy.storageKey, pcCopy.data, pcCopy.targets)
+			log.Printf("STORE_DATA: chunk %d replicated (storageKey=%s)", pcCopy.info.Index, pcCopy.storageKey)
+		}()
+
+		chunkInfos = append(chunkInfos, pc.info)
 	}
+
+	// Wait for all replication goroutines to finish before building the manifest.
+	replWg.Wait()
 
 	// Check for error from Stage 1.
 	if err := <-stage1ErrCh; err != nil {
@@ -720,6 +751,13 @@ func (s *Server) StoreData(key string, w io.Reader) error {
 
 	// Build and persist the manifest locally.
 	manifest := chunker.BuildManifest(key, chunkInfos, time.Now().UnixNano())
+	if enc != nil {
+		manifest.Encrypted = true
+		manifest.OwnerPubKey = enc.OwnerPubKey
+		manifest.OwnerEdPubKey = enc.OwnerEdPubKey
+		manifest.AccessList = enc.AccessList
+		manifest.Signature = enc.Signature
+	}
 	if err := s.serverOpts.metaData.SetManifest(key, manifest); err != nil {
 		return fmt.Errorf("STORE_DATA: store manifest: %w", err)
 	}
@@ -756,12 +794,11 @@ func (s *Server) writeQuorum(n int) int {
 	return n/2 + 1
 }
 
-func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData []byte, targetNodes []string) {
+func (s *Server) replicateChunk(selfAddr, storageKey string, data []byte, targetNodes []string) {
 	msg := &Message{
 		Payload: &MessageStoreFile{
-			Key:          storageKey,
-			Size:         int64(len(encData)),
-			EncryptedKey: encKeyHex,
+			Key:  storageKey,
+			Size: int64(len(data)),
 		},
 	}
 	buf := new(bytes.Buffer)
@@ -782,7 +819,6 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 
 	type result struct{ err error }
 	needed := 0
-	// Buffer = len(targetNodes) so goroutines never block on send after caller returns.
 	resultCh := make(chan result, len(targetNodes))
 
 	for _, nodeAddr := range targetNodes {
@@ -792,16 +828,16 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		p, ok := peers[nodeAddr]
 		if !ok {
 			log.Printf("REPLICATE_CHUNK: peer %s NOT FOUND, storing hint", nodeAddr)
-			s.storeHint(nodeAddr, storageKey, encKeyHex, encData)
+			s.storeHint(nodeAddr, storageKey, data)
 			metrics.RecordReplication("hint")
 			continue
 		}
 		needed++
 		go func(addr string, peer peer2peer.Peer) {
-			err := peer.SendStream(msgBytes, encData)
+			err := peer.SendStream(msgBytes, data)
 			if err != nil {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s failed: %v, storing hint", addr, err)
-				s.storeHint(addr, storageKey, encKeyHex, encData)
+				s.storeHint(addr, storageKey, data)
 				metrics.RecordReplication("hint")
 			} else {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s OK for key=%s", addr, storageKey)
@@ -811,8 +847,6 @@ func (s *Server) replicateChunk(selfAddr, storageKey, encKeyHex string, encData 
 		}(nodeAddr, p)
 	}
 
-	// Return as soon as writeQuorum(needed) successes arrive.
-	// Remaining goroutines drain into the buffered channel without leaking.
 	w := s.writeQuorum(needed)
 	successes := 0
 	for i := 0; i < needed; i++ {
@@ -944,12 +978,12 @@ func (s *Server) readRepair(key string) {
 		case <-time.After(2500 * time.Millisecond):
 			// peer did not respond — repair it
 			log.Printf("[readRepair] key=%s replica %s is stale, repairing", key, nodeAddr)
-			encKey, data, err := s.readEncryptedFile(key)
+			data, err := s.readFile(key)
 			if err != nil {
 				log.Printf("[readRepair] failed to read key=%s for repair: %v", key, err)
 				continue
 			}
-			s.storeHint(nodeAddr, key, encKey, data)
+			s.storeHint(nodeAddr, key, data)
 		}
 	}
 }
@@ -964,7 +998,6 @@ func (s *Server) handleQuorumWrite(from string, peer peer2peer.Peer, msg *Messag
 	if err == nil {
 		// Merge into the FileMeta that WriteStream just wrote (which has Path set).
 		fm, _ := s.serverOpts.metaData.Get(msg.Key)
-		fm.EncryptedKey = msg.EncryptedKey
 		fm.VClock = msg.Clock
 		fm.Timestamp = time.Now().UnixNano()
 		_ = s.serverOpts.metaData.Set(msg.Key, fm)
@@ -996,12 +1029,11 @@ func (s *Server) handleQuorumRead(from string, peer peer2peer.Peer, msg *Message
 	fm, found := s.serverOpts.metaData.Get(msg.Key)
 
 	resp := &Message{Payload: &MessageQuorumReadResponse{
-		Key:          msg.Key,
-		From:         selfAddr,
-		Found:        found,
-		Clock:        fm.VClock,
-		Timestamp:    fm.Timestamp,
-		EncryptedKey: fm.EncryptedKey,
+		Key:       msg.Key,
+		From:      selfAddr,
+		Found:     found,
+		Clock:     fm.VClock,
+		Timestamp: fm.Timestamp,
 	}}
 	buf := new(bytes.Buffer)
 	if err := gob.NewEncoder(buf).Encode(resp); err == nil {
@@ -1013,6 +1045,22 @@ func (s *Server) handleQuorumRead(from string, peer peer2peer.Peer, msg *Message
 // deriveHealthPort returns the health-server listen address by adding 1000 to
 // the port in listenAddr (e.g. ":3000" → ":4000", "127.0.0.1:3000" → "127.0.0.1:4000").
 // Falls back to ":14000" if parsing fails.
+// normalizeAddr canonicalizes loopback and unspecified addresses to
+// 127.0.0.1 so that [::1]:3011, 127.0.0.1:3011, and :3011 all map to
+// the same ring key. Real LAN IPs (e.g. 192.168.1.50:3011) pass through
+// unchanged, so two machines on the same port never collide.
+func normalizeAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	ip := net.ParseIP(host)
+	if host == "" || (ip != nil && (ip.IsLoopback() || ip.IsUnspecified())) {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
+}
+
 // isLocalAddr returns true if host matches one of this machine's own network
 // interface addresses. Used by handleAnnounce to reject self-connections that
 // arrive when gossip causes a node to dial its own alternate IP.
@@ -1062,39 +1110,33 @@ func deriveHealthPort(listenAddr string) string {
 }
 
 // storeHint saves a hinted handoff entry for a key that could not be delivered.
-func (s *Server) storeHint(targetAddr, key, encKeyHex string, data []byte) {
+func (s *Server) storeHint(targetAddr, key string, data []byte) {
 	if s.HandoffSvc == nil {
 		return
 	}
 	s.HandoffSvc.StoreHint(handoff.Hint{
-		Key:          key,
-		TargetAddr:   targetAddr,
-		EncryptedKey: encKeyHex,
-		Data:         data,
-		CreatedAt:    time.Now(),
+		Key:        key,
+		TargetAddr: targetAddr,
+		Data:       data,
+		CreatedAt:  time.Now(),
 	})
 }
 
-// readEncryptedFile reads the raw encrypted bytes for key from local storage.
+// readFile reads the raw bytes for key from local storage.
 // Used by the Rebalancer's ReadFileFunc closure.
-func (s *Server) readEncryptedFile(key string) (encKey string, data []byte, err error) {
-	fm, ok := s.serverOpts.metaData.Get(key)
-	if !ok {
-		return "", nil, fmt.Errorf("readEncryptedFile: no metadata for key %s", key)
-	}
-
+func (s *Server) readFile(key string) (data []byte, err error) {
 	_, r, err := s.Store.ReadStream(key)
 	if err != nil {
-		return "", nil, fmt.Errorf("readEncryptedFile: open %s: %w", key, err)
+		return nil, fmt.Errorf("readFile: open %s: %w", key, err)
 	}
 	defer r.Close()
 
 	data, err = io.ReadAll(r)
 	if err != nil {
-		return "", nil, fmt.Errorf("readEncryptedFile: read %s: %w", key, err)
+		return nil, fmt.Errorf("readFile: read %s: %w", key, err)
 	}
 
-	return fm.EncryptedKey, data, nil
+	return data, nil
 }
 
 // healthStatus returns the current health snapshot for /health endpoint.
@@ -1126,7 +1168,63 @@ func (s *Server) healthStatus() health.Status {
 // InspectManifest returns the ChunkManifest stored for key, or nil if not found.
 // Intended for use in integration and E2E tests.
 func (s *Server) InspectManifest(key string) (*chunker.ChunkManifest, bool) {
-	return s.serverOpts.metaData.GetManifest(key)
+	// Try local first.
+	if m, ok := s.serverOpts.metaData.GetManifest(key); ok {
+		return m, true
+	}
+	// Not local — try peers (manifest may be on a different replica).
+	m, err := s.fetchManifestFromPeers(key)
+	if err != nil || m == nil {
+		return nil, false
+	}
+	// Cache locally so subsequent requests are fast.
+	s.serverOpts.metaData.SetManifest(key, m)
+	return m, true
+}
+
+// AliasResult holds the resolved identity for a single node matching an alias.
+type AliasResult struct {
+	Fingerprint   string
+	X25519PubHex  string
+	Ed25519PubHex string
+	NodeAddr      string
+}
+
+// LookupAlias searches cluster gossip metadata for nodes with the given alias.
+// Returns all matches (may be >1 if multiple nodes share the same alias).
+func (s *Server) LookupAlias(alias string) []AliasResult {
+	seen := make(map[string]bool) // dedup by fingerprint
+	var results []AliasResult
+
+	// Check local identity first — always available regardless of gossip state.
+	if s.identityMeta != nil && s.identityMeta["alias"] == alias {
+		fp := s.identityMeta["fingerprint"]
+		seen[fp] = true
+		results = append(results, AliasResult{
+			Fingerprint:   fp,
+			X25519PubHex:  s.identityMeta["x25519_pub"],
+			Ed25519PubHex: s.identityMeta["ed25519_pub"],
+			NodeAddr:      normalizeAddr(s.serverOpts.transport.Addr()),
+		})
+	}
+
+	// Check cluster gossip state for remote nodes.
+	for _, node := range s.Cluster.AllNodes() {
+		if node.Metadata["alias"] == alias {
+			fp := node.Metadata["fingerprint"]
+			if seen[fp] {
+				continue
+			}
+			seen[fp] = true
+			results = append(results, AliasResult{
+				Fingerprint:   fp,
+				X25519PubHex:  node.Metadata["x25519_pub"],
+				Ed25519PubHex: node.Metadata["ed25519_pub"],
+				NodeAddr:      node.Addr,
+			})
+		}
+	}
+	return results
 }
 
 // InspectMeta returns the vector clock and timestamp stored for key.
@@ -1204,7 +1302,7 @@ func (s *Server) handleLeaving(addr string, msgGen uint64) error {
 	s.peerLock.RUnlock()
 	log.Printf("[TRACE][handleLeaving] self=%s addr=%s inPeers=%v ring_size_before=%d", self, addr, inPeers, s.HashRing.Size())
 
-	s.HashRing.RemoveNode(addr)
+	s.HashRing.RemoveNode(normalizeAddr(addr))
 	log.Printf("[TRACE][handleLeaving] self=%s addr=%s ring_size_after=%d", self, addr, s.HashRing.Size())
 
 	if s.Cluster != nil {
@@ -1299,22 +1397,26 @@ func NewServer(opts ServerOpts) *Server {
 		HashRing: hashring.New(&hashring.Config{
 			ReplicationFactor: replFactor,
 		}),
-		quitch:      make(chan struct{}),
+		quitch:        make(chan struct{}),
 		pendingFile:   make(map[string]chan io.Reader),
+		pendingOffer:  make(map[string]chan []string),
 		dialingSet:    make(map[string]struct{}),
 		announceAdded: make(map[string]string),
 	}
 }
 
-func (s *Server) Run() error {
-	err := s.serverOpts.transport.ListenAndAccept()
-	if err != nil {
+// Start binds the transport port, initialises all services, and launches the
+// RPC loop in a background goroutine. It returns once the node is fully ready
+// to accept peer connections and IPC commands. If the port cannot be bound,
+// Start returns an error immediately so the caller can fail fast.
+func (s *Server) Start() error {
+	if err := s.serverOpts.transport.ListenAndAccept(); err != nil {
 		return err
 	}
 
-	// Add self to the hash ring so we participate in key ownership
+	// Add self to the hash ring so we participate in key ownership.
 	selfAddr := s.serverOpts.transport.Addr()
-	s.HashRing.AddNode(selfAddr)
+	s.HashRing.AddNode(normalizeAddr(selfAddr))
 	log.Printf("[Run] Added self (%s) to hash ring (replication factor: %d)", selfAddr, s.HashRing.ReplicationFactor())
 
 	// Sprint 2: start failure detection and handoff delivery.
@@ -1340,13 +1442,22 @@ func (s *Server) Run() error {
 	}
 
 	if len(s.serverOpts.bootstrapNodes) != 0 {
-		err := s.BootstrapNetwork()
-		if err != nil {
+		if err := s.BootstrapNetwork(); err != nil {
 			return err
 		}
 	}
 
-	s.loop()
+	go s.loop()
+	return nil
+}
+
+// Run is kept for backwards compatibility with tests that call it directly.
+// It calls Start and then blocks until the server shuts down.
+func (s *Server) Run() error {
+	if err := s.Start(); err != nil {
+		return err
+	}
+	<-s.quitch
 	return nil
 }
 
@@ -1406,16 +1517,31 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 
 	switch m := msg.Payload.(type) {
 	case *MessageStoreFile:
-		log.Printf("[handleMessage] Detected MessageStoreFile from %s\n", from)
-		return s.handleStoreMessage(from, peer, m, streamWg, streamReader)
+		// Dispatch to a goroutine so the server loop immediately returns to
+		// drain the next QUIC stream. Without this, concurrent chunk streams
+		// pile up in the QUIC connection receive window while the loop blocks
+		// reading one stream, causing a flow-control deadlock.
+		log.Printf("[handleMessage] Detected MessageStoreFile from %s — dispatching async\n", from)
+		go func() {
+			if err := s.handleStoreMessage(from, peer, m, streamWg, streamReader); err != nil {
+				log.Printf("[handleMessage] async StoreFile error from %s: %v\n", from, err)
+			}
+		}()
+		return nil
 
 	case *MessageGetFile:
 		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
 		return s.handleGetMessage(from, peer, m)
 
 	case *MessageLocalFile:
-		log.Printf("[handleMessage] Detected MessageLocalFile from %s\n", from)
-		return s.handleLocalMessage(from, peer, m, streamWg, streamReader)
+		// Same async dispatch — this reads stream data from a peer.
+		log.Printf("[handleMessage] Detected MessageLocalFile from %s — dispatching async\n", from)
+		go func() {
+			if err := s.handleLocalMessage(from, peer, m, streamWg, streamReader); err != nil {
+				log.Printf("[handleMessage] async LocalFile error from %s: %v\n", from, err)
+			}
+		}()
+		return nil
 
 	case *MessageHeartbeat:
 		return s.handleHeartbeat(from, peer, m)
@@ -1427,6 +1553,9 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 
 	case *MessageAnnounce:
 		return s.handleAnnounce(from, m)
+
+	case *MessageAnnounceAck:
+		return s.handleAnnounceAck(m)
 
 	case *MessageGossipDigest:
 		if s.GossipSvc != nil {
@@ -1485,12 +1614,11 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 	case *MessageQuorumReadResponse:
 		if s.Quorum != nil {
 			s.Quorum.HandleReadResponse(quorum.ReadResponse{
-				NodeAddr:     m.From,
-				Key:          m.Key,
-				Found:        m.Found,
-				Clock:        vclock.VectorClock(m.Clock),
-				Timestamp:    m.Timestamp,
-				EncryptedKey: m.EncryptedKey,
+				NodeAddr:  m.From,
+				Key:       m.Key,
+				Found:     m.Found,
+				Clock:     vclock.VectorClock(m.Clock),
+				Timestamp: m.Timestamp,
 			})
 		}
 		return nil
@@ -1553,6 +1681,68 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		if ok && len(m.ManifestJSON) > 0 {
 			// Wrap JSON in a bytes.Buffer and send on the channel.
 			ch <- bytes.NewReader(m.ManifestJSON)
+		}
+		return nil
+
+	case *MessageChunkOffer:
+		return s.handleChunkOffer(peer, m)
+
+	case *MessageChunkNeed:
+		// Deliver to the replicateChunk goroutine waiting on this peer's offer reply.
+		s.mu.Lock()
+		ch, ok := s.pendingOffer[from]
+		s.mu.Unlock()
+		if ok {
+			ch <- m.Missing
+		}
+		return nil
+
+	case *MessageIdentityMeta:
+		// Store the remote node's identity metadata for alias resolution.
+		if s.Cluster != nil && m.Metadata != nil {
+			// Resolve the canonical address for this peer. We cannot trust m.From
+			// because in Docker/NAT it may be 127.0.0.1:3000 (container-local),
+			// which collides with the local node's own address.
+			//
+			// Strategy:
+			// 1. Check if 'from' (connection addr) was remapped by handleAnnounce
+			//    to a canonical addr — use the canonical.
+			// 2. If 'from' itself is already a canonical peer addr — use it.
+			// 3. Fall back to m.From only if it doesn't collide with our own addr.
+			// 4. Last resort: use 'from' and ensure the node exists.
+			addr := ""
+			selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
+
+			// Check announceAdded reverse: is 'from' an ephemeral that was remapped?
+			s.peerLock.RLock()
+			for canonical, ephemeral := range s.announceAdded {
+				if ephemeral == from {
+					addr = canonical
+					break
+				}
+			}
+			// Also check if 'from' itself is a canonical peer key.
+			if addr == "" {
+				if _, ok := s.peers[from]; ok {
+					addr = from
+				}
+			}
+			s.peerLock.RUnlock()
+
+			// Fall back to m.From only if it doesn't collide with self.
+			if addr == "" && m.From != "" && m.From != selfAddr {
+				addr = m.From
+			}
+			if addr == "" {
+				addr = from
+			}
+
+			// Ensure the node exists in cluster before setting metadata.
+			// This handles the case where the identity message arrives before
+			// handleAnnounce has added the node to the cluster.
+			s.Cluster.AddNode(addr, nil)
+			s.Cluster.SetMetadata(addr, m.Metadata)
+			log.Printf("[identity] stored metadata for %s (alias=%s fingerprint=%s)", addr, m.Metadata["alias"], m.Metadata["fingerprint"])
 		}
 		return nil
 
@@ -1638,6 +1828,9 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 		}
 	}
 
+	// Canonicalize loopback variants so the peers map key matches the ring key.
+	canonical = normalizeAddr(canonical)
+
 	if canonical == from {
 		return nil
 	}
@@ -1670,14 +1863,20 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 		return nil
 	}
 
-	if !s.HashRing.HasNode(canonical) {
-		s.HashRing.AddNode(canonical)
-		log.Printf("[handleAnnounce] added %s to hash ring (size=%d)", canonical, s.HashRing.Size())
+	if !s.HashRing.HasNode(normalizeAddr(canonical)) {
+		s.HashRing.AddNode(normalizeAddr(canonical))
+		log.Printf("[handleAnnounce] added %s to hash ring (size=%d)", normalizeAddr(canonical), s.HashRing.Size())
 		metrics.SetPeerCount(s.outboundPeerCount())
 		metrics.SetRingSize(s.HashRing.Size())
 
 		if s.Cluster != nil {
 			s.Cluster.AddNode(canonical, nil)
+			// Migrate any identity metadata that was stored under the ephemeral
+			// address (if the identity message arrived before the announce).
+			if old, ok := s.Cluster.GetNode(from); ok && old.Metadata != nil && len(old.Metadata) > 0 {
+				s.Cluster.SetMetadata(canonical, old.Metadata)
+				log.Printf("[handleAnnounce] migrated metadata from %s to %s", from, canonical)
+			}
 		}
 		if s.HandoffSvc != nil {
 			s.HandoffSvc.OnPeerReconnect(canonical)
@@ -1686,6 +1885,108 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 			s.Rebalancer.OnNodeJoined(canonical)
 		}
 	}
+
+	// Send MessageAnnounceAck back to the peer telling it its externally-visible
+	// address. This is how nodes behind NAT/Docker discover their routable IP.
+	s.peerLock.RLock()
+	peer, hasPeer := s.peers[canonical]
+	s.peerLock.RUnlock()
+	if hasPeer {
+		// The peer's externally-visible address is its canonical listen address
+		// (derived from the IP we see on the inbound connection + announced port).
+		ackMsg := &Message{Payload: &MessageAnnounceAck{YourAddr: canonical}}
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(ackMsg); err == nil {
+			_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+		}
+
+		// Send our identity metadata so the remote peer can resolve our alias.
+		if s.identityMeta != nil {
+			idFrom := s.effectiveSelfAddr()
+			idMsg := &Message{Payload: &MessageIdentityMeta{
+				From:     idFrom,
+				Metadata: s.identityMeta,
+			}}
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(idMsg); err == nil {
+				_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+			}
+		}
+	}
+	return nil
+}
+
+// effectiveSelfAddr returns the externally-visible address if known (via
+// AnnounceAck), otherwise falls back to normalizeAddr(transport.Addr()).
+func (s *Server) effectiveSelfAddr() string {
+	s.externalAddrMu.Lock()
+	ext := s.externalAddr
+	s.externalAddrMu.Unlock()
+	if ext != "" {
+		return ext
+	}
+	return normalizeAddr(s.serverOpts.transport.Addr())
+}
+
+// handleAnnounceAck processes a MessageAnnounceAck from a peer we connected to.
+// The ack tells us our externally-visible address (what the remote sees us as).
+// If it differs from our current canonAddr (e.g. we think we're 127.0.0.1:3000
+// but the peer sees us as 172.17.0.3:3000), we re-register under the external
+// address in the ring, cluster, and gossip so the whole cluster can route to us.
+func (s *Server) handleAnnounceAck(msg *MessageAnnounceAck) error {
+	if msg.YourAddr == "" {
+		return nil
+	}
+
+	extAddr := normalizeAddr(msg.YourAddr)
+	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
+
+	// If the external address matches what we already think we are, nothing to do.
+	if extAddr == selfAddr {
+		log.Printf("[AnnounceAck] external addr %s matches self — no re-registration needed", extAddr)
+		return nil
+	}
+
+	s.externalAddrMu.Lock()
+	alreadySet := s.externalAddr != ""
+	s.externalAddr = extAddr
+	s.externalAddrMu.Unlock()
+
+	if alreadySet {
+		// Already re-registered from a previous ack — don't repeat.
+		log.Printf("[AnnounceAck] external addr already set to %s, skipping re-registration", extAddr)
+		return nil
+	}
+
+	log.Printf("[AnnounceAck] discovered external addr: %s (was: %s) — re-registering", extAddr, selfAddr)
+
+	// 1. Re-register in hash ring: add external, remove old self.
+	if !s.HashRing.HasNode(extAddr) {
+		s.HashRing.AddNode(extAddr)
+	}
+	if selfAddr != extAddr {
+		s.HashRing.RemoveNode(selfAddr)
+	}
+
+	// 2. Re-register in cluster state: copy metadata from old addr to new.
+	if s.Cluster != nil {
+		oldNode, ok := s.Cluster.GetNode(selfAddr)
+		s.Cluster.AddNode(extAddr, nil)
+		if ok && oldNode.Metadata != nil {
+			s.Cluster.SetMetadata(extAddr, oldNode.Metadata)
+		} else if s.identityMeta != nil {
+			s.Cluster.SetMetadata(extAddr, s.identityMeta)
+		}
+		nextGen := s.Cluster.NextGeneration(extAddr)
+		s.Cluster.UpdateState(extAddr, membership.StateAlive, nextGen)
+	}
+
+	// 3. Update gossip selfAddr so it advertises the routable address.
+	if s.GossipSvc != nil {
+		s.GossipSvc.SetSelfAddr(extAddr)
+	}
+
+	log.Printf("[AnnounceAck] re-registration complete: ring has %s, cluster has %s", extAddr, extAddr)
 	return nil
 }
 
@@ -1728,7 +2029,7 @@ func (s *Server) handleGetMessage(from string, peer peer2peer.Peer, msg *Message
 }
 
 func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *MessageStoreFile, streamWg *sync.WaitGroup, streamReader io.Reader) error {
-	log.Printf("HANDLE_STORE: Received store request for key %s from %s — EncryptedKey=%q encKeyLen=%d", msg.Key, from, msg.EncryptedKey, len(msg.EncryptedKey))
+	log.Printf("HANDLE_STORE: Received store request for key %s from %s", msg.Key, from)
 
 	// Use streamReader (set to quic.Stream for QUIC, peer for TCP) to read file data.
 	if streamReader == nil {
@@ -1746,26 +2047,29 @@ func (s *Server) handleStoreMessage(from string, peer peer2peer.Peer, msg *Messa
 		streamWg.Done()
 	}
 
-	// Merge EncryptedKey into existing FileMeta (preserves Path set by WriteStream).
-	if msg.EncryptedKey != "" {
-		fm, _ := s.serverOpts.metaData.Get(msg.Key)
-		fm.EncryptedKey = msg.EncryptedKey
-		if err := s.serverOpts.metaData.Set(msg.Key, fm); err != nil {
-			log.Printf("HANDLE_STORE: Failed to save metadata for key %s: %v", msg.Key, err)
-			return err
-		}
-		// Immediately verify the write persisted.
-		if verified, ok := s.serverOpts.metaData.Get(msg.Key); ok {
-			log.Printf("[LIFECYCLE] HANDLE_STORE: metadata saved key=%s EncryptedKey=%q", msg.Key, verified.EncryptedKey)
-		} else {
-			log.Printf("[LIFECYCLE] HANDLE_STORE: WARNING metadata GET failed immediately after SET for key=%s", msg.Key)
-		}
-	} else {
-		log.Printf("[LIFECYCLE] HANDLE_STORE: WARNING EncryptedKey is EMPTY in received message for key=%s from=%s", msg.Key, from)
-	}
-
 	log.Printf("HANDLE_STORE: Successfully stored [%d] bytes to %s from %s", n, msg.Key, from)
 	return nil
+}
+
+// handleChunkOffer processes a MessageChunkOffer from an uploading peer.
+// It checks which of the offered chunk hashes are already stored locally
+// and replies with a MessageChunkNeed listing only the missing ones.
+func (s *Server) handleChunkOffer(peer peer2peer.Peer, msg *MessageChunkOffer) error {
+	var missing []string
+	for _, h := range msg.Hashes {
+		storageKey := chunker.ChunkStorageKey(h)
+		if !s.Store.Has(storageKey) {
+			missing = append(missing, h)
+		}
+	}
+	log.Printf("[CHUNK_OFFER] offered=%d missing=%d", len(msg.Hashes), len(missing))
+
+	reply := &Message{Payload: &MessageChunkNeed{Missing: missing}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(reply); err != nil {
+		return fmt.Errorf("handleChunkOffer: encode reply: %w", err)
+	}
+	return peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
 }
 
 func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *MessageLocalFile, streamWg *sync.WaitGroup, streamReader io.Reader) error {
@@ -1800,7 +2104,7 @@ func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *Messa
 	if streamWg != nil {
 		streamWg.Done()
 	}
-	log.Printf("HANDLE_LOCAL: Successfully retrieved '%s' from %s (enc bytes=%d)", msg.Key, from, encBuf.Len())
+	log.Printf("HANDLE_LOCAL: Successfully retrieved '%s' from %s (bytes=%d)", msg.Key, from, encBuf.Len())
 
 	s.mu.Lock()
 	ch, ok := s.pendingFile[msg.Key]
@@ -1858,7 +2162,7 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 
 		if canonicalToRemove != "" {
 			log.Printf("[TRACE][OnPeerDisconnect] INBOUND announce-added closed: self=%s canonical=%s — removing from ring", self, canonicalToRemove)
-			s.HashRing.RemoveNode(canonicalToRemove)
+			s.HashRing.RemoveNode(normalizeAddr(canonicalToRemove))
 			metrics.SetPeerCount(s.outboundPeerCount())
 			metrics.SetRingSize(s.HashRing.Size())
 			if s.Cluster != nil {
@@ -1883,7 +2187,7 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	}
 
 	log.Printf("[TRACE][OnPeerDisconnect] REMOVING from ring: self=%s addr=%s ring_size_before=%d", self, addr, s.HashRing.Size())
-	s.HashRing.RemoveNode(addr)
+	s.HashRing.RemoveNode(normalizeAddr(addr))
 	peerCount := s.outboundPeerCount()
 	log.Printf("[TRACE][OnPeerDisconnect] RING UPDATED: self=%s removed=%s ring_size=%d peer_count=%d", self, addr, s.HashRing.Size(), peerCount)
 	metrics.SetPeerCount(peerCount)
@@ -1937,7 +2241,7 @@ func (s *Server) BootstrapNetwork() error {
 }
 
 func (s *Server) OnPeer(p peer2peer.Peer) error {
-	addr := p.RemoteAddr().String()
+	addr := normalizeAddr(p.RemoteAddr().String())
 	self := s.serverOpts.transport.Addr()
 	log.Printf("[TRACE][OnPeer] self=%s addr=%s outbound=%v ptr=%p", self, addr, p.Outbound(), p)
 
@@ -1968,19 +2272,33 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 	s.peers[addr] = p
 	s.peerLock.Unlock()
 
-	s.HashRing.AddNode(addr)
+	s.HashRing.AddNode(normalizeAddr(addr))
 	peerCount := s.outboundPeerCount()
-	log.Printf("[TRACE][OnPeer] RING UPDATED self=%s added=%s ring_size=%d peer_count=%d", self, addr, s.HashRing.Size(), peerCount)
+	log.Printf("[TRACE][OnPeer] RING UPDATED self=%s added=%s ring_size=%d peer_count=%d", self, normalizeAddr(addr), s.HashRing.Size(), peerCount)
 	metrics.SetPeerCount(peerCount)
 	metrics.SetRingSize(s.HashRing.Size())
 
 	// Tell the peer our canonical listen address so it can remap its inbound
 	// connection (stored under our ephemeral port) to our real listen address
 	// and add us to its hash ring immediately.
+	// Identity metadata is sent in the same goroutine AFTER announce so the
+	// remote side processes announce first (remap) and the identity message
+	// lands on the canonical address, not the ephemeral one.
 	go func() {
 		announceMsg := &Message{Payload: &MessageAnnounce{ListenAddr: self}}
 		if err := s.sendToAddr(addr, announceMsg); err != nil {
 			log.Printf("[OnPeer] announce to %s failed: %v", addr, err)
+		}
+		// Phase 2: send identity metadata after announce so remote has the
+		// canonical mapping when it processes the identity message.
+		if s.identityMeta != nil {
+			idMsg := &Message{Payload: &MessageIdentityMeta{
+				From:     s.effectiveSelfAddr(),
+				Metadata: s.identityMeta,
+			}}
+			if err := s.sendToAddr(addr, idMsg); err != nil {
+				log.Printf("[OnPeer] identity meta to %s failed: %v", addr, err)
+			}
 		}
 	}()
 
@@ -2008,6 +2326,7 @@ func init() {
 	gob.Register(&MessageGetFile{})
 	gob.Register(&MessageLocalFile{})
 	gob.Register(&MessageAnnounce{})
+	gob.Register(&MessageAnnounceAck{})
 	gob.Register(&MessageHeartbeat{})
 	gob.Register(&MessageHeartbeatAck{})
 	gob.Register(&MessageGossipDigest{})
@@ -2026,10 +2345,24 @@ func init() {
 	gob.Register(&MessageStoreManifest{})
 	gob.Register(&MessageGetManifest{})
 	gob.Register(&MessageManifestResponse{})
+	gob.Register(&MessageChunkOffer{})
+	gob.Register(&MessageChunkNeed{})
+	gob.Register(&MessageIdentityMeta{})
 }
 
-func MakeServer(listenAddr string, replicationFactor int, node ...string) *Server {
-	metaPath := "_metadata.json"
+// MakeServerOpts holds optional configuration for MakeServer.
+type MakeServerOpts struct {
+	IdentityMeta map[string]string // gossip metadata from identity (alias, fingerprint, keys)
+}
+
+func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOpts, node ...string) *Server {
+	metaPath := "_metadata.db"
+
+	// canonAddr is the normalized form of listenAddr (loopback variants → 127.0.0.1).
+	// Used for ring membership, gossip, heartbeat, quorum, and cluster identity so
+	// all subsystems agree on one canonical key. listenAddr (raw) is kept for file
+	// paths and transport init to avoid renaming existing directories.
+	canonAddr := normalizeAddr(listenAddr)
 
 	// Sprint 5: initialise structured logging and Prometheus metrics.
 	logging.Init("server", logging.LevelInfo)
@@ -2038,12 +2371,6 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	// Load .env file (ignore error if not found - will use OS env vars)
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using environment variables")
-	}
-
-	// Get encryption key from environment (loaded from .env or OS)
-	EncryptionServiceKey := os.Getenv("DFS_ENCRYPTION_KEY")
-	if EncryptionServiceKey == "" {
-		log.Fatal("CRITICAL: DFS_ENCRYPTION_KEY not set. Please set it in .env file or as environment variable.")
 	}
 
 	// Resolve optional mTLS config (used by both TCP and QUIC transports).
@@ -2095,13 +2422,17 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	}
 	log.Printf("[MakeServer] transport: %s (protocol=%s)", listenAddr, factory.ProtocolFromEnv())
 
+	metaStore, err := storage.NewBoltMetaStore(listenAddr + metaPath)
+	if err != nil {
+		log.Fatalf("Failed to open metadata store: %v", err)
+	}
+
 	opts := ServerOpts{
 		pathTransform:     storage.CASPathTransformFunc,
 		transport:         tr,
-		metaData:          storage.NewMetaFile(listenAddr + metaPath),
+		metaData:          metaStore,
 		bootstrapNodes:    node,
 		storageRoot:       listenAddr + "_network",
-		Encryption:        crypto.NewEncryptionService(EncryptionServiceKey),
 		ReplicationFactor: replicationFactor,
 	}
 
@@ -2112,7 +2443,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	hbCfg := failure.DefaultConfig()
 	s.HeartbeatSvc = failure.NewHeartbeatService(
 		hbCfg,
-		listenAddr,
+		canonAddr,
 		// getPeers closure: returns listen addresses of outbound peers only
 		func() []string {
 			s.peerLock.RLock()
@@ -2129,7 +2460,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		func(addr string) error {
 			return s.sendToAddr(addr, &Message{
 				Payload: &MessageHeartbeat{
-					From:      listenAddr,
+					From:      canonAddr,
 					Timestamp: time.Now().UnixNano(),
 				},
 			})
@@ -2141,7 +2472,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		// onDead: remove from ring and trigger re-replication
 		func(addr string) {
 			log.Printf("[failure] DEAD: peer %s — removing from ring", addr)
-			s.HashRing.RemoveNode(addr)
+			s.HashRing.RemoveNode(normalizeAddr(addr))
 			if s.Rebalancer != nil {
 				s.Rebalancer.OnNodeLeft(addr)
 			}
@@ -2155,13 +2486,12 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		log.Printf("[MakeServer] failed to create hint store: %v (hinted handoff disabled)", err)
 	} else {
 		s.HandoffSvc = handoff.NewHandoffService(hintStore,
-			// deliver closure: resend a hint's encrypted data to its target
+			// deliver closure: resend a hint's data to its target
 			func(h handoff.Hint) error {
 				msg := &Message{
 					Payload: &MessageStoreFile{
-						Key:          h.Key,
-						Size:         int64(len(h.Data)),
-						EncryptedKey: h.EncryptedKey,
+						Key:  h.Key,
+						Size: int64(len(h.Data)),
 					},
 				}
 				buf := new(bytes.Buffer)
@@ -2181,17 +2511,16 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 
 	// Sprint 2: wire Rebalancer
 	s.Rebalancer = rebalance.New(
-		listenAddr,
+		canonAddr,
 		s.HashRing,
 		opts.metaData,
-		s.readEncryptedFile,
+		s.readFile,
 		// sendFile closure: replicate a file to a target node
-		func(targetAddr, key, encKey string, data []byte) error {
+		func(targetAddr, key string, data []byte) error {
 			msg := &Message{
 				Payload: &MessageStoreFile{
-					Key:          key,
-					Size:         int64(len(data)),
-					EncryptedKey: encKey,
+					Key:  key,
+					Size: int64(len(data)),
 				},
 			}
 			buf := new(bytes.Buffer)
@@ -2233,7 +2562,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	// Sprint 4: wire Quorum coordinator.
 	s.Quorum = quorum.New(
 		quorum.DefaultConfig(),
-		listenAddr,
+		canonAddr,
 		// getTargets: ask the hash ring for N responsible nodes
 		func(key string) []string {
 			return s.HashRing.GetNodes(key, s.HashRing.ReplicationFactor())
@@ -2243,8 +2572,7 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 			switch m := msg.(type) {
 			case *quorum.MessageQuorumWrite:
 				return s.sendToAddr(addr, &Message{Payload: &MessageQuorumWrite{
-					Key: m.Key, EncryptedKey: m.EncryptedKey,
-					Data: m.Data, Clock: m.Clock,
+					Key: m.Key, Data: m.Data, Clock: m.Clock,
 				}})
 			case *quorum.MessageQuorumRead:
 				return s.sendToAddr(addr, &Message{Payload: &MessageQuorumRead{Key: m.Key}})
@@ -2252,31 +2580,30 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 				return fmt.Errorf("quorum sendMsg: unknown type %T", msg)
 			}
 		},
-		// localWrite: store encrypted bytes + update metadata with vclock
-		func(key, encKey string, data []byte, clock vclock.VectorClock) error {
+		// localWrite: store bytes + update metadata with vclock
+		func(key string, data []byte, clock vclock.VectorClock) error {
 			if _, err := s.Store.WriteStream(key, bytes.NewReader(data)); err != nil {
 				return err
 			}
 			fm, _ := s.serverOpts.metaData.Get(key)
-			fm.EncryptedKey = encKey
 			fm.VClock = map[string]uint64(clock)
 			fm.Timestamp = time.Now().UnixNano()
 			return s.serverOpts.metaData.Set(key, fm)
 		},
 		// localRead: return metadata for the conflict resolver
-		func(key string) (vclock.VectorClock, int64, string, bool) {
+		func(key string) (vclock.VectorClock, int64, bool) {
 			fm, ok := s.serverOpts.metaData.Get(key)
 			if !ok {
-				return nil, 0, "", false
+				return nil, 0, false
 			}
-			return vclock.VectorClock(fm.VClock), fm.Timestamp, fm.EncryptedKey, true
+			return vclock.VectorClock(fm.VClock), fm.Timestamp, true
 		},
 	)
 
 	// Sprint 4: wire AntiEntropyService.
 	metaAsKeyer := opts.metaData
 	s.AntiEntropy = merkle.NewAntiEntropyService(
-		listenAddr,
+		canonAddr,
 		10*time.Minute,
 		// getKeys: all locally-stored file keys
 		func() []string {
@@ -2313,12 +2640,12 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 		// onSendKey: we have a key the peer is missing — re-replicate it
 		func(addr, key string) {
 			log.Printf("[anti-entropy] replicating missing key %s to %s", key, addr)
-			encKey, data, err := s.readEncryptedFile(key)
+			data, err := s.readFile(key)
 			if err != nil {
 				log.Printf("[anti-entropy] failed to read %s: %v", key, err)
 				return
 			}
-			s.storeHint(addr, key, encKey, data)
+			s.storeHint(addr, key, data)
 		},
 	)
 
@@ -2328,23 +2655,17 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	s.Downloader = downloader.New(
 		dmCfg,
 		s.Selector,
-		// fetch: get raw encrypted bytes for storageKey from peerAddr
+		// fetch: get raw bytes for storageKey from peerAddr
 		func(storageKey, peerAddr string) ([]byte, error) {
 			return s.fetchChunkFromPeer(storageKey, peerAddr)
 		},
-		// decrypt: look up per-chunk key and decrypt
-		func(storageKey string, encData []byte) ([]byte, error) {
-			fm, ok := s.serverOpts.metaData.Get(storageKey)
-			log.Printf("[LIFECYCLE] DECRYPT: storageKey=%s metaFound=%v EncryptedKey=%q", storageKey, ok, fm.EncryptedKey)
-			if !ok {
-				return nil, fmt.Errorf("no metadata for chunk %s", storageKey)
-			}
-			encKey, err := hex.DecodeString(fm.EncryptedKey)
-			if err != nil {
-				return nil, err
+		// decrypt: decrypt chunk data using the caller-provided DEK
+		func(storageKey string, data []byte, dek []byte) ([]byte, error) {
+			if dek == nil {
+				return data, nil // plaintext path — no decryption
 			}
 			var plain bytes.Buffer
-			if err := s.serverOpts.Encryption.DecryptStream(bytes.NewReader(encData), &plain, encKey); err != nil {
+			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(data), &plain, dek); err != nil {
 				return nil, err
 			}
 			return plain.Bytes(), nil
@@ -2370,12 +2691,20 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 	}
 
 	// Sprint 3: wire ClusterState and GossipService.
-	s.Cluster = membership.New(listenAddr)
+	s.Cluster = membership.New(canonAddr)
+
+	// Inject identity metadata into local node's gossip state + server field.
+	var selfFingerprint string
+	if makeOpts != nil && makeOpts.IdentityMeta != nil {
+		s.identityMeta = makeOpts.IdentityMeta
+		s.Cluster.SetMetadata(canonAddr, makeOpts.IdentityMeta)
+		selfFingerprint = makeOpts.IdentityMeta["fingerprint"]
+	}
 
 	gossipCfg := gossip.DefaultConfig()
 	s.GossipSvc = gossip.New(
 		gossipCfg,
-		listenAddr,
+		canonAddr,
 		s.Cluster,
 		// getPeers: all nodes known to the hash ring (not just currently connected)
 		func() []string {
@@ -2455,6 +2784,12 @@ func MakeServer(listenAddr string, replicationFactor int, node ...string) *Serve
 			}
 		},
 	)
+
+	// Set selfFingerprint on gossip for fingerprint-based self-detection
+	// (prevents Docker/NAT address collision from swallowing our own metadata).
+	if selfFingerprint != "" {
+		s.GossipSvc.SetSelfFingerprint(selfFingerprint)
+	}
 
 	return s
 }

@@ -148,23 +148,21 @@ func TestConcurrentExactTimestampTieFirstWins(t *testing.T) {
 	}
 }
 
-// Verify that EncryptedKey is preserved on the winning version.
-func TestEncryptedKeyPreservedOnWinner(t *testing.T) {
+// Verify that the causally-later version wins regardless of timestamp.
+func TestCausallyLaterWinsRegardlessOfTimestamp(t *testing.T) {
 	loser := conflict.Version{
-		NodeAddr:     "A",
-		Clock:        vclock.VectorClock{"A": 1},
-		Timestamp:    100,
-		EncryptedKey: "loser-key",
+		NodeAddr:  "A",
+		Clock:     vclock.VectorClock{"A": 1},
+		Timestamp: 100,
 	}
 	winner := conflict.Version{
-		NodeAddr:     "B",
-		Clock:        vclock.VectorClock{"A": 1, "B": 1}, // causally after A
-		Timestamp:    50,
-		EncryptedKey: "winner-key",
+		NodeAddr:  "B",
+		Clock:     vclock.VectorClock{"A": 1, "B": 1}, // causally after A
+		Timestamp: 50,
 	}
 
 	result := resolver.Resolve([]conflict.Version{loser, winner})
-	if result.EncryptedKey != "winner-key" {
-		t.Errorf("expected winner's encrypted key, got %s", result.EncryptedKey)
+	if result.NodeAddr != "B" {
+		t.Errorf("expected winner node B, got %s", result.NodeAddr)
 	}
 }

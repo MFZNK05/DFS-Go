@@ -91,31 +91,35 @@ func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
 
 func TestRecordStoreOkIncrements(t *testing.T) {
 	reg := newReg(t)
+	// Read baseline then record one more; expect delta=1.
+	before := gatherCounter(t, reg, "dfs_store_ops_total", map[string]string{"operation": "store", "status": "ok"})
 	metrics.RecordStore("store", nil, 5*time.Millisecond)
 
 	v := gatherCounter(t, reg, "dfs_store_ops_total", map[string]string{"operation": "store", "status": "ok"})
-	if v != 1 {
-		t.Errorf("expected 1, got %v", v)
+	if v-before != 1 {
+		t.Errorf("expected delta=1, got %v", v-before)
 	}
 }
 
 func TestRecordStoreErrLabel(t *testing.T) {
 	reg := newReg(t)
+	before := gatherCounter(t, reg, "dfs_store_ops_total", map[string]string{"operation": "replicate", "status": "err"})
 	metrics.RecordStore("replicate", errors.New("io error"), 2*time.Millisecond)
 
 	v := gatherCounter(t, reg, "dfs_store_ops_total", map[string]string{"operation": "replicate", "status": "err"})
-	if v != 1 {
-		t.Errorf("expected err counter=1, got %v", v)
+	if v-before != 1 {
+		t.Errorf("expected err counter delta=1, got %v", v-before)
 	}
 }
 
 func TestRecordStoreDurationObserved(t *testing.T) {
 	reg := newReg(t)
+	before := gatherSampleCount(t, reg, "dfs_store_duration_seconds", map[string]string{"operation": "store"})
 	metrics.RecordStore("store", nil, 10*time.Millisecond)
 
 	n := gatherSampleCount(t, reg, "dfs_store_duration_seconds", map[string]string{"operation": "store"})
-	if n != 1 {
-		t.Errorf("expected 1 histogram sample, got %d", n)
+	if n-before != 1 {
+		t.Errorf("expected histogram delta=1, got %d", n-before)
 	}
 }
 
@@ -125,21 +129,23 @@ func TestRecordStoreDurationObserved(t *testing.T) {
 
 func TestRecordGetLocalOk(t *testing.T) {
 	reg := newReg(t)
+	before := gatherCounter(t, reg, "dfs_get_ops_total", map[string]string{"source": "local", "status": "ok"})
 	metrics.RecordGet("local", nil, time.Millisecond)
 
 	v := gatherCounter(t, reg, "dfs_get_ops_total", map[string]string{"source": "local", "status": "ok"})
-	if v != 1 {
-		t.Errorf("expected 1, got %v", v)
+	if v-before != 1 {
+		t.Errorf("expected delta=1, got %v", v-before)
 	}
 }
 
 func TestRecordGetMiss(t *testing.T) {
 	reg := newReg(t)
+	before := gatherCounter(t, reg, "dfs_get_ops_total", map[string]string{"source": "miss", "status": "err"})
 	metrics.RecordGet("miss", errors.New("not found"), time.Millisecond)
 
 	v := gatherCounter(t, reg, "dfs_get_ops_total", map[string]string{"source": "miss", "status": "err"})
-	if v != 1 {
-		t.Errorf("expected miss/err counter=1, got %v", v)
+	if v-before != 1 {
+		t.Errorf("expected miss/err counter delta=1, got %v", v-before)
 	}
 }
 
@@ -149,22 +155,24 @@ func TestRecordGetMiss(t *testing.T) {
 
 func TestRecordReplicationOk(t *testing.T) {
 	reg := newReg(t)
+	before := gatherCounter(t, reg, "dfs_replication_total", map[string]string{"status": "ok"})
 	metrics.RecordReplication("ok")
 	metrics.RecordReplication("ok")
 
 	v := gatherCounter(t, reg, "dfs_replication_total", map[string]string{"status": "ok"})
-	if v != 2 {
-		t.Errorf("expected 2, got %v", v)
+	if v-before != 2 {
+		t.Errorf("expected delta=2, got %v", v-before)
 	}
 }
 
 func TestRecordReplicationHint(t *testing.T) {
 	reg := newReg(t)
+	before := gatherCounter(t, reg, "dfs_replication_total", map[string]string{"status": "hint"})
 	metrics.RecordReplication("hint")
 
 	v := gatherCounter(t, reg, "dfs_replication_total", map[string]string{"status": "hint"})
-	if v != 1 {
-		t.Errorf("expected 1, got %v", v)
+	if v-before != 1 {
+		t.Errorf("expected delta=1, got %v", v-before)
 	}
 }
 
@@ -174,24 +182,30 @@ func TestRecordReplicationHint(t *testing.T) {
 
 func TestRecordGossipRoundIncrementsCounter(t *testing.T) {
 	reg := newReg(t)
+	mf := gatherFamily(t, reg, "dfs_gossip_rounds_total")
+	before := mf.GetMetric()[0].GetCounter().GetValue()
+
 	metrics.RecordGossipRound(50 * time.Millisecond)
 	metrics.RecordGossipRound(30 * time.Millisecond)
 
-	mf := gatherFamily(t, reg, "dfs_gossip_rounds_total")
+	mf = gatherFamily(t, reg, "dfs_gossip_rounds_total")
 	v := mf.GetMetric()[0].GetCounter().GetValue()
-	if v != 2 {
-		t.Errorf("expected 2 gossip rounds, got %v", v)
+	if v-before != 2 {
+		t.Errorf("expected delta=2 gossip rounds, got %v", v-before)
 	}
 }
 
 func TestRecordGossipRoundObservesDuration(t *testing.T) {
 	reg := newReg(t)
+	mf := gatherFamily(t, reg, "dfs_gossip_duration_seconds")
+	before := mf.GetMetric()[0].GetHistogram().GetSampleCount()
+
 	metrics.RecordGossipRound(100 * time.Millisecond)
 
-	mf := gatherFamily(t, reg, "dfs_gossip_duration_seconds")
+	mf = gatherFamily(t, reg, "dfs_gossip_duration_seconds")
 	n := mf.GetMetric()[0].GetHistogram().GetSampleCount()
-	if n != 1 {
-		t.Errorf("expected 1 sample, got %d", n)
+	if n-before != 1 {
+		t.Errorf("expected delta=1 sample, got %d", n-before)
 	}
 }
 
@@ -201,14 +215,17 @@ func TestRecordGossipRoundObservesDuration(t *testing.T) {
 
 func TestRecordHeartbeatSent(t *testing.T) {
 	reg := newReg(t)
+	beforeSent := gatherCounter(t, reg, "dfs_heartbeats_total", map[string]string{"direction": "sent"})
+	beforeRecv := gatherCounter(t, reg, "dfs_heartbeats_total", map[string]string{"direction": "received"})
+
 	metrics.RecordHeartbeat("sent")
 	metrics.RecordHeartbeat("sent")
 	metrics.RecordHeartbeat("received")
 
 	sent := gatherCounter(t, reg, "dfs_heartbeats_total", map[string]string{"direction": "sent"})
 	recv := gatherCounter(t, reg, "dfs_heartbeats_total", map[string]string{"direction": "received"})
-	if sent != 2 || recv != 1 {
-		t.Errorf("expected sent=2 recv=1, got sent=%v recv=%v", sent, recv)
+	if sent-beforeSent != 2 || recv-beforeRecv != 1 {
+		t.Errorf("expected sent delta=2 recv delta=1, got sent=%v recv=%v", sent-beforeSent, recv-beforeRecv)
 	}
 }
 
@@ -218,21 +235,23 @@ func TestRecordHeartbeatSent(t *testing.T) {
 
 func TestRecordQuorumRead(t *testing.T) {
 	reg := newReg(t)
+	before := gatherSampleCount(t, reg, "dfs_quorum_duration_seconds", map[string]string{"type": "read"})
 	metrics.RecordQuorum("read", 3*time.Millisecond)
 
 	n := gatherSampleCount(t, reg, "dfs_quorum_duration_seconds", map[string]string{"type": "read"})
-	if n != 1 {
-		t.Errorf("expected 1 quorum read sample, got %d", n)
+	if n-before != 1 {
+		t.Errorf("expected delta=1 quorum read sample, got %d", n-before)
 	}
 }
 
 func TestRecordQuorumWrite(t *testing.T) {
 	reg := newReg(t)
+	before := gatherSampleCount(t, reg, "dfs_quorum_duration_seconds", map[string]string{"type": "write"})
 	metrics.RecordQuorum("write", 5*time.Millisecond)
 
 	n := gatherSampleCount(t, reg, "dfs_quorum_duration_seconds", map[string]string{"type": "write"})
-	if n != 1 {
-		t.Errorf("expected 1 quorum write sample, got %d", n)
+	if n-before != 1 {
+		t.Errorf("expected delta=1 quorum write sample, got %d", n-before)
 	}
 }
 
@@ -308,8 +327,8 @@ func TestAllMetricNamesRegistered(t *testing.T) {
 
 func TestRecordSafeBeforeInit(t *testing.T) {
 	// Simulate uninitialized state by resetting without calling Init.
+	// Metric objects are always non-nil singletons; calls must not panic.
 	metrics.Reset()
-	// These should be no-ops, not panics.
 	metrics.RecordStore("store", nil, time.Millisecond)
 	metrics.RecordGet("local", nil, time.Millisecond)
 	metrics.RecordReplication("ok")

@@ -32,7 +32,7 @@ func newTestStore(t *testing.T) *Store {
 func TestAddAndRetrieveHint(t *testing.T) {
 	s := newTestStore(t)
 
-	h := Hint{Key: "file1", TargetAddr: "peer:3000", EncryptedKey: "aabbcc", Data: []byte("encrypted"), CreatedAt: time.Now()}
+	h := Hint{Key: "file1", TargetAddr: "peer:3000", Data: []byte("encrypted"), CreatedAt: time.Now()}
 	if err := s.AddHint(h); err != nil {
 		t.Fatalf("AddHint: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestPersistAndReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := "peer:3004"
-	_ = s1.AddHint(Hint{Key: "persistent", TargetAddr: addr, EncryptedKey: "deadbeef", Data: []byte("data"), CreatedAt: time.Now()})
+	_ = s1.AddHint(Hint{Key: "persistent", TargetAddr: addr, Data: []byte("data"), CreatedAt: time.Now()})
 
 	// Reload from same dir.
 	s2, err := NewStore(dir, 100, time.Hour)

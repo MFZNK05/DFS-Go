@@ -42,8 +42,9 @@ func DefaultConfig() Config {
 // is called by the downloader with the best peer from the selector.
 type FetchFunc func(storageKey string, peerAddr string) (encData []byte, err error)
 
-// DecryptFunc decrypts encData using the per-chunk key identified by storageKey.
-type DecryptFunc func(storageKey string, encData []byte) (plaintext []byte, err error)
+// DecryptFunc decrypts encData using the provided DEK.
+// When dek is nil, returns encData as-is (plaintext path).
+type DecryptFunc func(storageKey string, encData []byte, dek []byte) (plaintext []byte, err error)
 
 // GetPeersFunc returns the ordered list of peer addresses responsible for
 // storing storageKey (from the consistent hash ring).
@@ -78,7 +79,8 @@ func New(cfg Config, sel *selector.Selector, fetch FetchFunc, decrypt DecryptFun
 
 // Download fetches all chunks in manifest in parallel, writes the reassembled
 // plaintext to dst, and calls progress (if non-nil) after each chunk.
-func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc) error {
+// dek is the decryption key — nil for plaintext files.
+func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc, dek []byte) error {
 	n := len(manifest.Chunks)
 	if n == 0 {
 		return nil
@@ -98,7 +100,7 @@ func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progr
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			c, err := m.fetchChunk(ci)
+			c, err := m.fetchChunk(ci, dek)
 			chunks[idx] = c
 			errs[idx] = err
 
@@ -120,9 +122,9 @@ func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progr
 	return chunker.Reassemble(chunks, dst)
 }
 
-// fetchChunk fetches, decrypts, decompresses, and integrity-checks one chunk.
+// fetchChunk fetches, optionally decrypts, decompresses, and integrity-checks one chunk.
 // It retries up to cfg.MaxRetries times on different peers.
-func (m *Manager) fetchChunk(info chunker.ChunkInfo) (chunker.Chunk, error) {
+func (m *Manager) fetchChunk(info chunker.ChunkInfo, dek []byte) (chunker.Chunk, error) {
 	storageKey := chunker.ChunkStorageKey(info.EncHash)
 	candidates := m.getPeers(storageKey)
 
@@ -161,8 +163,8 @@ func (m *Manager) fetchChunk(info chunker.ChunkInfo) (chunker.Chunk, error) {
 			continue
 		}
 
-		// Decrypt.
-		plain, err := m.decrypt(storageKey, encData)
+		// Decrypt (no-op when dek is nil).
+		plain, err := m.decrypt(storageKey, encData, dek)
 		if err != nil {
 			lastErr = fmt.Errorf("decrypt from %s: %w", peer, err)
 			continue

@@ -58,7 +58,13 @@ type MessageGossipResponse struct {
 type GossipService struct {
 	cfg      Config
 	selfAddr string
+	mu       sync.RWMutex // guards selfAddr and selfFingerprint
 	cluster  *membership.ClusterState
+
+	// selfFingerprint is the identity fingerprint of this node. When set,
+	// HandleResponse uses it (instead of address comparison) to skip self-entries.
+	// This is critical for Docker/NAT where multiple nodes share 127.0.0.1:3000.
+	selfFingerprint string
 
 	getPeers func() []string                          // all known peer addresses
 	sendMsg  func(addr string, msg interface{}) error // deliver a message to a peer
@@ -69,6 +75,38 @@ type GossipService struct {
 
 	stopCh chan struct{}
 	once   sync.Once // guards Stop
+}
+
+// SetSelfAddr updates the gossip service's self address after external address
+// discovery (e.g. via MessageAnnounceAck). This ensures gossip digests advertise
+// the routable address instead of 127.0.0.1:port.
+func (gs *GossipService) SetSelfAddr(addr string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.selfAddr = addr
+}
+
+// SetSelfFingerprint sets the identity fingerprint used for self-detection in
+// HandleResponse. When set, entries are skipped based on fingerprint match
+// rather than address match, which is essential in Docker/NAT environments.
+func (gs *GossipService) SetSelfFingerprint(fp string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	gs.selfFingerprint = fp
+}
+
+// getSelfAddr returns the current self address (thread-safe).
+func (gs *GossipService) getSelfAddr() string {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.selfAddr
+}
+
+// getSelfFingerprint returns the current self fingerprint (thread-safe).
+func (gs *GossipService) getSelfFingerprint() string {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+	return gs.selfFingerprint
 }
 
 // isConnected returns true if addr appears in the current getPeers() list.
@@ -134,11 +172,12 @@ func (gs *GossipService) gossipLoop() {
 
 // doGossipRound picks up to FanOut random peers and sends them a digest.
 func (gs *GossipService) doGossipRound() {
+	selfAddr := gs.getSelfAddr()
 	all := gs.getPeers()
 	// Filter out self — we should never gossip to our own address.
 	peers := all[:0]
 	for _, p := range all {
-		if p != gs.selfAddr {
+		if p != selfAddr {
 			peers = append(peers, p)
 		}
 	}
@@ -159,7 +198,7 @@ func (gs *GossipService) doGossipRound() {
 	// This prevents phantom addresses — learned via third-party gossip but never
 	// directly reachable — from propagating across the cluster.
 	connectedSet := make(map[string]struct{}, len(peers)+1)
-	connectedSet[gs.selfAddr] = struct{}{}
+	connectedSet[selfAddr] = struct{}{}
 	for _, p := range peers {
 		connectedSet[p] = struct{}{}
 	}
@@ -170,7 +209,7 @@ func (gs *GossipService) doGossipRound() {
 		}
 	}
 	msg := &MessageGossipDigest{
-		From:    gs.selfAddr,
+		From:    selfAddr,
 		Digests: filtered,
 	}
 
@@ -193,6 +232,8 @@ func (gs *GossipService) doGossipRound() {
 // peers-map lookup. This avoids the ephemeral-vs-canonical address mismatch
 // that causes "peer not connected" errors after handleAnnounce remaps the key.
 func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, replyFn func(interface{}) error) {
+	selfAddr := gs.getSelfAddr()
+
 	// Record which addrs we already know BEFORE the merge so we can detect
 	// newly discovered nodes afterwards.
 	knownBefore := make(map[string]bool)
@@ -209,7 +250,7 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 	}
 
 	log.Printf("[TRACE][HandleDigest] self=%s from=%s needFull=%v knownBefore_count=%d digest_count=%d",
-		gs.selfAddr, from, needFull, len(knownBefore), len(msg.Digests))
+		selfAddr, from, needFull, len(knownBefore), len(msg.Digests))
 
 	// Collect addresses to dial — use a set to avoid dialling the same addr twice
 	// (both the needFull loop and the digest_scan loop might flag the same addr).
@@ -217,13 +258,13 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 
 	if gs.onNewPeer != nil {
 		for _, addr := range needFull {
-			if addr == gs.selfAddr {
+			if addr == selfAddr {
 				continue
 			}
 			connected := gs.isConnected(addr)
 			d := digestMap[addr]
 			log.Printf("[TRACE][HandleDigest] needFull: self=%s addr=%s connected=%v knownBefore=%v d.State=%v d.Gen=%d",
-				gs.selfAddr, addr, connected, knownBefore[addr], d.State, d.Generation)
+				selfAddr, addr, connected, knownBefore[addr], d.State, d.Generation)
 			if !connected {
 				if !knownBefore[addr] {
 					log.Printf("[TRACE][HandleDigest] NEW peer %s via digest from %s → queued", addr, from)
@@ -241,12 +282,12 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 		}
 		// Also check every digest entry — the sender might be new or rejoined.
 		for _, d := range msg.Digests {
-			if d.Addr == gs.selfAddr {
+			if d.Addr == selfAddr {
 				continue
 			}
 			connected := gs.isConnected(d.Addr)
 			log.Printf("[TRACE][HandleDigest] digest_scan: self=%s addr=%s d.State=%v d.Gen=%d connected=%v knownBefore=%v",
-				gs.selfAddr, d.Addr, d.State, d.Generation, connected, knownBefore[d.Addr])
+				selfAddr, d.Addr, d.State, d.Generation, connected, knownBefore[d.Addr])
 			if d.State == membership.StateAlive && !connected {
 				if !knownBefore[d.Addr] {
 					// Ensure the node is registered in our membership table.
@@ -269,7 +310,7 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 
 		// Dial all queued addresses exactly once.
 		for addr := range toDialSet {
-			log.Printf("[TRACE][HandleDigest] DIALLING addr=%s from self=%s", addr, gs.selfAddr)
+			log.Printf("[TRACE][HandleDigest] DIALLING addr=%s from self=%s", addr, selfAddr)
 			go gs.onNewPeer(addr)
 		}
 	}
@@ -277,7 +318,7 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 	full := gs.cluster.GetNodes(needFull)
 
 	resp := &MessageGossipResponse{
-		From:     gs.selfAddr,
+		From:     selfAddr,
 		Full:     full,
 		MyDigest: gs.cluster.Digest(),
 	}
@@ -292,6 +333,9 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 // generation is higher than local.  If a node is newly discovered we call the
 // onNewPeer callback so the server can dial it.
 func (gs *GossipService) HandleResponse(from string, msg *MessageGossipResponse) {
+	selfAddr := gs.getSelfAddr()
+	selfFP := gs.getSelfFingerprint()
+
 	// Collect which addrs we already know before merging.
 	knownBefore := make(map[string]bool)
 	for _, n := range gs.cluster.AllNodes() {
@@ -299,20 +343,29 @@ func (gs *GossipService) HandleResponse(from string, msg *MessageGossipResponse)
 	}
 
 	log.Printf("[TRACE][HandleResponse] self=%s from=%s full_count=%d my_digest_count=%d knownBefore=%d",
-		gs.selfAddr, from, len(msg.Full), len(msg.MyDigest), len(knownBefore))
+		selfAddr, from, len(msg.Full), len(msg.MyDigest), len(knownBefore))
 
 	// Apply full NodeInfo updates.
 	for _, info := range msg.Full {
-		if info.Addr == gs.selfAddr {
-			continue // never overwrite self
+		// Skip self-entries. Use fingerprint-based detection when available
+		// (critical for Docker/NAT where multiple nodes share 127.0.0.1:3000).
+		if info.Addr == selfAddr {
+			continue
 		}
+		if selfFP != "" && info.Metadata != nil && info.Metadata["fingerprint"] == selfFP {
+			continue
+		}
+
 		applied := gs.cluster.UpdateState(info.Addr, info.State, info.Generation)
-		if applied && info.Metadata != nil {
+		// Always merge metadata if present — not just when state was applied.
+		// A node's metadata (alias, fingerprint, keys) doesn't change with
+		// generation; skipping it when applied==false would prevent propagation.
+		if info.Metadata != nil {
 			gs.cluster.SetMetadata(info.Addr, info.Metadata)
 		}
 		connected := gs.isConnected(info.Addr)
 		log.Printf("[TRACE][HandleResponse] self=%s info.Addr=%s info.State=%v info.Gen=%d applied=%v connected=%v knownBefore=%v",
-			gs.selfAddr, info.Addr, info.State, info.Generation, applied, connected, knownBefore[info.Addr])
+			selfAddr, info.Addr, info.State, info.Generation, applied, connected, knownBefore[info.Addr])
 
 		// If this is a node we hadn't seen before and it is Alive, notify.
 		if !knownBefore[info.Addr] && info.State == membership.StateAlive && gs.onNewPeer != nil {

@@ -75,7 +75,7 @@ func newManager(cfg downloader.Config, store map[string][]byte, peers []string) 
 	}
 
 	// Identity decrypt (no real encryption in tests).
-	decrypt := func(storageKey string, encData []byte) ([]byte, error) {
+	decrypt := func(storageKey string, encData []byte, dek []byte) ([]byte, error) {
 		return encData, nil
 	}
 
@@ -95,7 +95,7 @@ func TestDownloadSingleChunk(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), store, []string{"peer1:3000"})
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Fatalf("download error: %v", err)
 	}
 	if !bytes.Equal(buf.Bytes(), plain) {
@@ -114,7 +114,7 @@ func TestDownloadMultipleChunks(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), store, []string{"peer1:3000"})
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Fatalf("download error: %v", err)
 	}
 
@@ -133,7 +133,7 @@ func TestDownloadEmptyManifest(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), nil, nil)
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Errorf("expected no error for empty manifest, got %v", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestProgressCallback(t *testing.T) {
 	progress := func(_, _ int) { atomic.AddInt32(&calls, 1) }
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, progress); err != nil {
+	if err := dm.Download(manifest, &buf, progress, nil); err != nil {
 		t.Fatalf("download error: %v", err)
 	}
 	if atomic.LoadInt32(&calls) != int32(len(plaintexts)) {
@@ -169,7 +169,7 @@ func TestDownloadWithCompression(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), store, []string{"peer1:3000"})
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Fatalf("download error: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestDownloadMissingChunkError(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), map[string][]byte{}, []string{"peer1:3000"})
 
 	var buf bytes.Buffer
-	err := dm.Download(manifest, &buf, nil)
+	err := dm.Download(manifest, &buf, nil, nil)
 	if err == nil {
 		t.Error("expected error when chunk is missing from store")
 	}
@@ -215,7 +215,7 @@ func TestDownloadRetriesOnFailure(t *testing.T) {
 		}
 		return data, nil
 	}
-	decrypt := func(_ string, data []byte) ([]byte, error) { return data, nil }
+	decrypt := func(_ string, data []byte, _ []byte) ([]byte, error) { return data, nil }
 	getPeers := func(_ string) []string { return []string{"peerA:3000", "peerB:3000"} }
 
 	cfg := downloader.DefaultConfig()
@@ -223,7 +223,7 @@ func TestDownloadRetriesOnFailure(t *testing.T) {
 	dm := downloader.New(cfg, sel, fetch, decrypt, getPeers)
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Fatalf("expected retry to succeed, got: %v", err)
 	}
 }
@@ -241,7 +241,7 @@ func TestDownloadParallelism(t *testing.T) {
 	dm := newManager(cfg, store, []string{"peer1:3000", "peer2:3000"})
 
 	var buf bytes.Buffer
-	if err := dm.Download(manifest, &buf, nil); err != nil {
+	if err := dm.Download(manifest, &buf, nil, nil); err != nil {
 		t.Fatalf("parallel download error: %v", err)
 	}
 
@@ -266,7 +266,7 @@ func TestDownloadIntegrityCheckFails(t *testing.T) {
 	dm := newManager(downloader.DefaultConfig(), store, []string{"peer1:3000"})
 
 	var buf bytes.Buffer
-	err := dm.Download(manifest, &buf, nil)
+	err := dm.Download(manifest, &buf, nil, nil)
 	if err == nil {
 		t.Error("expected integrity error for corrupted chunk")
 	}

@@ -20,12 +20,11 @@ const (
 // target node because the target was unreachable at write time.
 // The data stored here is already encrypted — safe to persist to disk.
 type Hint struct {
-	Key          string    `json:"key"`
-	TargetAddr   string    `json:"target_addr"`
-	EncryptedKey string    `json:"encrypted_key"` // hex-encoded per-file AES key
-	Data         []byte    `json:"data"`          // encrypted file bytes
-	CreatedAt    time.Time `json:"created_at"`
-	Attempts     int       `json:"attempts"`
+	Key        string    `json:"key"`
+	TargetAddr string    `json:"target_addr"`
+	Data       []byte    `json:"data"` // raw (possibly encrypted) file bytes
+	CreatedAt  time.Time `json:"created_at"`
+	Attempts   int       `json:"attempts"`
 }
 
 // Store persists hints to disk so they survive process restarts.

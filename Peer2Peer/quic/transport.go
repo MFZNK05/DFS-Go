@@ -157,10 +157,7 @@ func (t *Transport) Consume() <-chan peer2peer.RPC { return t.rpcCh }
 func (t *Transport) ListenAndAccept() error {
 	cfg := t.tlsCfg.Clone()
 	cfg.NextProtos = []string{"dfs-quic"}
-	ln, err := quic.ListenAddr(t.opts.ListenAddr, cfg, &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-	})
+	ln, err := quic.ListenAddr(t.opts.ListenAddr, cfg, dfsQUICConfig())
 	if err != nil {
 		return err
 	}
@@ -174,10 +171,7 @@ func (t *Transport) Dial(addr string) error {
 	cfg := t.tlsCfg.Clone()
 	cfg.InsecureSkipVerify = true
 	cfg.NextProtos = []string{"dfs-quic"}
-	conn, err := quic.DialAddr(context.Background(), addr, cfg, &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: 10 * time.Second,
-	})
+	conn, err := quic.DialAddr(context.Background(), addr, cfg, dfsQUICConfig())
 	if err != nil {
 		return err
 	}
@@ -309,6 +303,24 @@ func (t *Transport) handleStream(stream *quic.Stream, from net.Addr, peer *QUICP
 		msg.From = from
 		msg.Peer = peer
 		t.rpcCh <- msg
+	}
+}
+
+// dfsQUICConfig returns the shared quic.Config for both listener and dialer.
+// Flow-control windows are sized for 4 MiB chunk transfers:
+//   - InitialStreamReceiveWindow  = 8 MiB  (one full chunk + overhead)
+//   - InitialConnectionReceiveWindow = 32 MiB (several concurrent streams)
+//
+// Without these, quic-go defaults (~6 MiB connection window) cause deadlocks
+// when multiple large streams contend for receive buffer space.
+func dfsQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		InitialStreamReceiveWindow:     8 << 20,  // 8 MiB
+		MaxStreamReceiveWindow:         16 << 20, // 16 MiB
+		InitialConnectionReceiveWindow: 32 << 20, // 32 MiB
+		MaxConnectionReceiveWindow:     64 << 20, // 64 MiB
 	}
 }
 

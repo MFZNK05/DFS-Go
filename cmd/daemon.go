@@ -9,9 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	serve "github.com/Faizan2005/DFS-Go/Server"
+	"github.com/Faizan2005/DFS-Go/Crypto/identity"
 	"github.com/Faizan2005/DFS-Go/Observability/logging"
 	"github.com/Faizan2005/DFS-Go/Observability/tracing"
+	serve "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/Faizan2005/DFS-Go/factory"
 )
 
@@ -37,8 +38,17 @@ func StartDaemon(port string, peers []string, replicationFactor int) error {
 	}
 	defer listener.Close()
 
+	// Load identity for gossip metadata (optional — warn if missing).
+	var makeOpts *serve.MakeServerOpts
+	if id, err := identity.Load(identity.DefaultPath()); err == nil {
+		logging.Global.Info("identity loaded", "alias", id.Alias, "fingerprint", id.Fingerprint())
+		makeOpts = &serve.MakeServerOpts{IdentityMeta: id.GossipMetadata()}
+	} else {
+		logging.Global.Warn("no identity found — ECDH sharing disabled. Run 'dfs identity init --alias <name>'")
+	}
+
 	logging.Global.Info("transport protocol", "protocol", string(factory.ProtocolFromEnv()))
-	server := serve.MakeServer(port, replicationFactor, peers...)
+	server := serve.MakeServer(port, replicationFactor, makeOpts, peers...)
 
 	// Graceful shutdown on SIGTERM / SIGINT.
 	sigCh := make(chan os.Signal, 1)
@@ -53,7 +63,9 @@ func StartDaemon(port string, peers []string, replicationFactor int) error {
 		os.Exit(0)
 	}()
 
-	go server.Run()
+	if err := server.Start(); err != nil {
+		return fmt.Errorf("server failed to start: %w", err)
+	}
 
 	logging.Global.Info("daemon started", "socket", sockPath, "port", port)
 	fmt.Println("Daemon started at", sockPath)

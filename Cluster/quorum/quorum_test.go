@@ -21,8 +21,8 @@ func makeCoordinator(
 	targets []string,
 	cfg quorum.Config,
 	sendMsg func(string, interface{}) error,
-	localWrite func(string, string, []byte, vclock.VectorClock) error,
-	localRead func(string) (vclock.VectorClock, int64, string, bool),
+	localWrite func(string, []byte, vclock.VectorClock) error,
+	localRead func(string) (vclock.VectorClock, int64, bool),
 ) *quorum.Coordinator {
 	return quorum.New(
 		cfg,
@@ -60,12 +60,12 @@ func TestWriteQuorumMetWith2Acks(t *testing.T) {
 			return nil
 		},
 		// local write always succeeds immediately.
-		func(key, encKey string, data []byte, clock vclock.VectorClock) error { return nil },
+		func(key string, data []byte, clock vclock.VectorClock) error { return nil },
 		nil,
 	)
 
 	clock := vclock.New().Increment("self")
-	err := coord.Write("notes.pdf", "hexkey", []byte("data"), clock)
+	err := coord.Write("notes.pdf", []byte("data"), clock)
 	if err != nil {
 		t.Errorf("expected nil error when quorum met, got: %v", err)
 	}
@@ -81,12 +81,12 @@ func TestWriteQuorumFailsOnTimeout(t *testing.T) {
 		func(addr string, msg interface{}) error {
 			return errors.New("connection refused") // peers unreachable
 		},
-		func(key, encKey string, data []byte, clock vclock.VectorClock) error { return nil },
+		func(key string, data []byte, clock vclock.VectorClock) error { return nil },
 		nil,
 	)
 
 	clock := vclock.New().Increment("self")
-	err := coord.Write("notes.pdf", "hexkey", []byte("data"), clock)
+	err := coord.Write("notes.pdf", []byte("data"), clock)
 	if err == nil {
 		t.Error("expected error when quorum not met, got nil")
 	}
@@ -101,13 +101,13 @@ func TestWriteLocalFailureCountsAgainstQuorum(t *testing.T) {
 		"self", targets, cfg,
 		func(addr string, msg interface{}) error { return nil },
 		// local write fails
-		func(key, encKey string, data []byte, clock vclock.VectorClock) error {
+		func(key string, data []byte, clock vclock.VectorClock) error {
 			return errors.New("disk full")
 		},
 		nil,
 	)
 
-	err := coord.Write("k", "e", []byte("d"), vclock.New())
+	err := coord.Write("k", []byte("d"), vclock.New())
 	if err == nil {
 		t.Error("expected error when local write fails")
 	}
@@ -120,11 +120,11 @@ func TestWriteSingleNodeQuorum(t *testing.T) {
 
 	coord := makeCoordinator("self", targets, cfg,
 		func(string, interface{}) error { return nil },
-		func(string, string, []byte, vclock.VectorClock) error { return nil },
+		func(string, []byte, vclock.VectorClock) error { return nil },
 		nil,
 	)
 
-	err := coord.Write("k", "e", []byte("d"), vclock.New())
+	err := coord.Write("k", []byte("d"), vclock.New())
 	if err != nil {
 		t.Errorf("single-node quorum should succeed immediately, got: %v", err)
 	}
@@ -154,29 +154,25 @@ func TestReadQuorumPicksCausallyLater(t *testing.T) {
 			go func() {
 				time.Sleep(5 * time.Millisecond)
 				coord.HandleReadResponse(quorum.ReadResponse{
-					NodeAddr:     addr,
-					Key:          "notes.pdf",
-					Found:        true,
-					Clock:        newerClock,
-					Timestamp:    2000,
-					EncryptedKey: "newer-key",
+					NodeAddr:  addr,
+					Key:       "notes.pdf",
+					Found:     true,
+					Clock:     newerClock,
+					Timestamp: 2000,
 				})
 			}()
 			return nil
 		},
 		nil,
 		// local read returns the older version.
-		func(key string) (vclock.VectorClock, int64, string, bool) {
-			return olderClock, 1000, "older-key", true
+		func(key string) (vclock.VectorClock, int64, bool) {
+			return olderClock, 1000, true
 		},
 	)
 
-	encKey, clock, err := coord.Read("notes.pdf")
+	clock, err := coord.Read("notes.pdf")
 	if err != nil {
 		t.Fatalf("unexpected read error: %v", err)
-	}
-	if encKey != "newer-key" {
-		t.Errorf("expected newer-key to win, got %s", encKey)
 	}
 	if clock.Compare(newerClock) != vclock.Equal {
 		t.Errorf("expected newerClock to be returned, got %v", clock)
@@ -198,28 +194,28 @@ func TestReadQuorumLWWTiebreak(t *testing.T) {
 			go func() {
 				time.Sleep(5 * time.Millisecond)
 				coord.HandleReadResponse(quorum.ReadResponse{
-					NodeAddr:     addr,
-					Key:          "f.pdf",
-					Found:        true,
-					Clock:        clockB,
-					Timestamp:    9000, // higher → should win
-					EncryptedKey: "key-B",
+					NodeAddr:  addr,
+					Key:       "f.pdf",
+					Found:     true,
+					Clock:     clockB,
+					Timestamp: 9000, // higher → should win
 				})
 			}()
 			return nil
 		},
 		nil,
-		func(key string) (vclock.VectorClock, int64, string, bool) {
-			return clockA, 1000, "key-A", true // lower timestamp
+		func(key string) (vclock.VectorClock, int64, bool) {
+			return clockA, 1000, true // lower timestamp
 		},
 	)
 
-	encKey, _, err := coord.Read("f.pdf")
+	clock, err := coord.Read("f.pdf")
 	if err != nil {
 		t.Fatalf("unexpected read error: %v", err)
 	}
-	if encKey != "key-B" {
-		t.Errorf("expected key-B (higher timestamp) to win LWW, got %s", encKey)
+	// clockB has higher timestamp so should win LWW
+	if clock.Compare(clockB) != vclock.Equal {
+		t.Errorf("expected clockB (higher timestamp) to win LWW, got %v", clock)
 	}
 }
 
@@ -233,10 +229,10 @@ func TestReadQuorumTimeout(t *testing.T) {
 		func(addr string, msg interface{}) error { return errors.New("unreachable") },
 		nil,
 		// self also has no data
-		func(key string) (vclock.VectorClock, int64, string, bool) { return nil, 0, "", false },
+		func(key string) (vclock.VectorClock, int64, bool) { return nil, 0, false },
 	)
 
-	_, _, err := coord.Read("missing.pdf")
+	_, err := coord.Read("missing.pdf")
 	if err == nil {
 		t.Error("expected timeout error when no responses, got nil")
 	}
@@ -253,17 +249,14 @@ func TestReadPartialQuorumDegradedMode(t *testing.T) {
 		func(addr string, msg interface{}) error { return nil },
 		nil,
 		// only self has data
-		func(key string) (vclock.VectorClock, int64, string, bool) {
-			return vclock.VectorClock{"self": 1}, 500, "my-key", true
+		func(key string) (vclock.VectorClock, int64, bool) {
+			return vclock.VectorClock{"self": 1}, 500, true
 		},
 	)
 
-	encKey, _, err := coord.Read("partial.pdf")
+	_, err := coord.Read("partial.pdf")
 	if err != nil {
 		t.Fatalf("partial quorum should degrade gracefully, got error: %v", err)
-	}
-	if encKey != "my-key" {
-		t.Errorf("expected my-key from partial quorum, got %s", encKey)
 	}
 }
 
@@ -278,13 +271,13 @@ func TestLateAckDroppedGracefully(t *testing.T) {
 
 	coord := makeCoordinator("self", targets, cfg,
 		func(addr string, msg interface{}) error { return nil },
-		func(string, string, []byte, vclock.VectorClock) error { return nil },
+		func(string, []byte, vclock.VectorClock) error { return nil },
 		nil,
 	)
 
 	// Let write time out (peer1 never acks).
 	clock := vclock.New()
-	_ = coord.Write("late.pdf", "k", []byte("d"), clock)
+	_ = coord.Write("late.pdf", []byte("d"), clock)
 
 	// Inject a late ack after the operation is already done — must not panic.
 	coord.HandleWriteAck(quorum.WriteAck{NodeAddr: "peer1", Key: "late.pdf", Success: true})
