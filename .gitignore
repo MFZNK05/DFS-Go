@@ -26,6 +26,7 @@ Thumbs.db
 # Data directories and runtime files
 *_network/
 *_metadata.json
+metadata_test.json
 *.db
 
 # Transfer artifacts

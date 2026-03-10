@@ -34,7 +34,8 @@ func TestWriteStream(t *testing.T) {
 
 	store := NewStore(StructOpts{
 		PathTransformFunc: CASPathTransformFunc,
-		Metadata:          NewMetaFile("metadata_test.json"),
+		Root:              t.TempDir(),
+		Metadata:          NewMetaFile(t.TempDir() + "/metadata_test.json"),
 	})
 
 	_, err := store.WriteStream(Key, reader)
@@ -46,9 +47,11 @@ func TestWriteStream(t *testing.T) {
 }
 
 func TestReadStream(t *testing.T) {
+	tmpDir := t.TempDir()
 	store := NewStore(StructOpts{
 		PathTransformFunc: CASPathTransformFunc,
-		Metadata:          NewMetaFile("metadata_test.json"),
+		Root:              tmpDir,
+		Metadata:          NewMetaFile(tmpDir + "/metadata_test.json"),
 	})
 
 	for i := 0; i < 50; i++ {
