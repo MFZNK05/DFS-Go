@@ -5,10 +5,10 @@ package ipc
 import (
 	"net"
 
-	"gopkg.in/natefinch/npipe.v2"
+	"github.com/Microsoft/go-winio"
 )
 
 // Dial connects to the daemon IPC socket (named pipe on Windows).
 func Dial(path string) (net.Conn, error) {
-	return npipe.Dial(path)
+	return winio.DialPipe(path, nil)
 }

@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"net"
 
-	"gopkg.in/natefinch/npipe.v2"
+	"github.com/Microsoft/go-winio"
 )
 
 func ipcListen(path string) (net.Listener, error) {
-	return npipe.Listen(path)
+	return winio.ListenPipe(path, nil)
 }
 
 func ipcDial(path string) (net.Conn, error) {
-	return npipe.Dial(path)
+	return winio.DialPipe(path, nil)
 }
 
 func platformSocketPath(port string) string {

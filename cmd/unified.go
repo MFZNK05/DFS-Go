@@ -67,7 +67,7 @@ func migrateConfigDir() {
 	if _, err := os.Stat(oldDir); err != nil {
 		return // nothing to migrate
 	}
-	os.Rename(oldDir, newDir)
+	_ = os.Rename(oldDir, newDir)
 }
 
 func ensureIdentity() (*identity.Identity, error) {

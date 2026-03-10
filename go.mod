@@ -3,6 +3,7 @@ module github.com/Faizan2005/DFS-Go
 go 1.24.2
 
 require (
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -21,7 +22,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.40.0
 	golang.org/x/crypto v0.47.0
 	golang.org/x/time v0.14.0
-	gopkg.in/natefinch/npipe.v2 v2.0.0-20160621034901-c1b8fa8bdcce
 )
 
 require (
