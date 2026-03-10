@@ -147,7 +147,9 @@ func downloadToStream(storageKey string, dek []byte, sockPath string) error {
 	}
 	if !ok {
 		errMsg := make([]byte, contentLen)
-		io.ReadFull(conn, errMsg) //nolint:errcheck
+		if _, err := io.ReadFull(conn, errMsg); err != nil {
+			return fmt.Errorf("download failed (and error message unreadable: %v)", err)
+		}
 		return fmt.Errorf("download failed: %s", errMsg)
 	}
 

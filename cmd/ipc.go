@@ -417,7 +417,9 @@ func readManifestInfoResponse(conn net.Conn) (*manifestInfoResponse, error) {
 		}
 		cl := binary.BigEndian.Uint64(clBuf[:])
 		errMsg := make([]byte, cl)
-		io.ReadFull(conn, errMsg) //nolint:errcheck
+		if _, err := io.ReadFull(conn, errMsg); err != nil {
+			return nil, fmt.Errorf("server error (message unreadable: %v)", err)
+		}
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 	resp := &manifestInfoResponse{
@@ -488,10 +490,14 @@ func readResolveAliasResponse(conn net.Conn) ([]ipc.AliasResult, error) {
 	}
 	if statusBuf[0] != statusOK {
 		var mlenBuf [4]byte
-		io.ReadFull(conn, mlenBuf[:]) //nolint:errcheck
+		if _, err := io.ReadFull(conn, mlenBuf[:]); err != nil {
+			return nil, fmt.Errorf("server error (length unreadable: %v)", err)
+		}
 		mlen := binary.BigEndian.Uint32(mlenBuf[:])
 		msgBuf := make([]byte, mlen)
-		io.ReadFull(conn, msgBuf) //nolint:errcheck
+		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+			return nil, fmt.Errorf("server error (message unreadable: %v)", err)
+		}
 		return nil, fmt.Errorf("%s", msgBuf)
 	}
 	var countBuf [2]byte

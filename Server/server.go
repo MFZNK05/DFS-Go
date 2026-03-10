@@ -3436,6 +3436,14 @@ func (s *Server) SelfAddr() string {
 	return s.effectiveSelfAddr()
 }
 
+// SelfFingerprint returns this node's identity fingerprint, or "" if no identity.
+func (s *Server) SelfFingerprint() string {
+	if s.identityMeta == nil {
+		return ""
+	}
+	return s.identityMeta["fingerprint"]
+}
+
 // discoverNAT runs STUN discovery in the background. On success it sets the
 // external address and injects the public_addr into gossip metadata, unifying
 // with the reactive announce-ack discovery path.

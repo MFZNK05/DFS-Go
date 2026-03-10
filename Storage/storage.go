@@ -141,7 +141,7 @@ func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
 	// Create directory
 	fullPath := filepath.Join(s.structOpts.Root, pathKey.pathname)
 	log.Printf("WRITE_STREAM: Creating directory at: %s", fullPath)
-	err := os.MkdirAll(fullPath, os.ModePerm)
+	err := os.MkdirAll(fullPath, 0755)
 	if err != nil {
 		log.Printf("WRITE_STREAM: Failed to create directory: %v", err)
 		return 0, err

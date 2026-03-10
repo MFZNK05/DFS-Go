@@ -100,13 +100,14 @@ func completeAndRecordTransfer(s *server.Server, tid string) {
 		s.TransferMgr.Complete(tid)
 		return
 	}
-	s.TransferMgr.Complete(tid)
-	if s.StateDB == nil {
-		return
-	}
+	// Read status before Complete() to avoid race with other goroutines.
 	status := 3 // completed
 	if info.Status == 4 {
 		status = 4 // failed
+	}
+	s.TransferMgr.Complete(tid)
+	if s.StateDB == nil {
+		return
 	}
 	entry := State.TransferHistoryEntry{
 		ID:        info.ID,
@@ -954,11 +955,16 @@ func handleListPeers(conn net.Conn, s *server.Server) {
 	}
 	nodes := s.Cluster.AllNodes()
 	selfAddr := s.SelfAddr()
+	selfFP := s.SelfFingerprint()
 	seen := make(map[string]int) // fingerprint → index in peers slice
 	peers := make([]peerInfo, 0, len(nodes))
 	for _, n := range nodes {
-		// Skip self node — only show remote peers.
+		// Skip self node — match by address or fingerprint to handle
+		// address normalization mismatches (e.g. ":3000" vs "127.0.0.1:3000").
 		if n.Addr == selfAddr {
+			continue
+		}
+		if selfFP != "" && n.Metadata != nil && n.Metadata["fingerprint"] == selfFP {
 			continue
 		}
 		// Skip Dead/Left nodes — they are gone and clutter the peer list.

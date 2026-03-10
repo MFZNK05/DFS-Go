@@ -16,10 +16,16 @@ import (
 
 // resolveAddr resolves an input string to a peer address.
 // If it looks like host:port, returns it unchanged.
+// If it's a bare IP address, appends the default port :3000.
 // Otherwise, tries alias lookup via cluster gossip metadata.
 func resolveAddr(input string, s *server.Server) (string, error) {
-	if strings.Contains(input, ":") {
+	// Already has a port — use as-is.
+	if _, _, err := net.SplitHostPort(input); err == nil {
 		return input, nil
+	}
+	// Bare IP address without port — append default :3000.
+	if ip := net.ParseIP(input); ip != nil {
+		return net.JoinHostPort(input, "3000"), nil
 	}
 	// Treat as alias — lookup via gossip.
 	results := s.LookupAlias(input)
