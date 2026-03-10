@@ -1,0 +1,49 @@
+version: 2
+
+project_name: hermond
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    binary: hermond
+    ldflags:
+      - -s -w
+      - -X github.com/Faizan2005/DFS-Go/cmd.version={{.Version}}
+      - -X github.com/Faizan2005/DFS-Go/cmd.commit={{.ShortCommit}}
+      - -X github.com/Faizan2005/DFS-Go/cmd.date={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "hermond_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - repository:
+      owner: Faizan2005
+      name: homebrew-hermond
+    homepage: "https://github.com/Faizan2005/DFS-Go"
+    description: "Hermond – P2P File Sharing for Campus Networks"
+    license: "MIT"
+    install: |
+      bin.install "hermond"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
