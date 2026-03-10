@@ -1,0 +1,167 @@
+================================================================================
+                        HERMOND - COMMAND REFERENCE
+================================================================================
+
+All commands support --node <":port"> to target a specific local daemon
+(default: :3000).
+
+
+STARTING HERMOND
+-----------------
+
+  hermond                              Start daemon + launch TUI
+  hermond --port :3000                 Start on a specific port
+  hermond --port :4000 --peer :3000    Join an existing node
+  hermond --no-stun                    Disable NAT traversal (LAN-only)
+  hermond tui --node :3000             Attach TUI to a running daemon
+
+
+IDENTITY (one-time setup)
+--------------------------
+
+  hermond identity init --alias "alice"    Generate Ed25519 + X25519 keypair
+  hermond identity show                    Show fingerprint, alias, public keys
+
+
+UPLOADING FILES
+----------------
+
+  hermond upload --name <name> --file <path>
+      Upload a single file.
+
+  hermond upload --name <name> --dir <path>
+      Upload an entire directory.
+
+  hermond upload --name <name> --file <path> --public
+      Upload and mark as publicly browsable by all peers.
+
+  hermond upload --name <name> --file <path> --share-with bob,charlie
+      Encrypt with ECDH so only bob and charlie can decrypt.
+
+  hermond upload --name <name> --file <path> --share-with-key <x25519-pubkey>
+      Encrypt for a specific public key (fallback when alias isn't known).
+
+  Flags:
+    -k, --name          Name to associate with the upload (required)
+    -f, --file          Path to a file
+    -d, --dir           Path to a directory
+    -n, --node          Daemon port (default :3000)
+    --public            Mark as publicly browsable
+    --share-with        Comma-separated aliases for ECDH encryption
+    --share-with-key    Comma-separated X25519 public keys
+
+
+DOWNLOADING FILES
+------------------
+
+  hermond download --name <name> --output <path>
+      Download a file you previously uploaded.
+
+  hermond download --name <name> --output <path> --from alice
+      Download a file uploaded by another user (by alias).
+
+  hermond download --name <name> --output <path> --from-key <fingerprint>
+      Download using the owner's fingerprint (for duplicate aliases).
+
+  Flags:
+    -k, --name          Name to retrieve (required)
+    -o, --output        Output path (optional; defaults to stdout for files)
+    -n, --node          Daemon port (default :3001)
+    --from              Alias of the file owner (defaults to self)
+    --from-key          Fingerprint of the owner
+
+
+DIRECT SEND
+-------------
+
+  hermond send <file-key> <peer-addr-or-alias>
+      Send a direct-share notification for one of your uploaded files to a
+      specific peer. The file must already be uploaded.
+
+
+SEARCHING
+----------
+
+  hermond search <query>
+      Flood-search the network for files matching the query.
+      Returns: key, name, size, owner, node address.
+
+
+NETWORK & PEERS
+----------------
+
+  hermond peers                        List all connected peers
+  hermond browse <peer-addr>           Browse a peer's public files
+  hermond status                       Show node info (uptime, peers, files)
+  hermond connect <addr-or-alias>      Manually connect to a peer
+
+
+TRANSFER MANAGEMENT
+--------------------
+
+  hermond transfers                    List all active/recent transfers
+  hermond pause <transfer-id>          Pause an active transfer
+  hermond resume <transfer-id>         Resume a paused transfer
+  hermond cancel <transfer-id>         Cancel a transfer
+
+
+FILE MANAGEMENT
+----------------
+
+  hermond list uploads                 Show your upload history
+  hermond list uploads --public        Show only public uploads
+  hermond list uploads --private       Show only encrypted/shared uploads
+  hermond list downloads               Show your download history
+  hermond list public                  Show the public file catalog
+  hermond remove <name>               Remove a file (tombstone propagated)
+
+
+VERSION
+--------
+
+  hermond version                      Print version, commit hash, build date
+
+
+TUI KEYBOARD SHORTCUTS
+------------------------
+
+  Tab / Shift+Tab     Switch between tabs
+  Ctrl+U              Open upload modal
+  Ctrl+D              Open download prompt
+  Ctrl+H              Show help overlay
+  Ctrl+C              Quit
+
+  TUI Tabs:
+    1. Network       - Peer roster + browse public files
+    2. Transfers     - Progress bars, speeds, pause/resume/cancel
+    3. Vault         - Upload/download history, public/private filters
+    4. Diagnostics   - Node health, uptime, metrics
+
+
+EXAMPLES
+---------
+
+  # First-time setup
+  hermond identity init --alias "alice"
+  hermond --port :3000
+
+  # Share a movie with everyone on the network
+  hermond upload --name "inception.mkv" --file ~/Movies/inception.mkv --public
+
+  # Share class notes privately with bob
+  hermond upload --name "cs101-notes" --dir ~/notes/cs101/ --share-with bob
+
+  # Download a file from a peer
+  hermond download --name "inception.mkv" --output ./inception.mkv --from alice
+
+  # Search for files across the network
+  hermond search "lecture"
+
+  # Check what's happening
+  hermond transfers
+  hermond status
+
+
+================================================================================
+  https://github.com/MFZNK05/DFS-Go
+================================================================================

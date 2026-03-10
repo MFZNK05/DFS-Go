@@ -27,6 +27,10 @@ archives:
         formats:
           - zip
     name_template: "hermond_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - INSTALL.txt
+      - USAGE.txt
+      - LICENSE
 
 checksum:
   name_template: "checksums.txt"

@@ -1,79 +1,440 @@
 <p align="center">
-  <h1 align="center">DFS-Go</h1>
+  <h1 align="center">Hermond</h1>
   <p align="center">
-    A peer-to-peer distributed file system built from scratch in Go
+    The Swift P2P Data Herald
     <br />
-    <strong>Encrypted · Content-Addressed · Replicated</strong>
+    <strong>High-Speed LAN Transfers &middot; End-to-End Encrypted &middot; Zero Config</strong>
   </p>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=flat&logo=go" alt="Go 1.24" />
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat" alt="MIT License" />
-  <img src="https://img.shields.io/badge/TLS-mTLS_1.2+-blue?style=flat&logo=letsencrypt" alt="mTLS" />
-  <img src="https://img.shields.io/badge/Encryption-AES--256--GCM-orange?style=flat" alt="AES-256-GCM" />
+  <a href="https://github.com/MFZNK05/DFS-Go/releases/latest"><img src="https://img.shields.io/github/v/release/MFZNK05/DFS-Go?label=release&color=7D56F4&style=flat-square" alt="Release" /></a>
+  <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go" alt="Go 1.24" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT License" />
+  <img src="https://img.shields.io/badge/Transport-QUIC-blue?style=flat-square" alt="QUIC" />
+  <img src="https://img.shields.io/badge/Encryption-AES--256--GCM-orange?style=flat-square" alt="AES-256-GCM" />
 </p>
 
 ---
 
-## Overview
+## What is Hermond?
 
-**DFS-Go** is a distributed file storage system where multiple nodes form a peer-to-peer network to store, replicate, and retrieve files. Files are encrypted at rest using AES-256-GCM streaming encryption, distributed across nodes via consistent hashing, and all peer communication can be secured with mutual TLS (mTLS).
+**Hermond** is a high-performance, decentralized file-sharing system built for campus LANs. It turns every machine on the network into a peer that can store, share, and retrieve files — no central server needed.
 
-Upload a file from any node, and it is automatically encrypted, content-addressed, and replicated to the responsible nodes in the cluster. Download from any node, and it transparently fetches and decrypts the file — even if the data lives on a remote peer.
+Think of it as a modern take on DC++ — but with end-to-end encryption, automatic peer discovery, and a real terminal UI.
 
-### Key Features
+### Why Hermond?
 
-- **Content-Addressable Storage (CAS)** — Files are stored at paths derived from their SHA-256 hash with MD5 content fingerprints, ensuring deduplication and integrity
-- **AES-256-GCM Streaming Encryption** — Files are encrypted in 4 MB chunks with per-chunk nonces; encryption keys are themselves encrypted with a master key (two-layer envelope encryption)
-- **Consistent Hashing** — A virtual-node hash ring determines which N nodes are responsible for each key, minimizing data movement when nodes join or leave
-- **Configurable Replication** — Replication factor (default N=3) controls how many copies of each file exist across the cluster
-- **Mutual TLS (mTLS)** — Optional CA-signed certificate infrastructure with auto-generated node certificates for authenticated, encrypted peer communication
-- **CLI Interface** — Simple `dfs start`, `dfs upload`, `dfs download` commands backed by a Unix socket daemon
-- **Peer Auto-Discovery** — Nodes bootstrap from a peer list and automatically register joining/departing peers on the hash ring
+Moving large files on a campus network shouldn't require cloud uploads, USB drives, or sketchy FTP servers. Hermond lets you share game folders, movies, datasets, and project archives directly between machines at the full speed of your local network.
+
+**What sets it apart:**
+
+- **Encrypted Direct Send** — Push files directly to a specific person using ECDH (X25519) encryption. Only the intended recipient can decrypt the data. No server ever sees the plaintext.
+- **LAN-Speed Transfers** — Built on QUIC with adaptive bandwidth management. Multi-GB transfers run at the physical limits of your network without saturating it for everyone else.
+- **Zero-Config Discovery** — Nodes find each other via gossip protocol. No IP addresses to type, no config files to edit. Join the swarm and start sharing.
+- **Persistent & Resumable** — Close your laptop mid-transfer? Hermond remembers exactly which chunks were downloaded and picks up where it left off.
+
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [The TUI](#the-tui)
+- [CLI Reference](#cli-reference)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Package Reference](#package-reference)
+- [Security Model](#security-model)
+- [Tech Stack](#tech-stack)
+- [License](#license)
+
+---
+
+## Installation
+
+Hermond ships as a single, statically-linked binary. No runtime dependencies.
+
+### One-Liner (Linux & macOS)
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/MFZNK05/DFS-Go/main/install.sh | sh
+```
+
+### Homebrew (macOS & Linux)
+
+```sh
+brew install MFZNK05/hermond/hermond
+```
+
+### Manual Download (All Platforms)
+
+Download the archive for your platform from the [Releases page](https://github.com/MFZNK05/DFS-Go/releases/latest):
+
+| Platform | Architecture | Archive |
+|----------|-------------|---------|
+| Linux | x86_64 | `hermond_<ver>_linux_amd64.tar.gz` |
+| Linux | ARM64 | `hermond_<ver>_linux_arm64.tar.gz` |
+| macOS | Intel | `hermond_<ver>_darwin_amd64.tar.gz` |
+| macOS | Apple Silicon | `hermond_<ver>_darwin_arm64.tar.gz` |
+| Windows | x86_64 | `hermond_<ver>_windows_amd64.zip` |
+| Windows | ARM64 | `hermond_<ver>_windows_arm64.zip` |
+
+Extract the binary, move it to a directory in your PATH, and you're done.
+
+> **Detailed instructions** for all platforms (including Windows PATH setup and checksum verification) are in [INSTALL.md](INSTALL.md).
+
+### Verify
+
+```sh
+hermond version
+```
+
+---
+
+## Quick Start
+
+### 1. Create your identity
+
+Every node needs a keypair for encryption and peer identification:
+
+```sh
+hermond identity init --alias "alice"
+```
+
+### 2. Launch Hermond
+
+Run without arguments to start the daemon and open the TUI:
+
+```sh
+hermond --port :3000
+```
+
+On another machine, join the first node:
+
+```sh
+hermond --port :4000 --peer <alice-ip>:3000
+```
+
+Nodes discover each other automatically from there — no need to manually connect every pair.
+
+### 3. Share files
+
+```sh
+# Upload a file (visible to the whole network)
+hermond upload --name "movie.mkv" --file ./movie.mkv --public
+
+# Upload a directory
+hermond upload --name "game-folder" --dir ./Elden\ Ring/ --public
+
+# Encrypt and share with a specific person
+hermond upload --name "notes.pdf" --file ./notes.pdf --share-with bob
+
+# Download from the network
+hermond download --name "movie.mkv" --output ./movie.mkv --from alice
+```
+
+---
+
+## The TUI
+
+Launch the full-screen terminal dashboard with `hermond` (or `hermond tui` to connect to a running daemon).
+
+### Network Tab
+
+Peer roster with live connection state, aliases, fingerprints, and public file counts. Select a peer and browse their shared catalog.
+
+### Transfers Tab
+
+Real-time view of all uploads and downloads with progress bars, speeds, and status (queued / active / paused / completed / failed). Pause, resume, or cancel any transfer.
+
+### Vault Tab
+
+Your file management hub. Two sub-views:
+
+- **Shares** — Everything you've uploaded, filterable by All / Public / Private (encrypted)
+- **Downloads** — Your download history with timestamps and status
+
+### Diagnostics Tab
+
+Node health dashboard: address, uptime, peer count, upload/download totals, and live metrics.
+
+### TUI Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Switch tabs |
+| `Ctrl+U` | Open upload modal |
+| `Ctrl+D` | Open download prompt |
+| `Ctrl+H` | Show help overlay |
+| `Ctrl+C` | Quit |
+
+---
+
+## CLI Reference
+
+All commands support the `--node` flag (default `:3000`) to target a specific local daemon.
+
+### Core Commands
+
+| Command | Description |
+|---------|-------------|
+| `hermond` | Start daemon + launch TUI |
+| `hermond upload --name <n> --file <f>` | Upload a file to the network |
+| `hermond upload --name <n> --dir <d>` | Upload a directory |
+| `hermond download --name <n> --output <o>` | Download a file or directory |
+| `hermond send <file-key> <peer>` | Direct-send a file to a specific peer |
+| `hermond search <query>` | Flood-search the network for files |
+
+### Upload Flags
+
+| Flag | Description |
+|------|-------------|
+| `--name`, `-k` | Name to associate with the upload |
+| `--file`, `-f` | Path to a file |
+| `--dir`, `-d` | Path to a directory |
+| `--public` | Mark as publicly browsable |
+| `--share-with` | Comma-separated aliases for ECDH encryption |
+| `--share-with-key` | Comma-separated X25519 public keys (fallback) |
+
+### Download Flags
+
+| Flag | Description |
+|------|-------------|
+| `--name`, `-k` | Name to retrieve |
+| `--output`, `-o` | Output path (optional, defaults to stdout for files) |
+| `--from` | Alias of the file owner (defaults to self) |
+| `--from-key` | Fingerprint of the owner (for duplicate aliases) |
+
+### Network & Status
+
+| Command | Description |
+|---------|-------------|
+| `hermond peers` | List connected peers |
+| `hermond browse <peer-addr>` | Browse a peer's public files |
+| `hermond status` | Show node status (uptime, peer count, files) |
+| `hermond connect <addr-or-alias>` | Manually connect to a peer |
+
+### Transfer Management
+
+| Command | Description |
+|---------|-------------|
+| `hermond transfers` | List all active transfers |
+| `hermond pause <id>` | Pause a transfer |
+| `hermond resume <id>` | Resume a paused transfer |
+| `hermond cancel <id>` | Cancel a transfer |
+
+### File Management
+
+| Command | Description |
+|---------|-------------|
+| `hermond list uploads` | Show upload history (`--public` / `--private` filters) |
+| `hermond list downloads` | Show download history |
+| `hermond list public` | Show public file catalog |
+| `hermond remove <name>` | Remove a file (propagates tombstone across cluster) |
+
+### Identity
+
+| Command | Description |
+|---------|-------------|
+| `hermond identity init --alias <name>` | Generate a new Ed25519 + X25519 keypair |
+| `hermond identity show` | Display fingerprint, alias, and public keys |
+| `hermond version` | Print version, commit, and build date |
+
+---
+
+## How It Works
+
+### Upload Flow
+
+```
+hermond upload --name "report.pdf" --file ./report.pdf --public
+              |
+              v
+  1. File split into 4 MB chunks, each SHA-256 hashed
+  2. Chunks encrypted with AES-256-GCM (random per-file DEK)
+  3. Compressed with zstd before encryption
+  4. Stored locally in content-addressed paths (SHA-256 dirs + MD5 filename)
+  5. ChunkManifest built with Merkle root for integrity
+  6. Hash ring determines N replica nodes
+  7. Chunks replicated in parallel over QUIC
+  8. Metadata persisted to local BoltDB state
+```
+
+### Download Flow
+
+```
+hermond download --name "report.pdf" --output ./out.pdf --from alice
+              |
+              v
+  1. Fetch ChunkManifest from local store or peers
+  2. Check for .part file (resume partial download if exists)
+  3. Fast-verify already-downloaded chunks against manifest
+  4. Download remaining chunks in parallel from multiple peers
+  5. Each chunk verified on-the-fly (SHA-256 vs manifest)
+  6. Bad peers banned, chunks re-fetched from alternates
+  7. Atomic rename: .part -> final file after Merkle verify
+  8. Download recorded in local state
+```
+
+### Peer Discovery
+
+```
+Node starts
+  -> Dials bootstrap peers (--peer flag)
+  -> Gossip protocol propagates membership (O(log N) convergence)
+  -> Identity metadata exchanged (alias, fingerprint, public keys)
+  -> Hash ring updated automatically
+  -> STUN-based NAT traversal for cross-subnet connectivity
+```
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                         DFS-Go Node                            │
-│                                                                │
-│  ┌──────────┐    ┌──────────────┐    ┌───────────────────┐     │
-│  │   CLI    │───▶│  Unix Socket │───▶│   Server (core)   │     │
-│  │ (cobra)  │    │   Daemon     │    │                   │     │
-│  └──────────┘    └──────────────┘    │  ┌─────────────┐  │     │
-│                                      │  │  Hash Ring  │  │     │
-│                                      │  │ (consistent │  │     │
-│                                      │  │  hashing)   │  │     │
-│                                      │  └──────┬──────┘  │     │
-│                                      │         │         │     │
-│                                      │  ┌──────▼──────┐  │     │
-│                                      │  │ Encryption  │  │     │
-│                                      │  │ (AES-256-   │  │     │
-│                                      │  │  GCM stream)│  │     │
-│                                      │  └──────┬──────┘  │     │
-│                                      │         │         │     │
-│                                      │  ┌──────▼──────┐  │     │
-│                                      │  │   Storage   │  │     │
-│                                      │  │ (CAS on     │  │     │
-│                                      │  │  disk)      │  │     │
-│                                      │  └─────────────┘  │     │
-│                                      └────────┬──────────┘     │
-│                                               │                │
-│                                      ┌────────▼──────────┐     │
-│                                      │  TCP Transport     │     │
-│                                      │  (optional mTLS)   │     │
-│                                      └────────┬──────────┘     │
-└───────────────────────────────────────────────┼────────────────┘
-                                                │
-                         ┌──────────────────────┼──────────────────────┐
-                         │                      │                      │
-                    ┌────▼────┐            ┌────▼────┐            ┌────▼────┐
-                    │ Node B  │            │ Node C  │            │ Node D  │
-                    └─────────┘            └─────────┘            └─────────┘
++-------------------------------------------------------------------+
+|                         Hermond Node                              |
+|                                                                   |
+|  +----------+    +-----------+    +---------------------------+   |
+|  | TUI      |--->| IPC       |--->|  Server (orchestrator)    |   |
+|  | (Bubble  |    | (Unix     |    |                           |   |
+|  |  Tea)    |    |  Socket)  |    |  Gossip    Hash Ring      |   |
+|  +----------+    +-----------+    |  Quorum    Heartbeat      |   |
+|  +----------+                     |  Handoff   Rebalancer     |   |
+|  | CLI      |----+               |  Selector  Anti-Entropy   |   |
+|  | (Cobra)  |    |               |  Bandwidth Transfer Mgr   |   |
+|  +----------+    |               +-------------+-------------+   |
+|                  |                             |                  |
+|                  |               +-------------v-------------+   |
+|                  |               |  Storage Engine            |   |
+|                  |               |  CAS + Chunker + Compress  |   |
+|                  |               |  + Resume + Dir Manifest   |   |
+|                  |               +-------------+-------------+   |
+|                  |                             |                  |
+|                  |               +-------------v-------------+   |
+|                  +-------------->|  QUIC Transport            |   |
+|                                  |  (TLS 1.3, per-stream)    |   |
+|                                  +-------------+-------------+   |
++---------------------------------------|---------------------------+
+                                        |
+              +-------------------------+-------------------------+
+              |                         |                         |
+        +-----v-----+            +-----v-----+            +-----v-----+
+        |  Peer B   |            |  Peer C   |            |  Peer D   |
+        +-----------+            +-----------+            +-----------+
 ```
+
+---
+
+## Package Reference
+
+Hermond is organized into isolated sub-packages with no circular dependencies.
+
+### Core
+
+| Package | Description |
+|---------|-------------|
+| `Server/` | Central orchestrator — peer lifecycle, storage, replication, message routing |
+| `Server/downloader/` | Parallel multi-source chunk fetcher with on-the-fly SHA-256 verification |
+| `Server/transfer/` | In-memory transfer registry — progress tracking, pause/resume/cancel |
+| `Server/ratelimit/` | LEDBAT-lite adaptive bandwidth — monitors QUIC RTT, auto-throttles |
+
+### Storage
+
+| Package | Description |
+|---------|-------------|
+| `Storage/` | Content-addressable store — SHA-256 directory paths, MD5 filenames, AES-GCM streaming |
+| `Storage/chunker/` | File chunking (4 MB) with SHA-256 per-chunk hashing and Merkle tree construction |
+| `Storage/compression/` | Zstandard compress/decompress layer applied before encryption |
+| `Storage/dirmanifest/` | Directory manifest — wraps N file manifests as a table of contents |
+| `Storage/resume/` | Download resume sidecar — append-only log, O(1) per chunk, fast-verify on restart |
+| `Storage/pending/` | Upload resume sidecar — crash-safe tracking of partially uploaded directories |
+
+### Cluster
+
+| Package | Description |
+|---------|-------------|
+| `Cluster/gossip/` | Push-pull epidemic protocol — O(log N) convergence, fingerprint-based self-detection |
+| `Cluster/hashring/` | Consistent hashing with 150 virtual nodes per physical node |
+| `Cluster/quorum/` | Tunable W-of-N write / R-of-N read quorum with lock-free routing |
+| `Cluster/membership/` | Node liveness tracking with generation counters (stale update prevention) |
+| `Cluster/handoff/` | Hinted handoff — buffers writes for unreachable nodes, replays on rejoin |
+| `Cluster/rebalance/` | Background chunk migration on topology changes |
+| `Cluster/selector/` | Peer selection via EWMA latency tracking — picks fastest peer per chunk |
+| `Cluster/conflict/` | Last-Write-Wins conflict resolution using wall-clock timestamps |
+| `Cluster/failure/` | Failure detection with configurable probe intervals and suspect thresholds |
+| `Cluster/vclock/` | Vector clocks for causal ordering of concurrent writes |
+| `Cluster/merkle/` | Anti-entropy Merkle tree sync — periodic diff-based replica repair |
+
+### Crypto
+
+| Package | Description |
+|---------|-------------|
+| `Crypto/identity/` | Per-node Ed25519 (signing) + X25519 (key exchange) keypairs |
+| `Crypto/envelope/` | ECDH key wrapping (`WrapDEKForRecipient` / `UnwrapDEK`) and manifest signing |
+
+### Networking
+
+| Package | Description |
+|---------|-------------|
+| `Peer2Peer/quic/` | QUIC transport — self-signed TLS 1.3, per-message streams, no head-of-line blocking |
+| `Peer2Peer/nat/` | STUN-based NAT traversal — discovers external address, LAN-only fallback on failure |
+
+### State & IPC
+
+| Package | Description |
+|---------|-------------|
+| `State/` | Persistent local state (BoltDB) — uploads, downloads, public catalog, tombstones, peers |
+| `ipc/` | Inter-process communication wire protocol — 18 opcodes for all CLI/TUI operations |
+
+### Interface
+
+| Package | Description |
+|---------|-------------|
+| `tui/` | Terminal UI (Bubble Tea) — 4 tabs, upload/download modals, keyboard-driven |
+| `tui/tabs/` | Individual tab implementations (Network, Transfers, Vault, Diagnostics) |
+| `tui/components/` | Reusable UI components (tables, modals, header, footer) |
+| `cmd/` | Cobra CLI commands and IPC client helpers |
+
+### Observability
+
+| Package | Description |
+|---------|-------------|
+| `Observability/health/` | HTTP health-check server (`/health`, `/metrics`, `/debug/pprof/*`) |
+| `Observability/metrics/` | Prometheus instrumentation (`dfs_*` metric families) |
+| `Observability/tracing/` | OpenTelemetry distributed tracing (OTLP export to Jaeger) |
+| `Observability/logging/` | Structured logging via zerolog |
+
+---
+
+## Security Model
+
+### End-to-End Encryption (ECDH)
+
+When you use `--share-with`, Hermond performs a full Diffie-Hellman key exchange:
+
+1. A random **256-bit DEK** (Data Encryption Key) is generated per file
+2. The file is encrypted with **AES-256-GCM** in 4 MB streaming chunks
+3. The DEK is wrapped for each recipient using **X25519 ECDH** — only the recipient's private key can unwrap it
+4. The manifest is signed with the uploader's **Ed25519** key for authenticity
+5. No server, relay, or intermediary ever has access to the plaintext or the DEK
+
+### Content Integrity
+
+- Every chunk is SHA-256 hashed and recorded in a **Merkle tree**
+- On download, each chunk is verified against the manifest before writing to disk
+- Corrupted chunks are discarded and re-fetched from alternate peers
+- Final file verified against the **Merkle root** before atomic rename
+
+### Identity
+
+Each node has a unique cryptographic identity:
+
+- **Ed25519** key for signing manifests and proving ownership
+- **X25519** key for ECDH key exchange
+- **Fingerprint** = first 16 hex chars of SHA-256(Ed25519 public key)
+- Fingerprints namespace all files — no name collisions between users
 
 ---
 
@@ -81,312 +442,34 @@ Upload a file from any node, and it is automatically encrypted, content-addresse
 
 | Component | Technology |
 |-----------|------------|
-| Language | **Go 1.24** |
-| CLI Framework | [Cobra](https://github.com/spf13/cobra) |
-| Environment Config | [godotenv](https://github.com/joho/godotenv) |
-| Encryption | AES-256-GCM (stdlib `crypto/aes`, `crypto/cipher`) |
-| TLS / Certificates | stdlib `crypto/tls`, `crypto/x509`, `crypto/ecdsa` (P-256) |
-| Hashing | SHA-256 (path transform), MD5 (content fingerprint) |
-| Serialization | `encoding/gob` (peer messages) |
-| IPC | Unix domain sockets (`/tmp/dfs.sock`) |
-| Build | `make build` / `make run` / `make test` |
+| Language | Go 1.24 |
+| Transport | QUIC (quic-go) with TLS 1.3 |
+| CLI | Cobra |
+| TUI | Bubble Tea + Lip Gloss |
+| Local State | BoltDB |
+| Encryption | AES-256-GCM (streaming), X25519 ECDH, Ed25519 |
+| Compression | Zstandard (zstd) |
+| Hashing | SHA-256 (integrity), MD5 (CAS filenames) |
+| Bandwidth | LEDBAT-lite (golang.org/x/time/rate) |
+| Observability | Prometheus + OpenTelemetry + zerolog |
+| CI/CD | GitHub Actions + GoReleaser |
 
 ---
 
-## Project Structure
+## Building from Source
 
-```
-DFS-Go/
-├── main.go                     # Entrypoint — executes the Cobra root command
-├── go.mod                      # Module: github.com/Faizan2005/DFS-Go
-├── Makefile                    # build / run / test targets
-├── .env                        # DFS_ENCRYPTION_KEY, DFS_ENABLE_TLS
-│
-├── cmd/                        # CLI layer (Cobra commands + daemon)
-│   ├── root.go                 #   Root command definition
-│   ├── start.go                #   `dfs start` — launches the daemon
-│   ├── upload.go               #   `dfs upload --key <k> --file <f>`
-│   ├── download.go             #   `dfs download --key <k> --output <o>`
-│   ├── daemon.go               #   Unix socket daemon loop
-│   ├── handle_client.go        #   Routes client JSON requests
-│   ├── handle_upload.go        #   Sends upload over Unix socket
-│   ├── handle_download.go      #   Sends download over Unix socket
-│   └── socket.go               #   Socket path constant
-│
-├── Server/                     # Core distributed logic
-│   └── server.go               #   Server struct, StoreData, GetData,
-│                                #   message handling, replication, hash ring
-│                                #   integration, bootstrap, peer lifecycle
-│
-├── Storage/                    # Content-addressable disk storage
-│   ├── storage.go              #   Store, CAS path transform, ReadStream,
-│   │                           #   WriteStream, MetaFile (JSON metadata)
-│   └── storage_test.go         #   Storage unit tests
-│
-├── Crypto/                     # Encryption & TLS
-│   ├── crypto.go               #   AES-256-GCM encrypt/decrypt (file + stream)
-│   │                           #   Two-layer envelope encryption
-│   ├── crypto_test.go          #   Encryption unit tests
-│   ├── tls.go                  #   CA generation, node cert signing, mTLS config
-│   │                           #   LoadMTLSConfig, LoadServerTLSConfig, etc.
-│   └── tls_test.go             #   mTLS handshake & certificate tests
-│
-├── Peer2Peer/                  # Network transport layer
-│   ├── transport.go            #   Peer & Transport interfaces
-│   ├── tcpTransport.go         #   TCP (+ optional TLS) listener, dialer,
-│   │                           #   connection handler, stream protocol
-│   ├── handshake.go            #   Handshake functions (NOPE, TLSVerify,
-│   │                           #   fingerprint pinning)
-│   ├── message.go              #   RPC struct, control byte constants
-│   └── encoding.go             #   GOB & Default decoders
-│
-├── Cluster/                    # Distributed coordination
-│   └── hashring/
-│       ├── hashring.go         #   Consistent hashing with virtual nodes
-│       │                       #   AddNode, RemoveNode, GetNodes, GetPrimaryNode
-│       └── hashring_test.go    #   Distribution uniformity, consistency tests
-│
-├── .certs/                     # Auto-generated TLS certificates (gitignored)
-└── bin/                        # Compiled binary (gitignored)
-    └── dfs
-```
-
----
-
-## How It Works
-
-### Write Flow (Upload)
-
-```
-User: dfs upload --key "report.pdf" --file ./report.pdf
-                │
-                ▼
-   1. CLI sends JSON over Unix socket
-                │
-                ▼
-   2. Daemon calls server.StoreData("report.pdf", fileReader)
-                │
-                ▼
-   3. Generate random AES-256 file key
-   4. Encrypt file in 4 MB streaming chunks → temp file
-   5. Encrypt the file key with master key (envelope encryption)
-                │
-                ▼
-   6. Store encrypted data to CAS disk path:
-      <root>/816cc/20437/d8595/.../md5hash
-                │
-                ▼
-   7. Save metadata (key → path + encrypted key) to JSON
-                │
-                ▼
-   8. Hash ring lookup: GetNodes("report.pdf", N=3)
-      → returns [Node A (self), Node C, Node D]
-                │
-                ▼
-   9. Replicate to Node C and Node D in parallel:
-      ├─ Send MessageStoreFile (gob-encoded) with encrypted key
-      └─ Stream encrypted bytes over TCP
-```
-
-### Read Flow (Download)
-
-```
-User: dfs download --key "report.pdf" --output ./out.pdf
-                │
-                ▼
-   1. CLI sends JSON over Unix socket
-                │
-                ▼
-   2. Daemon calls server.GetData("report.pdf")
-                │
-                ▼
-   3. Check local disk — found?
-      ├─ YES → Read encrypted data, decrypt with stored key, return
-      └─ NO  → Continue to step 4
-                │
-                ▼
-   4. Hash ring lookup: GetNodes("report.pdf", N=3)
-      → target specific replica nodes (not broadcast)
-                │
-                ▼
-   5. Send MessageGetFile to target peers
-                │
-                ▼
-   6. Remote peer reads encrypted data from disk
-   7. Sends MessageLocalFile + streams encrypted bytes back
-                │
-                ▼
-   8. Receiving node stores encrypted copy locally
-   9. Decrypts with stored key and returns plaintext
-                │
-                ▼
-  10. CLI writes plaintext to --output file
-```
-
-### Peer Lifecycle
-
-```
-Node starts → Adds self to hash ring
-            → Dials bootstrap peers
-            → On peer connect:  add to hash ring, store in peers map
-            → On peer disconnect: remove from hash ring, remove from peers map
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- **Go 1.24+** installed ([download](https://go.dev/dl/))
-
-### Installation
-
-```bash
-git clone https://github.com/Faizan2005/DFS-Go.git
+```sh
+git clone https://github.com/MFZNK05/DFS-Go.git
 cd DFS-Go
+go build -o hermond .
+./hermond version
 ```
 
-### Configuration
+### Running Tests
 
-Create a `.env` file (or copy the provided one):
-
-```env
-# REQUIRED: Encryption key for file encryption (change this!)
-DFS_ENCRYPTION_KEY=your-secure-random-key-here
-
-# Optional: Enable mutual TLS for peer connections
-DFS_ENABLE_TLS=true
+```sh
+go test ./...
 ```
-
-### Build
-
-```bash
-make build        # Compiles to ./bin/dfs
-```
-
-### Run a Cluster
-
-**Terminal 1 — Start Node A (port 3000):**
-
-```bash
-./bin/dfs start --port :3000
-```
-
-**Terminal 2 — Start Node B (port 4000, connects to A):**
-
-```bash
-./bin/dfs start --port :4000 --peer :3000
-```
-
-**Terminal 3 — Start Node C (port 5000, connects to A):**
-
-```bash
-./bin/dfs start --port :5000 --peer :3000 --replication 3
-```
-
-### Upload & Download
-
-```bash
-# Upload a file (connects to the local daemon via Unix socket)
-./bin/dfs upload --key "myfile" --file ./document.pdf
-
-# Download a file
-./bin/dfs download --key "myfile" --output ./retrieved.pdf
-```
-
-### Run Tests
-
-```bash
-make test         # Runs all tests with -v flag
-```
-
----
-
-## Security Model
-
-### Encryption at Rest
-
-Every file is encrypted before touching disk using a **two-layer envelope encryption** scheme:
-
-1. A **random 256-bit file key** is generated per file
-2. The file is encrypted with AES-256-GCM in **4 MB streaming chunks**, each with a unique nonce derived from the chunk index
-3. The file key is encrypted with the **master key** (derived from `DFS_ENCRYPTION_KEY` via SHA-256)
-4. Only the encrypted file key is stored in metadata — the master key never touches disk
-
-### Encryption in Transit (mTLS)
-
-When `DFS_ENABLE_TLS=true`:
-
-1. A **Certificate Authority (CA)** is auto-generated on first run (ECDSA P-256, 10-year validity)
-2. Each node gets a **CA-signed certificate** (1-year validity, auto-renewed)
-3. Peer connections use **mutual TLS** — both sides present and verify certificates
-4. `RequireAndVerifyClientCert` ensures only nodes with valid CA-signed certs can join
-5. Connections use TLS 1.2+ with modern cipher suites (X25519, P-256)
-
-### Content Integrity
-
-Files are content-addressed using SHA-256 (directory path) + MD5 (filename), ensuring:
-- Identical files map to the same path (deduplication)
-- Any bit-flip in stored data is detectable
-
----
-
-## Consistent Hashing
-
-The hash ring uses **150 virtual nodes** per physical node by default, providing:
-
-- **Uniform distribution** — Keys spread evenly across nodes (verified by tests at < 30% deviation)
-- **Minimal disruption** — Adding/removing a node only moves ~1/N of keys (tested at < 40% movement)
-- **Configurable replication** — `GetNodes(key, N)` returns N distinct physical nodes for any key
-
-```
-         ┌─────── Hash Ring ───────┐
-         │                         │
-    Node A ●                  ● Node B
-         │    ● (virtual)          │
-         │         ● (virtual)     │
-         │                         │
-    Node C ●              ● Node D │
-         │                         │
-         └─────────────────────────┘
-
-    hashKey("report.pdf") → position on ring
-    → walk clockwise → pick N distinct physical nodes
-```
-
----
-
-## Wire Protocol
-
-Peer-to-peer messages use a simple control-byte + gob encoding protocol over TCP:
-
-| Byte | Meaning | Followed By |
-|------|---------|-------------|
-| `0x1` | `IncomingMessage` | Gob-encoded `Message` struct |
-| `0x2` | `IncomingStream` | Raw byte stream (file data) |
-
-### Message Types
-
-| Type | Direction | Purpose |
-|------|-----------|---------|
-| `MessageStoreFile` | Sender → Replicas | Replicate a file (includes key, size, encrypted key) |
-| `MessageGetFile` | Requester → Replicas | Request a file by key |
-| `MessageLocalFile` | Replica → Requester | Return a file (includes key, size) |
-
----
-
-## Roadmap
-
-- [ ] **Vector Clocks** — Causality tracking with Last-Writer-Wins conflict resolution
-- [ ] **Quorum Reads/Writes** — Tunable consistency (R + W > N)
-- [ ] **Failure Detection** — Gossip-based heartbeat protocol
-- [ ] **Anti-Entropy** — Merkle tree synchronization for replica repair
-- [ ] **Hinted Handoff** — Buffer writes for temporarily unreachable nodes
-- [ ] **File Chunking** — Split large files into chunks with Merkle tree integrity
-- [ ] **Multi-Source Download** — Parallel chunk retrieval from multiple peers
-- [ ] **Compression** — zstd compression before encryption
-- [ ] **QUIC Transport** — UDP-based transport for lower latency
 
 ---
 
@@ -397,5 +480,5 @@ This project is open source under the [MIT License](LICENSE).
 ---
 
 <p align="center">
-  Built with ❤️ in Go
+  <sub>Built with Go. Shipped as a single binary.</sub>
 </p>

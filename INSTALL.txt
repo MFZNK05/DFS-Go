@@ -1,0 +1,110 @@
+================================================================================
+                        HERMOND - INSTALLATION GUIDE
+================================================================================
+
+Hermond is a single binary with no dependencies. Extract it, put it in your
+PATH, and you're ready to go.
+
+
+LINUX
+-----
+
+  1. Extract:
+     $ tar -xzf hermond_<version>_linux_amd64.tar.gz
+
+  2. Move to PATH:
+     $ sudo mv hermond /usr/local/bin/
+
+     Or without sudo:
+     $ mkdir -p ~/.local/bin
+     $ mv hermond ~/.local/bin/
+
+     If using ~/.local/bin, add it to your PATH in ~/.bashrc or ~/.zshrc:
+     $ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+     $ source ~/.bashrc
+
+  3. Verify:
+     $ hermond version
+
+
+macOS
+-----
+
+  1. Extract:
+     $ tar -xzf hermond_<version>_darwin_arm64.tar.gz
+     (use darwin_amd64 for Intel Macs)
+
+  2. Move to PATH:
+     $ sudo mv hermond /usr/local/bin/
+
+  3. If macOS blocks the binary ("developer cannot be verified"):
+     $ xattr -d com.apple.quarantine /usr/local/bin/hermond
+
+  4. Verify:
+     $ hermond version
+
+
+WINDOWS
+-------
+
+  1. Extract hermond_<version>_windows_amd64.zip
+     (Right-click > Extract All, or use 7-Zip)
+
+  2. Move hermond.exe to a permanent location, e.g.:
+     C:\Program Files\hermond\hermond.exe
+
+  3. Add the folder to your PATH:
+     a. Press Win+R, type "sysdm.cpl", press Enter
+     b. Go to Advanced tab > Environment Variables
+     c. Under System variables, find "Path", click Edit
+     d. Click New and add: C:\Program Files\hermond
+     e. Click OK on all dialogs
+
+  4. Open a NEW Command Prompt or PowerShell:
+     > hermond version
+
+  PowerShell one-liner (alternative to steps 2-3):
+     $dest = "$env:LOCALAPPDATA\hermond"
+     New-Item -ItemType Directory -Force -Path $dest
+     Move-Item hermond.exe $dest\hermond.exe
+     $p = [Environment]::GetEnvironmentVariable("Path", "User")
+     [Environment]::SetEnvironmentVariable("Path", "$p;$dest", "User")
+     # Restart your terminal after this.
+
+
+ALTERNATIVE INSTALL METHODS
+----------------------------
+
+  One-liner (Linux & macOS):
+     $ curl -sSfL https://raw.githubusercontent.com/MFZNK05/DFS-Go/main/install.sh | sh
+
+  Homebrew (macOS & Linux):
+     $ brew install MFZNK05/hermond/hermond
+
+
+GETTING STARTED
+---------------
+
+  1. Create your identity (required, one-time):
+     $ hermond identity init --alias "your-name"
+
+  2. Start Hermond (launches daemon + TUI):
+     $ hermond --port :3000
+
+  3. Join another node:
+     $ hermond --port :4000 --peer <other-ip>:3000
+
+  See USAGE.txt for the full command reference.
+
+
+UNINSTALLING
+------------
+
+  Linux/macOS:  $ rm $(which hermond)
+  Homebrew:     $ brew uninstall hermond
+  Windows:      Delete hermond.exe and remove its folder from PATH.
+
+
+================================================================================
+  https://github.com/MFZNK05/DFS-Go
+================================================================================
