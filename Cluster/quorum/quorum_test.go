@@ -2,7 +2,6 @@ package quorum_test
 
 import (
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -145,8 +144,6 @@ func TestReadQuorumPicksCausallyLater(t *testing.T) {
 	newerClock := vclock.VectorClock{"self": 1, "peer1": 1}
 
 	var coord *quorum.Coordinator
-	var mu sync.Mutex
-	_ = mu
 
 	coord = makeCoordinator(
 		"self", targets, cfg,

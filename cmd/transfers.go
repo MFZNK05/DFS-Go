@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/Faizan2005/DFS-Go/Server/transfer"
+	"github.com/Faizan2005/DFS-Go/ipc"
 	"github.com/spf13/cobra"
 )
 
@@ -31,7 +31,7 @@ var transfersCmd = &cobra.Command{
 			return err
 		}
 
-		var transfers []transfer.TransferInfo
+		var transfers []ipc.TransferInfo
 		if err := json.Unmarshal(data, &transfers); err != nil {
 			return fmt.Errorf("parse response: %w", err)
 		}
@@ -42,9 +42,10 @@ var transfersCmd = &cobra.Command{
 		}
 
 		fmt.Printf("%-10s %-10s %-8s %-20s %-12s %-12s\n", "ID", "DIR", "STATUS", "NAME", "PROGRESS", "SPEED")
+		statusNames := []string{"queued", "active", "paused", "completed", "failed"}
 		for _, t := range transfers {
 			dir := "upload"
-			if t.Direction == transfer.Download {
+			if t.Direction == 1 { // 1 == Download
 				dir = "download"
 			}
 
@@ -63,8 +64,13 @@ var transfersCmd = &cobra.Command{
 				name = name[:18] + ".."
 			}
 
+			status := "unknown"
+			if t.Status >= 0 && t.Status < len(statusNames) {
+				status = statusNames[t.Status]
+			}
+
 			fmt.Printf("%-10s %-10s %-8s %-20s %-12s %-12s\n",
-				t.ID, dir, t.Status.String(), name, progress, speed)
+				t.ID, dir, status, name, progress, speed)
 		}
 		return nil
 	},

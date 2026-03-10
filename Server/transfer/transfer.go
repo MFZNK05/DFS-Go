@@ -76,7 +76,11 @@ type TransferInfo struct {
 	FilePath  string `json:"filePath"`            // absolute local file path
 	OutputDir string `json:"outputDir,omitempty"` // for directory downloads
 	DEK       []byte `json:"-"`                   // encryption key (ECDH)
+}
 
+// trackedTransfer wraps TransferInfo with internal synchronization and cancel.
+type trackedTransfer struct {
+	TransferInfo
 	cancel context.CancelFunc
 	mu     sync.Mutex
 }
@@ -84,14 +88,14 @@ type TransferInfo struct {
 // Manager is a thread-safe in-memory registry of active transfers.
 type Manager struct {
 	mu        sync.RWMutex
-	transfers map[string]*TransferInfo
+	transfers map[string]*trackedTransfer
 	counter   uint32
 }
 
 // NewManager creates a new transfer manager.
 func NewManager() *Manager {
 	return &Manager{
-		transfers: make(map[string]*TransferInfo),
+		transfers: make(map[string]*trackedTransfer),
 	}
 }
 
@@ -102,19 +106,21 @@ func (m *Manager) Register(dir Direction, key, name, filePath string, size int64
 	id := fmt.Sprintf("%08x", atomic.AddUint32(&m.counter, 1))
 	ctx, cancel := context.WithCancel(context.Background())
 
-	t := &TransferInfo{
-		ID:        id,
-		Direction: dir,
-		Status:    Queued,
-		Key:       key,
-		Name:      name,
-		FilePath:  filePath,
-		Size:      size,
-		IsDir:     isDir,
-		Encrypted: encrypted,
-		Public:    public,
-		StartedAt: time.Now(),
-		cancel:    cancel,
+	t := &trackedTransfer{
+		TransferInfo: TransferInfo{
+			ID:        id,
+			Direction: dir,
+			Status:    Queued,
+			Key:       key,
+			Name:      name,
+			FilePath:  filePath,
+			Size:      size,
+			IsDir:     isDir,
+			Encrypted: encrypted,
+			Public:    public,
+			StartedAt: time.Now(),
+		},
+		cancel: cancel,
 	}
 
 	m.mu.Lock()
@@ -273,6 +279,11 @@ func (m *Manager) Remove(id string) {
 	m.mu.Unlock()
 }
 
+// snapshot returns a plain copy of TransferInfo. Caller must hold t.mu.
+func (t *trackedTransfer) snapshot() TransferInfo {
+	return t.TransferInfo
+}
+
 // Get returns a snapshot of a single transfer.
 func (m *Manager) Get(id string) (TransferInfo, bool) {
 	m.mu.RLock()
@@ -282,10 +293,9 @@ func (m *Manager) Get(id string) (TransferInfo, bool) {
 		return TransferInfo{}, false
 	}
 	t.mu.Lock()
-	copy := *t
+	s := t.snapshot()
 	t.mu.Unlock()
-	copy.cancel = nil // don't expose internal cancel func
-	return copy, true
+	return s, true
 }
 
 // List returns a snapshot of all active transfers.
@@ -296,10 +306,8 @@ func (m *Manager) List() []TransferInfo {
 	result := make([]TransferInfo, 0, len(m.transfers))
 	for _, t := range m.transfers {
 		t.mu.Lock()
-		copy := *t
+		result = append(result, t.snapshot())
 		t.mu.Unlock()
-		copy.cancel = nil
-		result = append(result, copy)
 	}
 	return result
 }
