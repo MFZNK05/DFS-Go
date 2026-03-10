@@ -25,6 +25,7 @@ EXPOSE 3000
 # Health/metrics port (port + 1000)
 EXPOSE 4000
 
-# Default: start a node on :3000
+# Default: start a daemon node on :3000
 # Override with: docker run ... ./dfs start --port :3000 --peer HOST:3000
-ENTRYPOINT ["./dfs", "start", "--port", ":3000"]
+ENTRYPOINT ["./dfs"]
+CMD ["start", "--port", ":3000", "--no-stun"]

@@ -14,6 +14,7 @@
 package quic
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -54,6 +55,12 @@ func (p *QUICPeer) Outbound() bool       { return p.outbound }
 func (p *QUICPeer) Close() error         { return p.conn.CloseWithError(0, "peer closed") }
 func (p *QUICPeer) CloseStream()         {} // no-op: stream closed by handleStream's defer
 
+// SmoothedRTT returns the QUIC connection's smoothed RTT estimate.
+// Satisfies the ratelimit.RTTSource interface.
+func (p *QUICPeer) SmoothedRTT() time.Duration {
+	return p.conn.ConnectionStats().SmoothedRTT
+}
+
 // Read satisfies net.Conn but should not be used directly.
 // Use RPC.StreamReader to read stream data in handlers.
 func (p *QUICPeer) Read(_ []byte) (int, error) { return 0, io.EOF }
@@ -91,20 +98,38 @@ func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
 }
 
 // SendStream sends [0x3][4-byte len][msgPayload][streamData] on one stream.
-// Flattened into a single Write call for the same reason as SendMsg.
+// Delegates to SendStreamThrottled with no writer wrapper.
 func (p *QUICPeer) SendStream(msgPayload []byte, streamData []byte) error {
+	return p.SendStreamThrottled(msgPayload, streamData, nil)
+}
+
+// SendStreamThrottled sends a message+stream frame with optional bandwidth
+// throttling. The header (control byte + length + msgPayload) is sent at wire
+// speed. Stream data is written through wrapWriter (if non-nil) via
+// io.CopyBuffer with 32 KiB slices for smooth flow control.
+func (p *QUICPeer) SendStreamThrottled(msgPayload, streamData []byte, wrapWriter func(io.Writer) io.Writer) error {
 	stream, err := p.conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
 
-	buf := make([]byte, 1+4+len(msgPayload)+len(streamData))
-	buf[0] = peer2peer.IncomingMessageWithStream
-	binary.BigEndian.PutUint32(buf[1:5], uint32(len(msgPayload)))
-	copy(buf[5:], msgPayload)
-	copy(buf[5+len(msgPayload):], streamData)
-	_, err = stream.Write(buf)
+	// Header at wire speed (tiny — control byte + length + msg).
+	hdr := make([]byte, 1+4+len(msgPayload))
+	hdr[0] = peer2peer.IncomingMessageWithStream
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(msgPayload)))
+	copy(hdr[5:], msgPayload)
+	if _, err := stream.Write(hdr); err != nil {
+		return err
+	}
+
+	// Data through optional rate-limited writer (smooth 32 KiB slices).
+	var w io.Writer = stream
+	if wrapWriter != nil {
+		w = wrapWriter(stream)
+	}
+	buf := make([]byte, 32<<10) // 32 KiB copy buffer
+	_, err = io.CopyBuffer(w, bytes.NewReader(streamData), buf)
 	return err
 }
 
@@ -171,7 +196,9 @@ func (t *Transport) Dial(addr string) error {
 	cfg := t.tlsCfg.Clone()
 	cfg.InsecureSkipVerify = true
 	cfg.NextProtos = []string{"dfs-quic"}
-	conn, err := quic.DialAddr(context.Background(), addr, cfg, dfsQUICConfig())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, addr, cfg, dfsQUICConfig())
 	if err != nil {
 		return err
 	}

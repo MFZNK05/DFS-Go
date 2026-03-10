@@ -380,5 +380,26 @@ func (gs *GossipService) HandleResponse(from string, msg *MessageGossipResponse)
 	}
 
 	// Also merge their digest in case they know something we missed.
-	gs.cluster.Merge(msg.MyDigest)
+	// Merge returns addresses where the peer has newer info. For those,
+	// apply the state directly from the digest so we don't wait for
+	// another full gossip round to converge (critical for reconnection:
+	// the peer's bumped generation must be accepted immediately).
+	needFromDigest := gs.cluster.Merge(msg.MyDigest)
+	digestMap2 := make(map[string]membership.GossipDigest, len(msg.MyDigest))
+	for _, d := range msg.MyDigest {
+		digestMap2[d.Addr] = d
+	}
+	for _, addr := range needFromDigest {
+		if addr == selfAddr {
+			continue
+		}
+		if selfFP != "" {
+			if node, ok := gs.cluster.GetNode(addr); ok && node.Metadata != nil && node.Metadata["fingerprint"] == selfFP {
+				continue
+			}
+		}
+		if d, ok := digestMap2[addr]; ok {
+			gs.cluster.UpdateState(d.Addr, d.State, d.Generation)
+		}
+	}
 }

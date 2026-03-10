@@ -27,7 +27,7 @@ var identityInitCmd = &cobra.Command{
 
 		// Check if identity already exists.
 		if existing, err := identity.Load(path); err == nil {
-			return fmt.Errorf("identity already exists at %s (alias=%q, fingerprint=%s). Delete it first to regenerate",
+			return fmt.Errorf("identity already exists at %s (alias=%q, fingerprint=%s). Identity is permanent — all your files are tied to this fingerprint",
 				path, existing.Alias, existing.Fingerprint())
 		}
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Faizan2005/DFS-Go/Crypto/envelope"
@@ -23,7 +24,7 @@ import (
 //
 // When shareWith is empty, a plaintext upload (opcode 0x01) is sent.
 // Identity is required in both cases for fingerprint-based namespacing.
-func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error {
+func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public bool) error {
 	// Load identity — required for all uploads (fingerprint namespace).
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
@@ -124,13 +125,14 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error 
 			AccessList:    accessList,
 			Signature:     sig,
 			FileSize:      fi.Size(),
+			Public:        public,
 		}
 		if err := writeECDHUploadRequest(conn, req); err != nil {
 			return fmt.Errorf("send ECDH header: %w", err)
 		}
 	} else {
 		// Plaintext path: no encryption.
-		if err := writeUploadRequest(conn, storageKey, fi.Size()); err != nil {
+		if err := writeUploadRequest(conn, storageKey, fi.Size(), public); err != nil {
 			return fmt.Errorf("send header: %w", err)
 		}
 	}
@@ -145,6 +147,14 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error 
 	}
 	resultCh := make(chan uploadResult, 1)
 	go func() {
+		// Read transfer ID sent by daemon before progress.
+		tid, err := readTransferID(conn)
+		if err != nil {
+			resultCh <- uploadResult{err: err}
+			return
+		}
+		fmt.Printf("Transfer %s started\n", tid)
+
 		for {
 			completed, total, isProgress, finalOK, msg, err := readProgressOrStatus(conn)
 			if err != nil {
@@ -185,6 +195,11 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string) error 
 		return fmt.Errorf("upload failed: %s", res.msg)
 	}
 	fmt.Println("Uploaded:", res.msg)
+
+	// Auto-notify share-with recipients so the file appears in their inbox.
+	if shareWith != "" {
+		autoNotifyRecipients(sockPath, storageKey, shareWith)
+	}
 	return nil
 }
 
@@ -278,4 +293,178 @@ func resolveRecipients(conn net.Conn, shareWith, shareWithKey, sockPath string) 
 	}
 
 	return recipients, nil
+}
+
+// UploadDirectory uploads a directory to the daemon via Unix socket IPC.
+//
+// The CLI sends the absolute directory path to the daemon, which walks and
+// uploads each file individually, then creates a DirectoryManifest.
+// Progress updates show per-file and per-chunk status.
+func UploadDirectory(name, dirPath, shareWith, shareWithKey, sockPath string, public bool) error {
+	id, err := identity.Load(identity.DefaultPath())
+	if err != nil {
+		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+	}
+
+	storageKey := id.Fingerprint() + "/" + name
+
+	absDir, err := filepath.Abs(dirPath)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if shareWith != "" || shareWithKey != "" {
+		dek := make([]byte, 32)
+		if _, err := rand.Read(dek); err != nil {
+			return fmt.Errorf("generate DEK: %w", err)
+		}
+
+		var accessList []chunker.AccessEntry
+		selfPubHex := hex.EncodeToString(id.X25519Pub)
+		selfEntry, err := envelope.WrapDEKForRecipient(id.X25519Priv, selfPubHex, dek)
+		if err != nil {
+			return fmt.Errorf("wrap DEK for self: %w", err)
+		}
+		accessList = append(accessList, chunker.AccessEntry{
+			RecipientPubKey: selfEntry.RecipientPubKey,
+			WrappedDEK:      selfEntry.WrappedDEK,
+		})
+
+		recipients, err := resolveRecipients(conn, shareWith, shareWithKey, sockPath)
+		if err != nil {
+			return err
+		}
+		for _, recip := range recipients {
+			entry, err := envelope.WrapDEKForRecipient(id.X25519Priv, recip.x25519PubHex, dek)
+			if err != nil {
+				return fmt.Errorf("wrap DEK for %s: %w", recip.label, err)
+			}
+			accessList = append(accessList, chunker.AccessEntry{
+				RecipientPubKey: entry.RecipientPubKey,
+				WrappedDEK:      entry.WrappedDEK,
+			})
+		}
+
+		ownerPubHex := hex.EncodeToString(id.X25519Pub)
+		ownerEdPubHex := hex.EncodeToString(id.Ed25519Pub)
+		envelopeAccessList := make([]envelope.AccessEntry, len(accessList))
+		for i, a := range accessList {
+			envelopeAccessList[i] = envelope.AccessEntry{
+				RecipientPubKey: a.RecipientPubKey,
+				WrappedDEK:      a.WrappedDEK,
+			}
+		}
+		sig, err := envelope.SignManifest(id.Ed25519Priv, envelope.ManifestSigningPayload{
+			FileKey:     storageKey,
+			OwnerPubKey: ownerPubHex,
+			Encrypted:   true,
+			AccessList:  envelopeAccessList,
+		})
+		if err != nil {
+			return fmt.Errorf("sign manifest: %w", err)
+		}
+
+		conn.Close()
+		conn, err = net.Dial("unix", sockPath)
+		if err != nil {
+			return err
+		}
+
+		req := ecdhDirUploadRequest{
+			StorageKey:    storageKey,
+			DirPath:       absDir,
+			DEK:           dek,
+			OwnerPubKey:   ownerPubHex,
+			OwnerEdPubKey: ownerEdPubHex,
+			AccessList:    accessList,
+			Signature:     sig,
+			Public:        public,
+		}
+		if err := writeECDHDirUploadRequest(conn, req); err != nil {
+			return fmt.Errorf("send ECDH dir upload header: %w", err)
+		}
+	} else {
+		if err := writeDirUploadRequest(conn, storageKey, absDir, public); err != nil {
+			return fmt.Errorf("send dir upload header: %w", err)
+		}
+	}
+
+	// Read transfer ID from daemon.
+	tid, err := readTransferID(conn)
+	if err != nil {
+		return fmt.Errorf("read transfer ID: %w", err)
+	}
+	fmt.Printf("Transfer %s started\n", tid)
+
+	// Read progress updates until final status.
+	for {
+		fileIdx, fileTotal, chunkIdx, chunkTotal, isProgress, finalOK, msg, err := readDirProgressOrStatus(conn)
+		if err != nil {
+			return fmt.Errorf("read progress: %w", err)
+		}
+		if isProgress {
+			if chunkTotal > 0 {
+				pct := float64(chunkIdx) / float64(chunkTotal) * 100
+				fmt.Printf("\rFile %d/%d — chunk %d/%d (%.0f%%)", fileIdx, fileTotal, chunkIdx, chunkTotal, pct)
+			} else {
+				fmt.Printf("\rFile %d/%d — uploading...", fileIdx, fileTotal)
+			}
+			continue
+		}
+		fmt.Println()
+		if !finalOK {
+			return fmt.Errorf("upload failed: %s", msg)
+		}
+		fmt.Println("Uploaded:", msg)
+
+		// Auto-notify share-with recipients so the file appears in their inbox.
+		if shareWith != "" {
+			autoNotifyRecipients(sockPath, storageKey, shareWith)
+		}
+		return nil
+	}
+}
+
+// autoNotifyRecipients sends DirectShare notifications to each comma-separated
+// alias after a successful ECDH upload. Best-effort: errors are logged but don't
+// fail the upload.
+func autoNotifyRecipients(sockPath, storageKey, shareWith string) {
+	for _, alias := range strings.Split(shareWith, ",") {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		notifyConn, err := net.Dial("unix", sockPath)
+		if err != nil {
+			fmt.Printf("  (could not notify %s: %v)\n", alias, err)
+			continue
+		}
+		if _, err := notifyConn.Write([]byte{opcodeSendToPeer}); err != nil {
+			notifyConn.Close()
+			continue
+		}
+		if err := writeString16(notifyConn, storageKey); err != nil {
+			notifyConn.Close()
+			continue
+		}
+		if err := writeString16(notifyConn, alias); err != nil {
+			notifyConn.Close()
+			continue
+		}
+		ok, msg, err := readStatus(notifyConn)
+		notifyConn.Close()
+		if err == nil && ok {
+			fmt.Printf("  Notified %s: %s\n", alias, msg)
+		} else if err != nil {
+			fmt.Printf("  (notify %s failed: %v)\n", alias, err)
+		} else {
+			fmt.Printf("  (notify %s: %s)\n", alias, msg)
+		}
+	}
 }

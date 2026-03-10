@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/Faizan2005/DFS-Go/Crypto/identity"
 	"github.com/spf13/cobra"
 )
 
@@ -16,13 +17,36 @@ var (
 
 var downloadCmd = &cobra.Command{
 	Use:   "download",
-	Short: "Download a file from the network using a name",
-	Long:  `Downloads a file from the distributed network using its unique name.`,
+	Short: "Download a file or directory from the network using a name",
+	Long:  `Downloads a file or directory from the distributed network using its unique name. Directory detection is automatic.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if downloadName == "" {
 			return fmt.Errorf("name is required")
 		}
-		return DownloadFile(downloadName, outputFile, downloadFrom, downloadFromKey, socketPath(downloadNode))
+		sock := socketPath(downloadNode)
+
+		// Unified stat: one IPC round-trip tells us if it's a file or directory.
+		id, err := identity.Load(identity.DefaultPath())
+		if err != nil {
+			return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+		}
+		ownerFingerprint, err := resolveOwner(id, downloadFrom, downloadFromKey, sock)
+		if err != nil {
+			return err
+		}
+		storageKey := ownerFingerprint + "/" + downloadName
+		resp, err := fetchManifestInfo(storageKey, sock)
+		if err != nil {
+			return err
+		}
+
+		if resp.IsDirectory {
+			if outputFile == "" {
+				return fmt.Errorf("--output is required for directory downloads (target directory path)")
+			}
+			return DownloadDirectory(downloadName, outputFile, downloadFrom, downloadFromKey, sock)
+		}
+		return DownloadFile(downloadName, outputFile, downloadFrom, downloadFromKey, sock)
 	},
 }
 

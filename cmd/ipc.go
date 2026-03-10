@@ -6,39 +6,49 @@ import (
 	"io"
 	"net"
 
-	server "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
+	"github.com/Faizan2005/DFS-Go/ipc"
 )
 
-// Binary IPC protocol over Unix socket.
-//
-// Opcodes:
-//   0x01 — Plaintext upload
-//   0x02 — Plaintext download
-//   0x03 — ECDH encrypted upload
-//   0x04 — ECDH download (raw DEK)
-//   0x05 — Get manifest info (ECDH fields)
-//   0x06 — Resolve alias → fingerprint + keys
-
+// Local aliases for brevity — avoids ipc.StatusOK everywhere in handlers.
 const (
-	opcodeUpload             byte = 0x01
-	opcodeDownload           byte = 0x02
-	opcodeECDHUpload         byte = 0x03
-	opcodeECDHDownload       byte = 0x04
-	opcodeGetManifest        byte = 0x05
-	opcodeResolveAlias       byte = 0x06
-	opcodeDownloadToFile     byte = 0x07 // direct-to-disk plaintext download
-	opcodeECDHDownloadToFile byte = 0x08 // direct-to-disk ECDH download
-	statusOK                 byte = 0x00
-	statusError              byte = 0x01
-	statusProgress           byte = 0x02 // progress update (not final)
+	opcodeUpload             = ipc.OpUpload
+	opcodeDownload           = ipc.OpDownload
+	opcodeECDHUpload         = ipc.OpECDHUpload
+	opcodeECDHDownload       = ipc.OpECDHDownload
+	opcodeGetManifest        = ipc.OpGetManifest
+	opcodeResolveAlias       = ipc.OpResolveAlias
+	opcodeDownloadToFile     = ipc.OpDownloadToFile
+	opcodeECDHDownloadToFile = ipc.OpECDHDownloadToFile
+	opcodeDirUpload          = ipc.OpDirUpload
+	opcodeDirDownload        = ipc.OpDirDownload
+	opcodeECDHDirUpload      = ipc.OpECDHDirUpload
+	opcodeECDHDirDownload    = ipc.OpECDHDirDownload
+	opcodeListUploads        = ipc.OpListUploads
+	opcodeListDownloads      = ipc.OpListDownloads
+	opcodeBrowsePeer         = ipc.OpBrowsePeer
+	opcodeListPeers          = ipc.OpListPeers
+	opcodeNodeStatus         = ipc.OpNodeStatus
+	opcodeListTransfers      = ipc.OpListTransfers
+	opcodeCancelTransfer     = ipc.OpCancelTransfer
+	opcodePauseTransfer      = ipc.OpPauseTransfer
+	opcodeResumeTransfer     = ipc.OpResumeTransfer
+	opcodeRemoveFile         = ipc.OpRemoveFile
+	opcodeSearch             = ipc.OpSearch
+	opcodeConnectPeer        = ipc.OpConnectPeer
+	opcodeDisconnectPeer     = ipc.OpDisconnectPeer
+	opcodeFullBrowse         = ipc.OpFullBrowse
+	opcodeSendToPeer         = ipc.OpSendToPeer
+	opcodeListInbox          = ipc.OpListInbox
+	opcodeUnblockPeer        = ipc.OpUnblockPeer
+	statusOK                 = ipc.StatusOK
+	statusError              = ipc.StatusError
+	statusProgress           = ipc.StatusProgress
 )
 
 // ── Plaintext upload (0x01) ──────────────────────────────────────────
 
-// writeUploadRequest sends the upload framing header.
-// Format: [0x01][2B key-len][key][8B file-size]
-func writeUploadRequest(conn net.Conn, key string, fileSize int64) error {
+func writeUploadRequest(conn net.Conn, key string, fileSize int64, public bool) error {
 	keyBytes := []byte(key)
 	if len(keyBytes) > 0xFFFF {
 		return fmt.Errorf("key too long (max 65535 bytes)")
@@ -56,12 +66,18 @@ func writeUploadRequest(conn net.Conn, key string, fileSize int64) error {
 	}
 	var sz [8]byte
 	binary.BigEndian.PutUint64(sz[:], uint64(fileSize))
-	_, err := conn.Write(sz[:])
+	if _, err := conn.Write(sz[:]); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if public {
+		pubByte = 0x01
+	}
+	_, err := conn.Write([]byte{pubByte})
 	return err
 }
 
-// readUploadRequest reads the upload framing header on the daemon side.
-func readUploadRequest(conn net.Conn) (key string, fileSize int64, err error) {
+func readUploadRequest(conn net.Conn) (key string, fileSize int64, public bool, err error) {
 	var klenBuf [2]byte
 	if _, err = io.ReadFull(conn, klenBuf[:]); err != nil {
 		return
@@ -77,37 +93,78 @@ func readUploadRequest(conn net.Conn) (key string, fileSize int64, err error) {
 		return
 	}
 	fileSize = int64(binary.BigEndian.Uint64(szBuf[:]))
+	var pubBuf [1]byte
+	if _, err = io.ReadFull(conn, pubBuf[:]); err != nil {
+		return
+	}
+	public = pubBuf[0] == 0x01
 	return
 }
 
-// ── Status (upload responses) ────────────────────────────────────────
+// ── Delegated to ipc package ─────────────────────────────────────────
 
 func writeStatus(conn net.Conn, status byte, msg string) {
-	msgBytes := []byte(msg)
-	var mlen [4]byte
-	binary.BigEndian.PutUint32(mlen[:], uint32(len(msgBytes)))
-	conn.Write([]byte{status})
-	conn.Write(mlen[:])
-	conn.Write(msgBytes)
+	ipc.WriteStatus(conn, status, msg)
 }
 
 func readStatus(conn net.Conn) (ok bool, msg string, err error) {
-	var statusBuf [1]byte
-	if _, err = io.ReadFull(conn, statusBuf[:]); err != nil {
-		return
-	}
-	var mlenBuf [4]byte
-	if _, err = io.ReadFull(conn, mlenBuf[:]); err != nil {
-		return
-	}
-	mlen := binary.BigEndian.Uint32(mlenBuf[:])
-	msgBuf := make([]byte, mlen)
-	if _, err = io.ReadFull(conn, msgBuf); err != nil {
-		return
-	}
-	ok = statusBuf[0] == statusOK
-	msg = string(msgBuf)
-	return
+	return ipc.ReadStatus(conn)
+}
+
+func writeString16(conn net.Conn, s string) error {
+	return ipc.WriteString16(conn, s)
+}
+
+func writeString16NoErr(conn net.Conn, s string) {
+	ipc.WriteString16NoErr(conn, s)
+}
+
+func readString16(conn net.Conn) (string, error) {
+	return ipc.ReadString16(conn)
+}
+
+func writeJSONResponse(conn net.Conn, data interface{}) {
+	ipc.WriteJSONResponse(conn, data)
+}
+
+func readJSONResponse(conn net.Conn) ([]byte, error) {
+	return ipc.ReadJSONResponse(conn)
+}
+
+func writeDownloadResponse(conn net.Conn, contentLen int64) {
+	ipc.WriteDownloadResponse(conn, contentLen)
+}
+
+func writeDownloadError(conn net.Conn, errMsg string) {
+	ipc.WriteDownloadError(conn, errMsg)
+}
+
+func readDownloadResponseHeader(conn net.Conn) (ok bool, contentLen int64, err error) {
+	return ipc.ReadDownloadResponseHeader(conn)
+}
+
+func writeProgressUpdate(conn net.Conn, completed, total int) {
+	ipc.WriteProgressUpdate(conn, completed, total)
+}
+
+func readProgressOrStatus(conn net.Conn) (completed, total int, isProgress bool, finalOK bool, msg string, err error) {
+	return ipc.ReadProgressOrStatus(conn)
+}
+
+func writeDirProgressUpdate(conn net.Conn, fileIdx, fileTotal, chunkIdx, chunkTotal int) {
+	ipc.WriteDirProgressUpdate(conn, fileIdx, fileTotal, chunkIdx, chunkTotal)
+}
+
+func readDirProgressOrStatus(conn net.Conn) (fileIdx, fileTotal, chunkIdx, chunkTotal int, isProgress bool, finalOK bool, msg string, err error) {
+	return ipc.ReadDirProgressOrStatus(conn)
+}
+
+func writeTransferID(conn net.Conn, tid string) {
+	ipc.WriteTransferID(conn, tid)
+}
+
+func readTransferID(conn net.Conn) (string, error) {
+	return ipc.ReadTransferID(conn)
 }
 
 // ── Plaintext download (0x02) ────────────────────────────────────────
@@ -141,87 +198,29 @@ func readDownloadRequest(conn net.Conn) (key string, err error) {
 	return
 }
 
-func writeDownloadResponse(conn net.Conn, contentLen int64) {
-	var cl [8]byte
-	binary.BigEndian.PutUint64(cl[:], uint64(contentLen))
-	conn.Write([]byte{statusOK})
-	conn.Write(cl[:])
-}
-
-func writeDownloadError(conn net.Conn, errMsg string) {
-	msgBytes := []byte(errMsg)
-	var cl [8]byte
-	binary.BigEndian.PutUint64(cl[:], uint64(len(msgBytes)))
-	conn.Write([]byte{statusError})
-	conn.Write(cl[:])
-	conn.Write(msgBytes)
-}
-
-func readDownloadResponseHeader(conn net.Conn) (ok bool, contentLen int64, err error) {
-	var statusBuf [1]byte
-	if _, err = io.ReadFull(conn, statusBuf[:]); err != nil {
-		return
-	}
-	var clBuf [8]byte
-	if _, err = io.ReadFull(conn, clBuf[:]); err != nil {
-		return
-	}
-	ok = statusBuf[0] == statusOK
-	contentLen = int64(binary.BigEndian.Uint64(clBuf[:]))
-	return
-}
-
 // ── ECDH Upload (0x03) ───────────────────────────────────────────────
-//
-// Format: [0x03][2B key-len][storageKey]
-//         [32B dek]
-//         [2B owner-x25519-len][owner_x25519_hex]
-//         [2B owner-ed25519-len][owner_ed25519_hex]
-//         [2B access-count]
-//           for each: [2B recip-pub-len][recip_pub_hex][2B wdek-len][wdek_hex]
-//         [2B sig-len][sig_hex]
-//         [8B file-size]
-//         [raw plaintext bytes]
 
-// ecdhUploadRequest holds all fields parsed from an ECDH upload IPC message.
-type ecdhUploadRequest struct {
-	StorageKey    string
-	DEK           []byte
-	OwnerPubKey   string
-	OwnerEdPubKey string
-	AccessList    []chunker.AccessEntry
-	Signature     string
-	FileSize      int64
-}
+type ecdhUploadRequest = ipc.ECDHUploadRequest
 
 func writeECDHUploadRequest(conn net.Conn, req ecdhUploadRequest) error {
-	keyBytes := []byte(req.StorageKey)
-	if len(keyBytes) > 0xFFFF {
-		return fmt.Errorf("key too long (max 65535 bytes)")
-	}
 	if _, err := conn.Write([]byte{opcodeECDHUpload}); err != nil {
 		return err
 	}
-	// storageKey
 	if err := writeString16(conn, req.StorageKey); err != nil {
 		return err
 	}
-	// 32-byte DEK
 	if len(req.DEK) != 32 {
 		return fmt.Errorf("DEK must be 32 bytes, got %d", len(req.DEK))
 	}
 	if _, err := conn.Write(req.DEK); err != nil {
 		return err
 	}
-	// owner X25519 pub
 	if err := writeString16(conn, req.OwnerPubKey); err != nil {
 		return err
 	}
-	// owner Ed25519 pub
 	if err := writeString16(conn, req.OwnerEdPubKey); err != nil {
 		return err
 	}
-	// access list
 	var count [2]byte
 	binary.BigEndian.PutUint16(count[:], uint16(len(req.AccessList)))
 	if _, err := conn.Write(count[:]); err != nil {
@@ -235,39 +234,39 @@ func writeECDHUploadRequest(conn net.Conn, req ecdhUploadRequest) error {
 			return err
 		}
 	}
-	// signature
 	if err := writeString16(conn, req.Signature); err != nil {
 		return err
 	}
-	// file size
 	var sz [8]byte
 	binary.BigEndian.PutUint64(sz[:], uint64(req.FileSize))
-	_, err := conn.Write(sz[:])
+	if _, err := conn.Write(sz[:]); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if req.Public {
+		pubByte = 0x01
+	}
+	_, err := conn.Write([]byte{pubByte})
 	return err
 }
 
 func readECDHUploadRequest(conn net.Conn) (*ecdhUploadRequest, error) {
-	// storageKey
 	storageKey, err := readString16(conn)
 	if err != nil {
 		return nil, fmt.Errorf("storageKey: %w", err)
 	}
-	// 32-byte DEK
 	dek := make([]byte, 32)
 	if _, err := io.ReadFull(conn, dek); err != nil {
 		return nil, fmt.Errorf("dek: %w", err)
 	}
-	// owner X25519 pub
 	ownerPub, err := readString16(conn)
 	if err != nil {
 		return nil, fmt.Errorf("ownerPub: %w", err)
 	}
-	// owner Ed25519 pub
 	ownerEdPub, err := readString16(conn)
 	if err != nil {
 		return nil, fmt.Errorf("ownerEdPub: %w", err)
 	}
-	// access list
 	var countBuf [2]byte
 	if _, err := io.ReadFull(conn, countBuf[:]); err != nil {
 		return nil, fmt.Errorf("accessCount: %w", err)
@@ -288,18 +287,19 @@ func readECDHUploadRequest(conn net.Conn) (*ecdhUploadRequest, error) {
 			WrappedDEK:      wrappedDEK,
 		}
 	}
-	// signature
 	sig, err := readString16(conn)
 	if err != nil {
 		return nil, fmt.Errorf("signature: %w", err)
 	}
-	// file size
 	var szBuf [8]byte
 	if _, err := io.ReadFull(conn, szBuf[:]); err != nil {
 		return nil, fmt.Errorf("fileSize: %w", err)
 	}
 	fileSize := int64(binary.BigEndian.Uint64(szBuf[:]))
-
+	var pubBuf [1]byte
+	if _, err := io.ReadFull(conn, pubBuf[:]); err != nil {
+		return nil, fmt.Errorf("public: %w", err)
+	}
 	return &ecdhUploadRequest{
 		StorageKey:    storageKey,
 		DEK:           dek,
@@ -308,11 +308,11 @@ func readECDHUploadRequest(conn net.Conn) (*ecdhUploadRequest, error) {
 		AccessList:    accessList,
 		Signature:     sig,
 		FileSize:      fileSize,
+		Public:        pubBuf[0] == 0x01,
 	}, nil
 }
 
 // ── ECDH Download (0x04) ─────────────────────────────────────────────
-// Format: [0x04][2B name-len][name][2B dek-len][dek]
 
 func writeECDHDownloadRequest(conn net.Conn, name string, dek []byte) error {
 	nameBytes := []byte(name)
@@ -361,12 +361,8 @@ func readECDHDownloadRequest(conn net.Conn) (name string, dek []byte, err error)
 }
 
 // ── Get Manifest Info (0x05) ─────────────────────────────────────────
-// Request:  [0x05][2B key-len][storageKey]
-// Response: [status][1B encrypted: 0x00=plain, 0x01=ecdh]
-//   If encrypted=0x01:
-//     [2B owner-pub-len][owner_x25519_hex]
-//     [2B access-count]
-//       for each: [2B recip-len][recip_hex][2B wdek-len][wdek_hex]
+
+type manifestInfoResponse = ipc.ManifestInfoResponse
 
 func writeGetManifestRequest(conn net.Conn, name string) error {
 	nameBytes := []byte(name)
@@ -385,25 +381,20 @@ func writeGetManifestRequest(conn net.Conn, name string) error {
 	return err
 }
 
-// manifestInfoResponse holds ECDH manifest fields returned to the CLI.
-type manifestInfoResponse struct {
-	Encrypted  bool
-	OwnerPub   string
-	AccessList []chunker.AccessEntry
-}
-
-func writeECDHManifestInfoResponse(conn net.Conn, manifest *chunker.ChunkManifest) {
+func writeManifestInfoResponse(conn net.Conn, manifest *chunker.ChunkManifest, isDirectory bool) {
 	encByte := byte(0x00)
 	if manifest.Encrypted {
 		encByte = 0x01
 	}
-	conn.Write([]byte{statusOK, encByte})
+	dirByte := byte(0x00)
+	if isDirectory {
+		dirByte = 0x01
+	}
+	conn.Write([]byte{statusOK, encByte, dirByte})
 	if !manifest.Encrypted {
 		return
 	}
-	// owner X25519 pub
 	writeString16NoErr(conn, manifest.OwnerPubKey)
-	// access list
 	var count [2]byte
 	binary.BigEndian.PutUint16(count[:], uint16(len(manifest.AccessList)))
 	conn.Write(count[:])
@@ -414,35 +405,33 @@ func writeECDHManifestInfoResponse(conn net.Conn, manifest *chunker.ChunkManifes
 }
 
 func readManifestInfoResponse(conn net.Conn) (*manifestInfoResponse, error) {
-	var header [2]byte // [status][encrypted]
+	var header [3]byte
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
 		return nil, err
 	}
 	if header[0] != statusOK {
-		// Read error message from download error format
 		var clBuf [8]byte
-		io.ReadFull(conn, clBuf[:]) //nolint:errcheck
+		copy(clBuf[:2], header[1:3])
+		if _, err := io.ReadFull(conn, clBuf[2:]); err != nil {
+			return nil, err
+		}
 		cl := binary.BigEndian.Uint64(clBuf[:])
 		errMsg := make([]byte, cl)
 		io.ReadFull(conn, errMsg) //nolint:errcheck
 		return nil, fmt.Errorf("%s", errMsg)
 	}
-
 	resp := &manifestInfoResponse{
-		Encrypted: header[1] == 0x01,
+		Encrypted:   header[1] == 0x01,
+		IsDirectory: header[2] == 0x01,
 	}
 	if !resp.Encrypted {
 		return resp, nil
 	}
-
-	// owner pub
 	ownerPub, err := readString16(conn)
 	if err != nil {
 		return nil, fmt.Errorf("ownerPub: %w", err)
 	}
 	resp.OwnerPub = ownerPub
-
-	// access list
 	var countBuf [2]byte
 	if _, err := io.ReadFull(conn, countBuf[:]); err != nil {
 		return nil, fmt.Errorf("accessCount: %w", err)
@@ -467,10 +456,6 @@ func readManifestInfoResponse(conn net.Conn) (*manifestInfoResponse, error) {
 }
 
 // ── Resolve Alias (0x06) ─────────────────────────────────────────────
-// Request:  [0x06][2B alias-len][alias]
-// Response: [status][2B count]
-//   for each: [2B fp-len][fingerprint][2B x25519-len][x25519_hex]
-//             [2B ed25519-len][ed25519_hex][2B addr-len][addr]
 
 func writeResolveAliasRequest(conn net.Conn, alias string) error {
 	if _, err := conn.Write([]byte{opcodeResolveAlias}); err != nil {
@@ -483,7 +468,7 @@ func readResolveAliasRequest(conn net.Conn) (string, error) {
 	return readString16(conn)
 }
 
-func writeResolveAliasResponse(conn net.Conn, results []server.AliasResult) {
+func writeResolveAliasResponse(conn net.Conn, results []ipc.AliasResult) {
 	conn.Write([]byte{statusOK})
 	var count [2]byte
 	binary.BigEndian.PutUint16(count[:], uint16(len(results)))
@@ -496,7 +481,7 @@ func writeResolveAliasResponse(conn net.Conn, results []server.AliasResult) {
 	}
 }
 
-func readResolveAliasResponse(conn net.Conn) ([]server.AliasResult, error) {
+func readResolveAliasResponse(conn net.Conn) ([]ipc.AliasResult, error) {
 	var statusBuf [1]byte
 	if _, err := io.ReadFull(conn, statusBuf[:]); err != nil {
 		return nil, err
@@ -514,7 +499,7 @@ func readResolveAliasResponse(conn net.Conn) ([]server.AliasResult, error) {
 		return nil, err
 	}
 	count := int(binary.BigEndian.Uint16(countBuf[:]))
-	results := make([]server.AliasResult, count)
+	results := make([]ipc.AliasResult, count)
 	for i := 0; i < count; i++ {
 		fp, err := readString16(conn)
 		if err != nil {
@@ -532,7 +517,7 @@ func readResolveAliasResponse(conn net.Conn) ([]server.AliasResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		results[i] = server.AliasResult{
+		results[i] = ipc.AliasResult{
 			Fingerprint:   fp,
 			X25519PubHex:  x25519,
 			Ed25519PubHex: ed25519,
@@ -542,43 +527,7 @@ func readResolveAliasResponse(conn net.Conn) ([]server.AliasResult, error) {
 	return results, nil
 }
 
-// ── String helpers ───────────────────────────────────────────────────
-
-func writeString16(conn net.Conn, s string) error {
-	b := []byte(s)
-	if len(b) > 0xFFFF {
-		return fmt.Errorf("string too long (max 65535 bytes)")
-	}
-	var slen [2]byte
-	binary.BigEndian.PutUint16(slen[:], uint16(len(b)))
-	if _, err := conn.Write(slen[:]); err != nil {
-		return err
-	}
-	_, err := conn.Write(b)
-	return err
-}
-
-func writeString16NoErr(conn net.Conn, s string) {
-	_ = writeString16(conn, s)
-}
-
-func readString16(conn net.Conn) (string, error) {
-	var slenBuf [2]byte
-	if _, err := io.ReadFull(conn, slenBuf[:]); err != nil {
-		return "", err
-	}
-	slen := binary.BigEndian.Uint16(slenBuf[:])
-	buf := make([]byte, slen)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return "", err
-	}
-	return string(buf), nil
-}
-
 // ── Download-to-File (0x07) ───────────────────────────────────────────
-// Request:  [0x07][2B key-len][key][2B path-len][absoluteFilePath]
-// Response: N × [statusProgress][4B completed][4B total]
-//           then [statusOK/statusError][4B msg-len][msg]
 
 func writeDownloadToFileRequest(conn net.Conn, key, filePath string) error {
 	if _, err := conn.Write([]byte{opcodeDownloadToFile}); err != nil {
@@ -600,7 +549,6 @@ func readDownloadToFileRequest(conn net.Conn) (key, filePath string, err error) 
 }
 
 // ── ECDH Download-to-File (0x08) ─────────────────────────────────────
-// Request:  [0x08][2B key-len][key][2B path-len][absoluteFilePath][2B dek-len][dek]
 
 func writeECDHDownloadToFileRequest(conn net.Conn, key, filePath string, dek []byte) error {
 	if _, err := conn.Write([]byte{opcodeECDHDownloadToFile}); err != nil {
@@ -640,47 +588,286 @@ func readECDHDownloadToFileRequest(conn net.Conn) (key, filePath string, dek []b
 	return
 }
 
-// ── Progress updates (sent during download-to-file) ───────────────────
+// ── Browse Peer (0x0F) ──────────────────────────────────────────────
 
-func writeProgressUpdate(conn net.Conn, completed, total int) {
-	var buf [9]byte
-	buf[0] = statusProgress
-	binary.BigEndian.PutUint32(buf[1:], uint32(completed))
-	binary.BigEndian.PutUint32(buf[5:], uint32(total))
-	conn.Write(buf[:]) //nolint:errcheck
+func writeBrowsePeerRequest(conn net.Conn, peerAddr string) error {
+	if _, err := conn.Write([]byte{opcodeBrowsePeer}); err != nil {
+		return err
+	}
+	return writeString16(conn, peerAddr)
 }
 
-// readProgressOrStatus reads either a progress update or a final status.
-// Returns (completed, total, true, "", nil) for progress updates.
-// Returns (0, 0, false, msg, nil) for final status (ok/error indicated by first return).
-func readProgressOrStatus(conn net.Conn) (completed, total int, isProgress bool, finalOK bool, msg string, err error) {
-	var statusBuf [1]byte
-	if _, err = io.ReadFull(conn, statusBuf[:]); err != nil {
-		return
-	}
+func readBrowsePeerRequest(conn net.Conn) (peerAddr string, err error) {
+	return readString16(conn)
+}
 
-	if statusBuf[0] == statusProgress {
-		var buf [8]byte
-		if _, err = io.ReadFull(conn, buf[:]); err != nil {
-			return
-		}
-		completed = int(binary.BigEndian.Uint32(buf[:4]))
-		total = int(binary.BigEndian.Uint32(buf[4:]))
-		isProgress = true
-		return
-	}
+// ── Directory Upload (0x09) ──────────────────────────────────────────
 
-	// Final status (OK or Error).
-	var mlenBuf [4]byte
-	if _, err = io.ReadFull(conn, mlenBuf[:]); err != nil {
+func writeDirUploadRequest(conn net.Conn, key, dirPath string, public bool) error {
+	if _, err := conn.Write([]byte{opcodeDirUpload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	if err := writeString16(conn, dirPath); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if public {
+		pubByte = 0x01
+	}
+	_, err := conn.Write([]byte{pubByte})
+	return err
+}
+
+func readDirUploadRequest(conn net.Conn) (key, dirPath string, public bool, err error) {
+	key, err = readString16(conn)
+	if err != nil {
 		return
 	}
-	mlen := binary.BigEndian.Uint32(mlenBuf[:])
-	msgBuf := make([]byte, mlen)
-	if _, err = io.ReadFull(conn, msgBuf); err != nil {
+	dirPath, err = readString16(conn)
+	if err != nil {
 		return
 	}
-	finalOK = statusBuf[0] == statusOK
-	msg = string(msgBuf)
+	var pubBuf [1]byte
+	if _, err = io.ReadFull(conn, pubBuf[:]); err != nil {
+		return
+	}
+	public = pubBuf[0] == 0x01
 	return
+}
+
+// ── Directory Download (0x0A) ────────────────────────────────────────
+
+func writeDirDownloadRequest(conn net.Conn, key, outputDir string) error {
+	if _, err := conn.Write([]byte{opcodeDirDownload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	return writeString16(conn, outputDir)
+}
+
+func readDirDownloadRequest(conn net.Conn) (key, outputDir string, err error) {
+	key, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	outputDir, err = readString16(conn)
+	return
+}
+
+// ── ECDH Directory Upload (0x0B) ─────────────────────────────────────
+
+type ecdhDirUploadRequest = ipc.ECDHDirUploadRequest
+
+func writeECDHDirUploadRequest(conn net.Conn, req ecdhDirUploadRequest) error {
+	if _, err := conn.Write([]byte{opcodeECDHDirUpload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.StorageKey); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.DirPath); err != nil {
+		return err
+	}
+	if len(req.DEK) != 32 {
+		return fmt.Errorf("DEK must be 32 bytes")
+	}
+	if _, err := conn.Write(req.DEK); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.OwnerPubKey); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.OwnerEdPubKey); err != nil {
+		return err
+	}
+	var count [2]byte
+	binary.BigEndian.PutUint16(count[:], uint16(len(req.AccessList)))
+	if _, err := conn.Write(count[:]); err != nil {
+		return err
+	}
+	for _, entry := range req.AccessList {
+		if err := writeString16(conn, entry.RecipientPubKey); err != nil {
+			return err
+		}
+		if err := writeString16(conn, entry.WrappedDEK); err != nil {
+			return err
+		}
+	}
+	if err := writeString16(conn, req.Signature); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if req.Public {
+		pubByte = 0x01
+	}
+	_, err := conn.Write([]byte{pubByte})
+	return err
+}
+
+func readECDHDirUploadRequest(conn net.Conn) (*ecdhDirUploadRequest, error) {
+	storageKey, err := readString16(conn)
+	if err != nil {
+		return nil, fmt.Errorf("storageKey: %w", err)
+	}
+	dirPath, err := readString16(conn)
+	if err != nil {
+		return nil, fmt.Errorf("dirPath: %w", err)
+	}
+	dek := make([]byte, 32)
+	if _, err := io.ReadFull(conn, dek); err != nil {
+		return nil, fmt.Errorf("dek: %w", err)
+	}
+	ownerPub, err := readString16(conn)
+	if err != nil {
+		return nil, fmt.Errorf("ownerPub: %w", err)
+	}
+	ownerEdPub, err := readString16(conn)
+	if err != nil {
+		return nil, fmt.Errorf("ownerEdPub: %w", err)
+	}
+	var countBuf [2]byte
+	if _, err := io.ReadFull(conn, countBuf[:]); err != nil {
+		return nil, fmt.Errorf("accessCount: %w", err)
+	}
+	count := int(binary.BigEndian.Uint16(countBuf[:]))
+	accessList := make([]chunker.AccessEntry, count)
+	for i := 0; i < count; i++ {
+		recipPub, err := readString16(conn)
+		if err != nil {
+			return nil, err
+		}
+		wrappedDEK, err := readString16(conn)
+		if err != nil {
+			return nil, err
+		}
+		accessList[i] = chunker.AccessEntry{
+			RecipientPubKey: recipPub,
+			WrappedDEK:      wrappedDEK,
+		}
+	}
+	sig, err := readString16(conn)
+	if err != nil {
+		return nil, fmt.Errorf("signature: %w", err)
+	}
+	var pubBuf [1]byte
+	if _, err := io.ReadFull(conn, pubBuf[:]); err != nil {
+		return nil, fmt.Errorf("public: %w", err)
+	}
+	return &ecdhDirUploadRequest{
+		StorageKey:    storageKey,
+		DirPath:       dirPath,
+		DEK:           dek,
+		OwnerPubKey:   ownerPub,
+		OwnerEdPubKey: ownerEdPub,
+		AccessList:    accessList,
+		Signature:     sig,
+		Public:        pubBuf[0] == 0x01,
+	}, nil
+}
+
+// ── ECDH Directory Download (0x0C) ───────────────────────────────────
+
+func writeECDHDirDownloadRequest(conn net.Conn, key, outputDir string, dek []byte) error {
+	if _, err := conn.Write([]byte{opcodeECDHDirDownload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	if err := writeString16(conn, outputDir); err != nil {
+		return err
+	}
+	var dlen [2]byte
+	binary.BigEndian.PutUint16(dlen[:], uint16(len(dek)))
+	if _, err := conn.Write(dlen[:]); err != nil {
+		return err
+	}
+	_, err := conn.Write(dek)
+	return err
+}
+
+func readECDHDirDownloadRequest(conn net.Conn) (key, outputDir string, dek []byte, err error) {
+	key, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	outputDir, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	var dlenBuf [2]byte
+	if _, err = io.ReadFull(conn, dlenBuf[:]); err != nil {
+		return
+	}
+	dlen := binary.BigEndian.Uint16(dlenBuf[:])
+	dek = make([]byte, dlen)
+	_, err = io.ReadFull(conn, dek)
+	return
+}
+
+// ── Transfer control opcodes ─────────────────────────────────────────
+
+func writeListTransfersRequest(conn net.Conn) error {
+	_, err := conn.Write([]byte{opcodeListTransfers})
+	return err
+}
+
+func writeCancelTransferRequest(conn net.Conn, id string) error {
+	if _, err := conn.Write([]byte{opcodeCancelTransfer}); err != nil {
+		return err
+	}
+	return writeString16(conn, id)
+}
+
+func readTransferIDRequest(conn net.Conn) (string, error) {
+	return readString16(conn)
+}
+
+func writePauseTransferRequest(conn net.Conn, id string) error {
+	if _, err := conn.Write([]byte{opcodePauseTransfer}); err != nil {
+		return err
+	}
+	return writeString16(conn, id)
+}
+
+func writeResumeTransferRequest(conn net.Conn, id string) error {
+	if _, err := conn.Write([]byte{opcodeResumeTransfer}); err != nil {
+		return err
+	}
+	return writeString16(conn, id)
+}
+
+func writeRemoveFileRequest(conn net.Conn, key string) error {
+	if _, err := conn.Write([]byte{opcodeRemoveFile}); err != nil {
+		return err
+	}
+	return writeString16(conn, key)
+}
+
+func writeSearchRequest(conn net.Conn, query string) error {
+	if _, err := conn.Write([]byte{opcodeSearch}); err != nil {
+		return err
+	}
+	return writeString16(conn, query)
+}
+
+// ── Peer management (0x19, 0x1A) ────────────────────────────────────
+
+func writeConnectPeerRequest(conn net.Conn, addr string) error {
+	if _, err := conn.Write([]byte{opcodeConnectPeer}); err != nil {
+		return err
+	}
+	return writeString16(conn, addr)
+}
+
+func writeDisconnectPeerRequest(conn net.Conn, addr string) error {
+	if _, err := conn.Write([]byte{opcodeDisconnectPeer}); err != nil {
+		return err
+	}
+	return writeString16(conn, addr)
 }

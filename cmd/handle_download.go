@@ -39,10 +39,19 @@ func DownloadFile(name, outputPath, fromAlias, fromKey, sockPath string) error {
 
 	storageKey := ownerFingerprint + "/" + name
 
-	// Fetch manifest to check if file is encrypted.
+	// Fetch manifest to check if file is encrypted and whether it's a directory.
 	manifestResp, err := fetchManifestInfo(storageKey, sockPath)
 	if err != nil {
 		return err
+	}
+
+	// If it's a directory, delegate to DownloadDirectory.
+	if manifestResp.IsDirectory {
+		outputDir := outputPath
+		if outputDir == "" {
+			outputDir = name
+		}
+		return downloadDirectoryInner(storageKey, outputDir, id, manifestResp, sockPath)
 	}
 
 	// Unwrap DEK if encrypted.
@@ -86,6 +95,13 @@ func downloadToFile(storageKey, outputPath string, dek []byte, sockPath string) 
 			return fmt.Errorf("send download-to-file request: %w", err)
 		}
 	}
+
+	// Read transfer ID from daemon.
+	tid, err := readTransferID(conn)
+	if err != nil {
+		return fmt.Errorf("read transfer ID: %w", err)
+	}
+	fmt.Printf("Transfer %s started\n", tid)
 
 	// Read progress updates until final status.
 	for {
@@ -222,4 +238,95 @@ func unwrapDEK(id *identity.Identity, resp *manifestInfoResponse) ([]byte, error
 		return nil, fmt.Errorf("unwrap DEK: %w", err)
 	}
 	return dek, nil
+}
+
+// DownloadDirectory downloads a directory from the daemon via Unix socket IPC.
+//
+// The daemon fetches the DirectoryManifest, then downloads each file using
+// direct-to-disk I/O, recreating the original directory structure under outputDir.
+// Progress updates show per-file and per-chunk status.
+func DownloadDirectory(name, outputDir, fromAlias, fromKey, sockPath string) error {
+	id, err := identity.Load(identity.DefaultPath())
+	if err != nil {
+		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+	}
+
+	ownerFingerprint, err := resolveOwner(id, fromAlias, fromKey, sockPath)
+	if err != nil {
+		return err
+	}
+
+	storageKey := ownerFingerprint + "/" + name
+
+	// Fetch manifest info to check encryption (uses the unified stat).
+	manifestResp, err := fetchManifestInfo(storageKey, sockPath)
+	if err != nil {
+		return err
+	}
+
+	return downloadDirectoryInner(storageKey, outputDir, id, manifestResp, sockPath)
+}
+
+// downloadDirectoryInner is the shared directory download logic used by both
+// DownloadDirectory (CLI) and DownloadFile (auto-detect when IsDirectory).
+func downloadDirectoryInner(storageKey, outputDir string, id *identity.Identity, manifestResp *manifestInfoResponse, sockPath string) error {
+	var dek []byte
+	if manifestResp.Encrypted {
+		var err error
+		dek, err = unwrapDEK(id, manifestResp)
+		if err != nil {
+			return err
+		}
+	}
+
+	absDir, err := filepath.Abs(outputDir)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if dek != nil {
+		if err := writeECDHDirDownloadRequest(conn, storageKey, absDir, dek); err != nil {
+			return fmt.Errorf("send ECDH dir download request: %w", err)
+		}
+	} else {
+		if err := writeDirDownloadRequest(conn, storageKey, absDir); err != nil {
+			return fmt.Errorf("send dir download request: %w", err)
+		}
+	}
+
+	// Read transfer ID from daemon.
+	tid, err := readTransferID(conn)
+	if err != nil {
+		return fmt.Errorf("read transfer ID: %w", err)
+	}
+	fmt.Printf("Transfer %s started\n", tid)
+
+	// Read progress updates until final status.
+	for {
+		fileIdx, fileTotal, chunkIdx, chunkTotal, isProgress, finalOK, msg, err := readDirProgressOrStatus(conn)
+		if err != nil {
+			return fmt.Errorf("read progress: %w", err)
+		}
+		if isProgress {
+			if chunkTotal > 0 {
+				pct := float64(chunkIdx) / float64(chunkTotal) * 100
+				fmt.Printf("\rFile %d/%d — chunk %d/%d (%.0f%%)", fileIdx, fileTotal, chunkIdx, chunkTotal, pct)
+			} else {
+				fmt.Printf("\rFile %d/%d — downloading...", fileIdx, fileTotal)
+			}
+			continue
+		}
+		fmt.Println()
+		if !finalOK {
+			return fmt.Errorf("download failed: %s", msg)
+		}
+		fmt.Printf("Downloaded → %s\n", outputDir)
+		return nil
+	}
 }

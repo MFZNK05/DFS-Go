@@ -22,3 +22,9 @@ func socketPath(port string) string {
 func GetSocketPath() string {
 	return socketPath(":3000")
 }
+
+// SocketPath returns the Unix socket path for a given node port string.
+// Exported for use by the TUI package.
+func SocketPath(port string) string {
+	return socketPath(port)
+}

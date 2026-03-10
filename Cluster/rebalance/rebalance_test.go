@@ -50,6 +50,9 @@ func (m *mockMeta) Keys() []string {
 
 func (m *mockMeta) GetManifest(_ string) (*chunker.ChunkManifest, bool) { return nil, false }
 func (m *mockMeta) SetManifest(_ string, _ *chunker.ChunkManifest) error { return nil }
+func (m *mockMeta) GetDirManifest(_ string) ([]byte, bool)              { return nil, false }
+func (m *mockMeta) SetDirManifest(_ string, _ []byte) error             { return nil }
+func (m *mockMeta) WithBatch(fn func(storage.MetadataBatch) error) error { return fn(m) }
 
 // makeRing builds a ring with the given nodes and replication factor.
 func makeRing(replFactor int, nodes ...string) *hashring.HashRing {

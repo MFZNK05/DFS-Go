@@ -128,6 +128,15 @@ func (cs *ClusterState) AddNode(addr string, meta map[string]string) {
 	cs.fireChange(addr, StateAlive, StateAlive) // newly discovered → Alive
 }
 
+// RemoveNode deletes a node entirely from the cluster table. Use this only
+// for ephemeral addresses that were remapped to a canonical address — these
+// entries are implementation artifacts and should not linger in the table.
+func (cs *ClusterState) RemoveNode(addr string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	delete(cs.nodes, addr)
+}
+
 // UpdateState transitions addr to newState if generation > current generation.
 // Returns true when the update was applied, false when discarded as stale.
 // If addr is unknown it is inserted as a new node.
@@ -160,6 +169,37 @@ func (cs *ClusterState) UpdateState(addr string, newState NodeState, generation 
 
 	cs.fireChange(addr, oldState, newState)
 	return true
+}
+
+// ForceLocalState overrides a node's state using the current wall-clock time
+// as the generation. Use this for ground-truth events (e.g. socket close →
+// Dead) where the local node has cryptographic proof of the state change.
+//
+// The generation is set to time.Now().UnixNano(), which is:
+//   - Higher than the remote's current generation (set at their startup, in the past)
+//     → overrides any in-flight heartbeats still carrying the old gen
+//   - Lower than the remote's refutation generation (set via BumpSelfGeneration
+//     on reconnect, in the future) → the remote can still come back
+//
+// This implements the SWIM protocol's suspicion mechanism while respecting
+// generation ownership: only the node itself can permanently bump its gen.
+func (cs *ClusterState) ForceLocalState(addr string, newState NodeState) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	existing, ok := cs.nodes[addr]
+	if !ok {
+		return
+	}
+	newGen := uint64(time.Now().UnixNano())
+	if newGen <= existing.Generation {
+		newGen = existing.Generation + 1
+	}
+	oldState := existing.State
+	existing.State = newState
+	existing.Generation = newGen
+	existing.LastUpdated = time.Now()
+	cs.fireChange(addr, oldState, newState)
 }
 
 // SetMetadata updates the metadata map for a node.  It does not bump the
@@ -293,6 +333,28 @@ func (cs *ClusterState) NextGeneration(addr string) uint64 {
 		return n.Generation + 1
 	}
 	return 2
+}
+
+// BumpSelfGeneration bumps the self-node's generation to the current Unix
+// nanosecond timestamp, guaranteeing it is strictly higher than any stale
+// Dead/Suspect state lingering on remote peers. This implements the SWIM
+// Refutation Pattern: a node that reconnects after being declared dead
+// advertises a higher incarnation so the network accepts it as Alive again.
+// Only the self-node should call this — never bump another node's generation.
+func (cs *ClusterState) BumpSelfGeneration() {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	self, ok := cs.nodes[cs.selfAddr]
+	if !ok {
+		return
+	}
+	newGen := uint64(time.Now().UnixNano())
+	if newGen <= self.Generation {
+		newGen = self.Generation + 1
+	}
+	self.Generation = newGen
+	self.LastUpdated = time.Now()
 }
 
 // SelfAddr returns the address this node identifies itself with.

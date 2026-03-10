@@ -45,12 +45,26 @@ type PathKey struct {
 	filename string
 }
 
+// MetadataBatch is a write-only handle for batching multiple metadata writes
+// into a single durable transaction (one fsync instead of N).
+type MetadataBatch interface {
+	Set(key string, meta FileMeta) error
+	SetManifest(fileKey string, manifest *chunker.ChunkManifest) error
+	SetDirManifest(key string, data []byte) error
+}
+
 // Interface for metadata operations
 type MetadataStore interface {
 	Get(key string) (FileMeta, bool)
 	Set(key string, meta FileMeta) error
 	GetManifest(fileKey string) (*chunker.ChunkManifest, bool)
 	SetManifest(fileKey string, manifest *chunker.ChunkManifest) error
+	GetDirManifest(key string) ([]byte, bool)
+	SetDirManifest(key string, data []byte) error
+	// WithBatch executes fn within a single durable transaction.
+	// All Set/SetManifest/SetDirManifest calls through the batch are
+	// committed atomically with one fsync.
+	WithBatch(fn func(batch MetadataBatch) error) error
 }
 
 func NewStore(opts StructOpts) *Store {
@@ -294,6 +308,27 @@ func (m *MetaFile) SetManifest(fileKey string, manifest *chunker.ChunkManifest) 
 	return m.Set(mkey, FileMeta{Manifest: manifest})
 }
 
+func (m *MetaFile) GetDirManifest(key string) ([]byte, bool) {
+	mkey := "dirmanifest:" + key
+	fm, ok := m.Get(mkey)
+	if !ok || fm.Path == "" {
+		return nil, false
+	}
+	return []byte(fm.Path), true // store raw JSON in Path field
+}
+
+func (m *MetaFile) SetDirManifest(key string, data []byte) error {
+	mkey := "dirmanifest:" + key
+	return m.Set(mkey, FileMeta{Path: string(data)})
+}
+
+// WithBatch for MetaFile simply calls fn with a wrapper that delegates to the
+// normal Set/SetManifest/SetDirManifest methods. No batching benefit here
+// (MetaFile rewrites on every Set), but it satisfies the interface.
+func (m *MetaFile) WithBatch(fn func(batch MetadataBatch) error) error {
+	return fn(m)
+}
+
 // ---------------------------------------------------------------------------
 // BoltMetaStore — bbolt-backed MetadataStore implementation.
 // Each Set() writes only the affected key (O(1)), replacing the O(N) full
@@ -403,4 +438,70 @@ func (b *BoltMetaStore) SetManifest(fileKey string, manifest *chunker.ChunkManif
 		bkt := tx.Bucket([]byte(boltBucketManifest))
 		return bkt.Put([]byte(fileKey), data)
 	})
+}
+
+func (b *BoltMetaStore) GetDirManifest(key string) ([]byte, bool) {
+	boltKey := "dirmanifest:" + key
+	var result []byte
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketManifest))
+		v := bkt.Get([]byte(boltKey))
+		if v == nil {
+			return os.ErrNotExist
+		}
+		result = make([]byte, len(v))
+		copy(result, v)
+		return nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func (b *BoltMetaStore) SetDirManifest(key string, data []byte) error {
+	boltKey := "dirmanifest:" + key
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte(boltBucketManifest))
+		return bkt.Put([]byte(boltKey), data)
+	})
+}
+
+// WithBatch executes fn within a single bbolt read-write transaction.
+// All writes through the MetadataBatch are committed atomically with one fsync.
+func (b *BoltMetaStore) WithBatch(fn func(batch MetadataBatch) error) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bw := &boltBatchWriter{
+			metaBkt:     tx.Bucket([]byte(boltBucketMeta)),
+			manifestBkt: tx.Bucket([]byte(boltBucketManifest)),
+		}
+		return fn(bw)
+	})
+}
+
+// boltBatchWriter implements MetadataBatch within a single bbolt transaction.
+type boltBatchWriter struct {
+	metaBkt     *bolt.Bucket
+	manifestBkt *bolt.Bucket
+}
+
+func (w *boltBatchWriter) Set(key string, meta FileMeta) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return w.metaBkt.Put([]byte(key), data)
+}
+
+func (w *boltBatchWriter) SetManifest(fileKey string, manifest *chunker.ChunkManifest) error {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return w.manifestBkt.Put([]byte(fileKey), data)
+}
+
+func (w *boltBatchWriter) SetDirManifest(key string, data []byte) error {
+	boltKey := "dirmanifest:" + key
+	return w.manifestBkt.Put([]byte(boltKey), data)
 }

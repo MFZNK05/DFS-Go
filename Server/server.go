@@ -37,10 +37,15 @@ import (
 	"github.com/Faizan2005/DFS-Go/Observability/metrics"
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
 	"github.com/Faizan2005/DFS-Go/Peer2Peer/nat"
+	quicTransport "github.com/Faizan2005/DFS-Go/Peer2Peer/quic"
 	"github.com/Faizan2005/DFS-Go/Server/downloader"
+	"github.com/Faizan2005/DFS-Go/Server/ratelimit"
+	"github.com/Faizan2005/DFS-Go/Server/transfer"
+	"github.com/Faizan2005/DFS-Go/State"
 	storage "github.com/Faizan2005/DFS-Go/Storage"
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 	"github.com/Faizan2005/DFS-Go/Storage/compression"
+	"github.com/Faizan2005/DFS-Go/Storage/dirmanifest"
 	"github.com/Faizan2005/DFS-Go/Storage/pending"
 	"github.com/Faizan2005/DFS-Go/Storage/resume"
 	"github.com/Faizan2005/DFS-Go/factory"
@@ -138,6 +143,24 @@ type Server struct {
 	// ring, cluster, and gossip — critical for Docker/NAT/cloud.
 	externalAddr   string
 	externalAddrMu sync.Mutex
+
+	// Sprint E: adaptive bandwidth management (LEDBAT-lite).
+	BandwidthMgr *ratelimit.BandwidthManager
+
+	// Sprint F: persistent local state (upload/download history, public files).
+	StateDB *State.StateDB
+
+	// Sprint G: active transfer queue (pause/resume/cancel).
+	TransferMgr *transfer.Manager
+
+	// Sprint G: search request dedup cache (flood loop prevention).
+	searchSeen *SearchRequestCache
+
+	// Connection Manager: auto-reconnection with exponential backoff.
+	backoffMu  sync.Mutex
+	backoffMap map[string]time.Time // addr → earliest next dial
+	backoffExp map[string]int       // addr → exponent (0→1min, 1→5min, 2+→1hr)
+	maxPeers   int                  // target active peer connections
 }
 
 type Message struct {
@@ -260,11 +283,14 @@ type MessageGetManifest struct {
 }
 
 // MessageManifestResponse is the reply to MessageGetManifest.
-// ManifestJSON is empty when the peer does not have the manifest.
+// ManifestJSON contains either a ChunkManifest or DirectoryManifest JSON.
+// IsDirectory distinguishes the two — the receiver unmarshals accordingly.
 type MessageManifestResponse struct {
 	FileKey      string
 	ManifestJSON []byte // nil/empty if not found
+	IsDirectory  bool   // true = DirectoryManifest, false = ChunkManifest
 }
+
 
 // MessageIdentityMeta carries a node's identity metadata (alias, fingerprint,
 // public keys) and is sent right after the announce handshake so that the remote
@@ -287,6 +313,90 @@ type MessageChunkNeed struct {
 	Missing []string // hashes the receiver needs; empty means "I have all of them"
 }
 
+// MessageGetPublicCatalog requests the remote peer's public file catalog.
+type MessageGetPublicCatalog struct{}
+
+// MessagePublicCatalogResponse carries the remote peer's public file list as JSON.
+type MessagePublicCatalogResponse struct {
+	CatalogJSON []byte // JSON-encoded []State.PublicFileEntry
+}
+
+// MessageDirectShare notifies a peer that a file has been shared with them.
+// The sender uploads the file first, then sends this notification so the
+// recipient can see it in their inbox and download it.
+type MessageDirectShare struct {
+	Key         string // storage key (fingerprint/name)
+	Name        string // human-readable file name
+	Size        int64
+	IsDir       bool
+	SenderAlias string
+	SenderFP    string // sender's fingerprint
+}
+
+// MessageDeleteFile is a P2P tombstone propagation message.
+// Only the owner (matching fingerprint) can delete a file.
+type MessageDeleteFile struct {
+	Key         string
+	Fingerprint string
+}
+
+// MessageSearchRequest is a flood-based search query.
+type MessageSearchRequest struct {
+	Query     string
+	RequestID string
+	Origin    string // originating node addr — responses sent directly here
+	TTL       int
+}
+
+// MessageSearchResponse carries search results back to the requester.
+type MessageSearchResponse struct {
+	RequestID string
+	Results   []SearchResult
+	FromNode  string
+}
+
+// SearchResult represents a single file matching a search query.
+type SearchResult struct {
+	Key        string `json:"key"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	IsDir      bool   `json:"isDir"`
+	OwnerAlias string `json:"ownerAlias"`
+	OwnerFP    string `json:"ownerFingerprint"`
+	NodeAddr   string `json:"nodeAddr"`
+}
+
+// SearchRequestCache prevents flood loops by tracking recently seen request IDs.
+type SearchRequestCache struct {
+	mu    sync.Mutex
+	items map[string]time.Time
+}
+
+// NewSearchRequestCache creates a new dedup cache.
+func NewSearchRequestCache() *SearchRequestCache {
+	return &SearchRequestCache{items: make(map[string]time.Time)}
+}
+
+// SeenOrAdd returns true if the request was already seen; otherwise records it.
+func (c *SearchRequestCache) SeenOrAdd(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.items[id]; ok {
+		return true
+	}
+	c.items[id] = time.Now()
+	// Inline GC: remove entries older than 30s.
+	if len(c.items) > 100 {
+		cutoff := time.Now().Add(-30 * time.Second)
+		for k, t := range c.items {
+			if t.Before(cutoff) {
+				delete(c.items, k)
+			}
+		}
+	}
+	return false
+}
+
 // ContentLength returns the total plaintext byte count for a stored key.
 // Returns 0 when the size is unknown (legacy single-blob files or key not found).
 func (s *Server) ContentLength(key string) int64 {
@@ -296,6 +406,12 @@ func (s *Server) ContentLength(key string) int64 {
 	}
 	if meta.Manifest != nil {
 		return meta.Manifest.TotalSize
+	}
+	// Manifest may be stored separately (replicated or fetched from peers).
+	if meta.Chunked {
+		if m, ok := s.serverOpts.metaData.GetManifest(key); ok {
+			return m.TotalSize
+		}
 	}
 	return 0
 }
@@ -333,8 +449,8 @@ func (s *Server) GetData(key string, dek []byte) (io.ReadCloser, error) {
 // on restart, and atomically renames to filePath on completion.
 //
 // The progress callback receives (completedChunks, totalChunks) after each chunk.
-func (s *Server) GetDataToFile(key string, filePath string, dek []byte, progress downloader.ProgressFunc) error {
-	manifest, err := s.ensureManifest(key)
+func (s *Server) GetDataToFile(ctx context.Context, key string, filePath string, dek []byte, progress downloader.ProgressFunc) error {
+	manifest, err := s.EnsureManifest(key)
 	if err != nil {
 		return err
 	}
@@ -393,11 +509,11 @@ func (s *Server) GetDataToFile(key string, filePath string, dek []byte, progress
 	}
 
 	if s.Downloader != nil {
-		if err := s.Downloader.DownloadToFileResumable(manifest, f, skipSet, progress, onChunkDone, dek); err != nil {
+		if err := s.Downloader.DownloadToFileResumable(ctx, manifest, f, skipSet, progress, onChunkDone, dek); err != nil {
 			return fmt.Errorf("GetDataToFile: %w", err)
 		}
 	} else {
-		if err := s.serialDownloadToFile(manifest, f, skipSet, onChunkDone, dek, progress); err != nil {
+		if err := s.serialDownloadToFile(ctx, manifest, f, skipSet, onChunkDone, dek, progress); err != nil {
 			return fmt.Errorf("GetDataToFile: %w", err)
 		}
 	}
@@ -460,8 +576,8 @@ func (s *Server) fastVerifyChunks(partPath string, manifest *chunker.ChunkManife
 	return verified
 }
 
-// ensureManifest returns the manifest for key, fetching from peers if needed.
-func (s *Server) ensureManifest(key string) (*chunker.ChunkManifest, error) {
+// EnsureManifest returns the manifest for key, fetching from peers if needed.
+func (s *Server) EnsureManifest(key string) (*chunker.ChunkManifest, error) {
 	fm, hasMeta := s.serverOpts.metaData.Get(key)
 	if hasMeta && fm.Chunked {
 		m, ok := s.serverOpts.metaData.GetManifest(key)
@@ -482,11 +598,14 @@ func (s *Server) ensureManifest(key string) (*chunker.ChunkManifest, error) {
 // serialDownloadToFile is the fallback when no Downloader is wired. Fetches
 // chunks one-by-one and writes each to dst at the correct offset.
 // Chunks in skipSet are skipped (already verified on disk).
-func (s *Server) serialDownloadToFile(manifest *chunker.ChunkManifest, dst io.WriterAt, skipSet map[int]bool, onChunkDone downloader.ChunkRecordFunc, dek []byte, progress downloader.ProgressFunc) error {
+func (s *Server) serialDownloadToFile(ctx context.Context, manifest *chunker.ChunkManifest, dst io.WriterAt, skipSet map[int]bool, onChunkDone downloader.ChunkRecordFunc, dek []byte, progress downloader.ProgressFunc) error {
 	n := len(manifest.Chunks)
 	completed := len(skipSet)
 
 	for i, info := range manifest.Chunks {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if skipSet[i] {
 			continue
 		}
@@ -804,14 +923,13 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 	}
 }
 
-// fetchManifestFromPeers retrieves a ChunkManifest from peers for key.
-// Uses MessageGetManifest / MessageManifestResponse — a direct JSON exchange
-// that does NOT go through the encrypted-stream path.
-func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, error) {
+// fetchMetadataFromPeers sends a unified metadata request to peers.
+// Returns raw JSON bytes and isDirectory flag. The caller unmarshals
+// into ChunkManifest or DirectoryManifest based on the flag.
+func (s *Server) fetchMetadataFromPeers(key string) (data []byte, isDirectory bool, err error) {
 	selfAddr := s.serverOpts.transport.Addr()
 	targetNodes := s.HashRing.GetNodes(key, s.HashRing.ReplicationFactor())
 
-	// Use a sentinel key in pendingFile to receive the async response.
 	pendingKey := "__manifest__" + key
 	ch := make(chan io.Reader, len(targetNodes))
 	s.mu.Lock()
@@ -826,7 +944,7 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 	getMsg := &Message{Payload: &MessageGetManifest{FileKey: key}}
 	buf := new(bytes.Buffer)
 	if err := gob.NewEncoder(buf).Encode(getMsg); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	msgBytes := buf.Bytes()
 
@@ -848,23 +966,39 @@ func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, err
 	s.peerLock.RUnlock()
 
 	if sent == 0 {
-		return nil, fmt.Errorf("fetchManifest: no reachable peers for '%s'", key)
+		return nil, false, fmt.Errorf("fetchMetadata: no reachable peers for '%s'", key)
 	}
 
 	select {
 	case r := <-ch:
-		data, err := io.ReadAll(r)
+		payload, err := io.ReadAll(r)
 		if err != nil {
-			return nil, fmt.Errorf("fetchManifest: read response: %w", err)
+			return nil, false, fmt.Errorf("fetchMetadata: read response: %w", err)
 		}
-		var manifest chunker.ChunkManifest
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return nil, fmt.Errorf("fetchManifest: unmarshal: %w", err)
+		if len(payload) < 1 {
+			return nil, false, fmt.Errorf("fetchMetadata: empty response")
 		}
-		return &manifest, nil
+		// First byte is type flag: 0x00=file, 0x01=directory.
+		return payload[1:], payload[0] == 0x01, nil
 	case <-time.After(10 * time.Second):
-		return nil, fmt.Errorf("timeout fetching manifest for '%s'", key)
+		return nil, false, fmt.Errorf("timeout fetching metadata for '%s'", key)
 	}
+}
+
+// fetchManifestFromPeers retrieves a ChunkManifest from peers for key.
+func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, error) {
+	data, isDir, err := s.fetchMetadataFromPeers(key)
+	if err != nil {
+		return nil, err
+	}
+	if isDir {
+		return nil, fmt.Errorf("key '%s' is a directory, not a file", key)
+	}
+	var manifest chunker.ChunkManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("fetchManifest: unmarshal: %w", err)
+	}
+	return &manifest, nil
 }
 
 // processedChunk carries all per-chunk results from Stage 1 (compress + optional encrypt)
@@ -892,11 +1026,39 @@ type EncryptionMeta struct {
 // total (may be 0 if file size was unknown).
 type UploadProgressFunc func(completed, total int)
 
-func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
-	return s.StoreDataWithProgress(key, w, enc, 0, nil)
+// StoredFileResult holds metadata collected during a deferred-metadata upload.
+// Used by StoreDirectory to batch all BoltDB writes into one transaction.
+type StoredFileResult struct {
+	ChunkMetas []ChunkMetaEntry          // per-chunk metadata (storageKey → FileMeta)
+	Manifest   *chunker.ChunkManifest    // file manifest
+	FileKey    string                     // top-level file key
+	FileMeta   storage.FileMeta           // top-level file meta
 }
 
-func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc) error {
+// ChunkMetaEntry pairs a storage key with its FileMeta for batch writing.
+type ChunkMetaEntry struct {
+	Key  string
+	Meta storage.FileMeta
+}
+
+func (s *Server) StoreData(key string, w io.Reader, enc *EncryptionMeta) error {
+	_, err := s.storeDataInternal(context.Background(), key, w, enc, 0, nil, false)
+	return err
+}
+
+func (s *Server) StoreDataWithProgress(ctx context.Context, key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc) error {
+	_, err := s.storeDataInternal(ctx, key, w, enc, fileSize, progress, false)
+	return err
+}
+
+// StoreDataCollectMeta performs a full upload (chunk, compress, encrypt, CAS
+// store, replicate) but defers the 3 BoltDB metadata writes. Returns the
+// collected metadata so the caller can batch-write them in a single transaction.
+func (s *Server) StoreDataCollectMeta(ctx context.Context, key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc) (*StoredFileResult, error) {
+	return s.storeDataInternal(ctx, key, w, enc, fileSize, progress, true)
+}
+
+func (s *Server) storeDataInternal(ctx context.Context, key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc, deferMeta bool) (*StoredFileResult, error) {
 	t0 := time.Now()
 	log.Println("STORE_DATA: Starting chunked storage for key:", key)
 	defer func() { metrics.RecordStore("store", nil, time.Since(t0)) }()
@@ -905,33 +1067,42 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 	replFactor := s.HashRing.ReplicationFactor()
 
 	// ── Resume: load any existing pending sidecar for this key ──
+	// Skip the sidecar entirely for single-chunk files (fileSize known and
+	// fits in one chunk) — there is nothing to resume for a 1-chunk upload,
+	// and the sidecar I/O dominates directory uploads with many small files.
 	storageRoot := s.serverOpts.storageRoot
-	prevResult, err := pending.Load(storageRoot, key)
-	if err != nil {
-		log.Printf("STORE_DATA: failed to load pending sidecar (starting fresh): %v", err)
-	}
+	useSidecar := fileSize == 0 || fileSize > int64(chunker.DefaultChunkSize)
+
 	skipSet := make(map[int]bool)
 	var resumedInfos []chunker.ChunkInfo
-	if prevResult != nil {
-		skipSet = prevResult.Completed
-		resumedInfos = prevResult.ChunkInfos
-		log.Printf("STORE_DATA: resuming upload for %q — %d chunks already done", key, len(skipSet))
-	}
+	var sidecar *pending.Sidecar
 
-	// Create (or re-create) the pending sidecar.
-	sidecar, err := pending.Create(storageRoot, pending.Header{
-		StorageKey: key,
-		ChunkSize:  chunker.DefaultChunkSize,
-		CreatedAt:  time.Now().UnixNano(),
-	})
-	if err != nil {
-		return fmt.Errorf("STORE_DATA: create pending sidecar: %w", err)
+	if useSidecar {
+		prevResult, err := pending.Load(storageRoot, key)
+		if err != nil {
+			log.Printf("STORE_DATA: failed to load pending sidecar (starting fresh): %v", err)
+		}
+		if prevResult != nil {
+			skipSet = prevResult.Completed
+			resumedInfos = prevResult.ChunkInfos
+			log.Printf("STORE_DATA: resuming upload for %q — %d chunks already done", key, len(skipSet))
+		}
+
+		// Create (or re-create) the pending sidecar.
+		sidecar, err = pending.Create(storageRoot, pending.Header{
+			StorageKey: key,
+			ChunkSize:  chunker.DefaultChunkSize,
+			CreatedAt:  time.Now().UnixNano(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("STORE_DATA: create pending sidecar: %w", err)
+		}
+		// Pre-record all resumed chunks so a second crash doesn't lose them.
+		for _, ci := range resumedInfos {
+			sidecar.RecordChunk(ci) //nolint:errcheck
+		}
+		defer sidecar.Close()
 	}
-	// Pre-record all resumed chunks so a second crash doesn't lose them.
-	for _, ci := range resumedInfos {
-		sidecar.RecordChunk(ci) //nolint:errcheck
-	}
-	defer sidecar.Close()
 
 	// Estimate total chunks for progress reporting.
 	totalChunks := 0
@@ -1038,16 +1209,25 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 		progress(completed, totalChunks)
 	}
 
+	// Collect per-chunk metadata when deferring writes.
+	var collectedChunkMetas []ChunkMetaEntry
+
 	for pc := range procCh {
+		// Check for pause/cancel between chunks.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// Store locally (skip if already present — dedup).
 		if !s.Store.Has(pc.storageKey) {
 			if _, err := s.Store.WriteStream(pc.storageKey, bytes.NewReader(pc.data)); err != nil {
-				return fmt.Errorf("STORE_DATA: local store chunk %d: %w", pc.info.Index, err)
+				return nil, fmt.Errorf("STORE_DATA: local store chunk %d: %w", pc.info.Index, err)
 			}
 			fm, _ := s.serverOpts.metaData.Get(pc.storageKey)
 			fm.Timestamp = time.Now().UnixNano()
-			if err := s.serverOpts.metaData.Set(pc.storageKey, fm); err != nil {
-				return fmt.Errorf("STORE_DATA: metadata chunk %d: %w", pc.info.Index, err)
+			if deferMeta {
+				collectedChunkMetas = append(collectedChunkMetas, ChunkMetaEntry{Key: pc.storageKey, Meta: fm})
+			} else if err := s.serverOpts.metaData.Set(pc.storageKey, fm); err != nil {
+				return nil, fmt.Errorf("STORE_DATA: metadata chunk %d: %w", pc.info.Index, err)
 			}
 		}
 
@@ -1076,7 +1256,9 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 		completed++
 
 		// Record in sidecar (crash-safe).
-		sidecar.RecordChunk(pc.info) //nolint:errcheck
+		if sidecar != nil {
+			sidecar.RecordChunk(pc.info) //nolint:errcheck
+		}
 
 		// Report progress.
 		if progress != nil {
@@ -1089,7 +1271,7 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 
 	// Check for error from Stage 1.
 	if err := <-stage1ErrCh; err != nil {
-		return fmt.Errorf("STORE_DATA: stage1: %w", err)
+		return nil, fmt.Errorf("STORE_DATA: stage1: %w", err)
 	}
 
 	// Build and persist the manifest locally.
@@ -1101,14 +1283,10 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 		manifest.AccessList = enc.AccessList
 		manifest.Signature = enc.Signature
 	}
-	if err := s.serverOpts.metaData.SetManifest(key, manifest); err != nil {
-		return fmt.Errorf("STORE_DATA: store manifest: %w", err)
-	}
-
-	// Manifest replication is fire-and-forget (non-blocking).
+	// Manifest replication is fire-and-forget (non-blocking) regardless of deferMeta.
 	s.replicateManifest(key, selfAddr, manifest)
 
-	// Update top-level FileMeta.
+	// Build top-level FileMeta.
 	topFm, _ := s.serverOpts.metaData.Get(key)
 	if topFm.VClock == nil {
 		topFm.VClock = make(map[string]uint64)
@@ -1116,15 +1294,227 @@ func (s *Server) StoreDataWithProgress(key string, w io.Reader, enc *EncryptionM
 	topFm.VClock[selfAddr]++
 	topFm.Chunked = true
 	topFm.Timestamp = time.Now().UnixNano()
+
+	if deferMeta {
+		// Return collected metadata for the caller to batch-write.
+		result := &StoredFileResult{
+			ChunkMetas: collectedChunkMetas,
+			Manifest:   manifest,
+			FileKey:    key,
+			FileMeta:   topFm,
+		}
+		// Upload succeeded — delete the pending sidecar.
+		if sidecar != nil {
+			sidecar.Close()
+			pending.Finalize(storageRoot, key) //nolint:errcheck
+		}
+		log.Printf("STORE_DATA: key '%s' stored as %d chunks (deferred metadata)", key, len(chunkInfos))
+		return result, nil
+	}
+
+	if err := s.serverOpts.metaData.SetManifest(key, manifest); err != nil {
+		return nil, fmt.Errorf("STORE_DATA: store manifest: %w", err)
+	}
 	if err := s.serverOpts.metaData.Set(key, topFm); err != nil {
-		return fmt.Errorf("STORE_DATA: update file meta: %w", err)
+		return nil, fmt.Errorf("STORE_DATA: update file meta: %w", err)
 	}
 
 	// Upload succeeded — delete the pending sidecar.
-	sidecar.Close()
-	pending.Finalize(storageRoot, key) //nolint:errcheck
+	if sidecar != nil {
+		sidecar.Close()
+		pending.Finalize(storageRoot, key) //nolint:errcheck
+	}
 
 	log.Printf("STORE_DATA: key '%s' stored as %d chunks", key, len(chunkInfos))
+	return nil, nil
+}
+
+// DirUploadProgressFunc reports directory upload progress.
+// fileIdx/fileTotal track which file, chunkIdx/chunkTotal track chunks within.
+type DirUploadProgressFunc func(fileIdx, fileTotal, chunkIdx, chunkTotal int)
+
+// StoreDirectory uploads all files in dirPath as individual chunked uploads,
+// then creates and stores a DirectoryManifest that binds them together.
+//
+// Two-phase design for performance:
+//   Phase 1: Process all files (chunk, compress, encrypt, CAS store, replicate)
+//            with deferred metadata — no BoltDB writes per file.
+//   Phase 2: Single WithBatch call writes all metadata atomically (1 fsync
+//            instead of 3N for N files).
+func (s *Server) StoreDirectory(ctx context.Context, key string, dirPath string, enc *EncryptionMeta, progress DirUploadProgressFunc) error {
+	entries, err := dirmanifest.Walk(dirPath)
+	if err != nil {
+		return fmt.Errorf("StoreDirectory: walk: %w", err)
+	}
+	if len(entries) == 0 {
+		return fmt.Errorf("StoreDirectory: directory is empty")
+	}
+
+	// Phase 1: process all files, collecting metadata for batch write.
+	fileTotal := len(entries)
+	fileResults := make([]*StoredFileResult, 0, fileTotal)
+
+	for i := range entries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		filePath := filepath.Join(dirPath, filepath.FromSlash(entries[i].RelativePath))
+		fileKey := key + "/" + entries[i].RelativePath
+
+		f, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("StoreDirectory: open %s: %w", entries[i].RelativePath, err)
+		}
+
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("StoreDirectory: stat %s: %w", entries[i].RelativePath, err)
+		}
+
+		fileIdx := i
+		fileProgress := func(chunkIdx, chunkTotal int) {
+			if progress != nil {
+				progress(fileIdx+1, fileTotal, chunkIdx, chunkTotal)
+			}
+		}
+
+		result, err := s.StoreDataCollectMeta(ctx, fileKey, f, enc, fi.Size(), fileProgress)
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("StoreDirectory: upload %s: %w", entries[i].RelativePath, err)
+		}
+		f.Close()
+
+		entries[i].FileHash = result.Manifest.MerkleRoot
+		entries[i].ManifestKey = fileKey
+		fileResults = append(fileResults, result)
+	}
+
+	// Build directory manifest.
+	var totalSize int64
+	for _, e := range entries {
+		totalSize += e.Size
+	}
+	dm := &dirmanifest.DirectoryManifest{
+		StorageKey:  key,
+		TotalSize:   totalSize,
+		FileCount:   len(entries),
+		Files:       entries,
+		MerkleRoot:  dirmanifest.ComputeMerkleRoot(entries),
+		CreatedAt:   time.Now().UnixNano(),
+		IsDirectory: true,
+	}
+	if enc != nil {
+		dm.Encrypted = true
+		dm.OwnerPubKey = enc.OwnerPubKey
+		dm.OwnerEdPubKey = enc.OwnerEdPubKey
+		dm.AccessList = enc.AccessList
+		dm.Signature = enc.Signature
+	}
+
+	dmData, err := dirmanifest.Marshal(dm)
+	if err != nil {
+		return fmt.Errorf("StoreDirectory: marshal manifest: %w", err)
+	}
+
+	// Phase 2: batch-write all metadata in a single transaction (1 fsync).
+	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
+	topFm, _ := s.serverOpts.metaData.Get(key)
+	if topFm.VClock == nil {
+		topFm.VClock = make(map[string]uint64)
+	}
+	topFm.VClock[selfAddr]++
+	topFm.Chunked = true
+	topFm.Timestamp = time.Now().UnixNano()
+
+	if err := s.serverOpts.metaData.WithBatch(func(batch storage.MetadataBatch) error {
+		for _, r := range fileResults {
+			for _, cm := range r.ChunkMetas {
+				if err := batch.Set(cm.Key, cm.Meta); err != nil {
+					return err
+				}
+			}
+			if err := batch.SetManifest(r.FileKey, r.Manifest); err != nil {
+				return err
+			}
+			if err := batch.Set(r.FileKey, r.FileMeta); err != nil {
+				return err
+			}
+		}
+		if err := batch.SetDirManifest(key, dmData); err != nil {
+			return err
+		}
+		return batch.Set(key, topFm)
+	}); err != nil {
+		return fmt.Errorf("StoreDirectory: batch metadata write: %w", err)
+	}
+
+	log.Printf("STORE_DIRECTORY: key '%s' stored as %d files", key, len(entries))
+	return nil
+}
+
+// GetDirectoryManifest retrieves and parses the DirectoryManifest for a key.
+func (s *Server) GetDirectoryManifest(key string) (*dirmanifest.DirectoryManifest, error) {
+	data, ok := s.serverOpts.metaData.GetDirManifest(key)
+	if !ok {
+		// Not local — ask peers via unified metadata fetch.
+		peerData, isDir, err := s.fetchMetadataFromPeers(key)
+		if err != nil || !isDir {
+			return nil, fmt.Errorf("no directory manifest for %q", key)
+		}
+		// Cache locally for subsequent requests.
+		s.serverOpts.metaData.SetDirManifest(key, peerData)
+		data = peerData
+	}
+	dm, err := dirmanifest.Unmarshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse directory manifest: %w", err)
+	}
+	return dm, nil
+}
+
+// IsDirectoryManifest returns true if a directory manifest exists for the key.
+func (s *Server) IsDirectoryManifest(key string) bool {
+	_, ok := s.serverOpts.metaData.GetDirManifest(key)
+	return ok
+}
+
+// GetDirectory downloads all files from a directory manifest to outputDir.
+func (s *Server) GetDirectory(ctx context.Context, key string, outputDir string, dek []byte, progress DirUploadProgressFunc) error {
+	dm, err := s.GetDirectoryManifest(key)
+	if err != nil {
+		return err
+	}
+
+	fileTotal := dm.FileCount
+	for i, entry := range dm.Files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		outPath, err := dirmanifest.SafeOutputPath(outputDir, entry.RelativePath)
+		if err != nil {
+			return fmt.Errorf("GetDirectory: %w", err)
+		}
+
+		// Ensure parent directory exists.
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return fmt.Errorf("GetDirectory: mkdir %s: %w", entry.RelativePath, err)
+		}
+
+		fileIdx := i
+		fileProgress := func(chunkIdx, chunkTotal int) {
+			if progress != nil {
+				progress(fileIdx+1, fileTotal, chunkIdx, chunkTotal)
+			}
+		}
+
+		if err := s.GetDataToFile(ctx, entry.ManifestKey, outPath, dek, fileProgress); err != nil {
+			return fmt.Errorf("GetDirectory: download %s: %w", entry.RelativePath, err)
+		}
+	}
+
+	log.Printf("GET_DIRECTORY: key '%s' — %d files downloaded to %s", key, fileTotal, outputDir)
 	return nil
 }
 
@@ -1181,7 +1571,13 @@ func (s *Server) replicateChunk(selfAddr, storageKey string, data []byte, target
 		}
 		needed++
 		go func(addr string, peer peer2peer.Peer) {
-			err := peer.SendStream(msgBytes, data)
+			// Sprint E: use throttled send for QUIC peers.
+			var err error
+			if qp, ok := peer.(*quicTransport.QUICPeer); ok && s.BandwidthMgr != nil {
+				err = qp.SendStreamThrottled(msgBytes, data, s.BandwidthMgr.WrapWriter)
+			} else {
+				err = peer.SendStream(msgBytes, data)
+			}
 			if err != nil {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s failed: %v, storing hint", addr, err)
 				s.storeHint(addr, storageKey, data)
@@ -1486,8 +1882,8 @@ func (s *Server) readFile(key string) (data []byte, err error) {
 	return data, nil
 }
 
-// healthStatus returns the current health snapshot for /health endpoint.
-func (s *Server) healthStatus() health.Status {
+// HealthStatus returns the current health snapshot for /health endpoint.
+func (s *Server) HealthStatus() health.Status {
 	ringSize := s.HashRing.Size()
 	// Ring size includes self, so peers = ringSize - 1.
 	// This counts both outbound and announced-inbound peers correctly.
@@ -1589,6 +1985,592 @@ func (s *Server) InspectMeta(key string) (VClock map[string]uint64, Timestamp in
 	return vcCopy, fm.Timestamp, true
 }
 
+// handleGetPublicCatalog responds to a remote peer requesting our public file catalog.
+func (s *Server) handleGetPublicCatalog(from string) error {
+	var catalogJSON []byte
+	if s.StateDB != nil {
+		files, err := s.StateDB.ListPublicFiles()
+		if err != nil {
+			log.Printf("[public-catalog] error listing public files: %v", err)
+			catalogJSON = []byte("[]")
+		} else {
+			catalogJSON, _ = json.Marshal(files)
+		}
+	} else {
+		catalogJSON = []byte("[]")
+	}
+
+	resp := &Message{Payload: &MessagePublicCatalogResponse{CatalogJSON: catalogJSON}}
+	return s.sendToAddr(from, resp)
+}
+
+// GetPublicCatalog fetches the public file catalog from a remote peer.
+func (s *Server) GetPublicCatalog(peerAddr string) ([]State.PublicFileEntry, error) {
+	ch := make(chan io.Reader, 1)
+	catalogKey := peerAddr + "#catalog"
+
+	s.mu.Lock()
+	s.pendingFile[catalogKey] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingFile, catalogKey)
+		s.mu.Unlock()
+	}()
+
+	msg := &Message{Payload: &MessageGetPublicCatalog{}}
+	if err := s.sendToAddr(peerAddr, msg); err != nil {
+		return nil, fmt.Errorf("failed to send catalog request to %s: %w", peerAddr, err)
+	}
+
+	select {
+	case reader := <-ch:
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, err
+		}
+		var entries []State.PublicFileEntry
+		if err := json.Unmarshal(data, &entries); err != nil {
+			return nil, fmt.Errorf("invalid catalog response: %w", err)
+		}
+		return entries, nil
+	case <-time.After(10 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for catalog from %s", peerAddr)
+	}
+}
+
+// UpdatePublicCatalogMetadata updates gossip metadata with the current public catalog summary.
+func (s *Server) UpdatePublicCatalogMetadata() {
+	if s.StateDB == nil || s.GossipSvc == nil {
+		return
+	}
+	count, size, hash := s.StateDB.PublicCatalogSummary()
+	selfAddr := s.effectiveSelfAddr()
+	if s.Cluster != nil {
+		s.Cluster.SetMetadata(selfAddr, map[string]string{
+			"public_catalog_hash":  hash,
+			"public_shared_count":  fmt.Sprintf("%d", count),
+			"public_shared_size":   fmt.Sprintf("%d", size),
+		})
+	}
+}
+
+// ── Direct Share / Inbox ─────────────────────────────────────────────
+
+// handleDirectShare processes an incoming direct-share notification from a peer.
+// It stores the entry in our inbox so the user can see and download it.
+func (s *Server) handleDirectShare(from string, m *MessageDirectShare) error {
+	if s.StateDB == nil {
+		log.Printf("[direct-share] no StateDB, ignoring share from %s", from)
+		return nil
+	}
+	entry := State.InboxEntry{
+		Key:         m.Key,
+		Name:        m.Name,
+		Size:        m.Size,
+		IsDir:       m.IsDir,
+		SenderAlias: m.SenderAlias,
+		SenderFP:    m.SenderFP,
+	}
+	if err := s.StateDB.AddInboxEntry(entry); err != nil {
+		log.Printf("[direct-share] failed to record inbox entry: %v", err)
+		return err
+	}
+	log.Printf("[direct-share] received %q from %s (%s)", m.Name, m.SenderAlias, from)
+	return nil
+}
+
+// AddAccessEntry appends a new AccessEntry to the manifest for the given key
+// and replicates the updated manifest to peers. Handles both file manifests
+// (ChunkManifest) and directory manifests (DirectoryManifest + per-file manifests).
+// If the recipient is already in the access list, this is a no-op.
+// Returns (encrypted bool, err error) — encrypted=false means the file is plaintext
+// and no access grant is needed.
+func (s *Server) AddAccessEntry(fileKey string, isDir bool, entry chunker.AccessEntry, newSignature string) (encrypted bool, err error) {
+	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
+
+	if isDir {
+		dm, dmErr := s.GetDirectoryManifest(fileKey)
+		if dmErr != nil {
+			return false, fmt.Errorf("get directory manifest: %w", dmErr)
+		}
+		if !dm.Encrypted {
+			return false, nil // plaintext — no access grant needed
+		}
+		// Check if already in access list.
+		for _, ae := range dm.AccessList {
+			if ae.RecipientPubKey == entry.RecipientPubKey {
+				return true, nil // already has access
+			}
+		}
+		// Append to directory manifest.
+		dm.AccessList = append(dm.AccessList, entry)
+		dm.Signature = newSignature
+		dmData, mErr := dirmanifest.Marshal(dm)
+		if mErr != nil {
+			return true, fmt.Errorf("marshal dir manifest: %w", mErr)
+		}
+		if err := s.serverOpts.metaData.SetDirManifest(fileKey, dmData); err != nil {
+			return true, fmt.Errorf("save dir manifest: %w", err)
+		}
+
+		// Update each file's ChunkManifest within the directory.
+		for _, f := range dm.Files {
+			fm, ok := s.InspectManifest(f.ManifestKey)
+			if !ok || fm == nil || !fm.Encrypted {
+				continue
+			}
+			fm.AccessList = append(fm.AccessList, entry)
+			fm.Signature = newSignature
+			if err := s.serverOpts.metaData.SetManifest(f.ManifestKey, fm); err != nil {
+				log.Printf("[grant-access] failed to update file manifest %s: %v", f.ManifestKey, err)
+				continue
+			}
+			s.replicateManifest(f.ManifestKey, selfAddr, fm)
+		}
+		return true, nil
+	}
+
+	// File manifest case.
+	manifest, ok := s.InspectManifest(fileKey)
+	if !ok || manifest == nil {
+		return false, fmt.Errorf("no manifest found for %q", fileKey)
+	}
+	if !manifest.Encrypted {
+		return false, nil
+	}
+	// Check if already in access list.
+	for _, ae := range manifest.AccessList {
+		if ae.RecipientPubKey == entry.RecipientPubKey {
+			return true, nil
+		}
+	}
+	manifest.AccessList = append(manifest.AccessList, entry)
+	manifest.Signature = newSignature
+	if err := s.serverOpts.metaData.SetManifest(fileKey, manifest); err != nil {
+		return true, fmt.Errorf("save manifest: %w", err)
+	}
+	s.replicateManifest(fileKey, selfAddr, manifest)
+	return true, nil
+}
+
+// SendDirectShare notifies a peer that a file has been sent to them.
+// The file must already be uploaded and replicated in the cluster.
+func (s *Server) SendDirectShare(peerAddr string, key, name string, size int64, isDir bool) error {
+	alias := ""
+	fp := ""
+	if s.identityMeta != nil {
+		alias = s.identityMeta["alias"]
+		fp = s.identityMeta["fingerprint"]
+	}
+	msg := &Message{Payload: &MessageDirectShare{
+		Key:         key,
+		Name:        name,
+		Size:        size,
+		IsDir:       isDir,
+		SenderAlias: alias,
+		SenderFP:    fp,
+	}}
+	return s.sendToAddr(peerAddr, msg)
+}
+
+// SendOrQueueDirectShare attempts to send a direct-share notification to a
+// peer. If the peer is offline, the notification is queued in the local outbox
+// and will be delivered automatically when the peer reconnects.
+// Returns queued=true if the message was queued instead of delivered.
+func (s *Server) SendOrQueueDirectShare(peerAddr, recipientFP string, key, name string, size int64, isDir bool) (queued bool, err error) {
+	err = s.SendDirectShare(peerAddr, key, name, size, isDir)
+	if err == nil {
+		return false, nil
+	}
+	// Peer offline — queue for later delivery.
+	if s.StateDB == nil {
+		return false, err
+	}
+	if recipientFP == "" {
+		return false, err // can't queue without fingerprint
+	}
+	qErr := s.QueueOutbox(recipientFP, peerAddr, key, name, size, isDir)
+	if qErr != nil {
+		return false, fmt.Errorf("send failed (%v) and queue failed (%v)", err, qErr)
+	}
+	return true, nil
+}
+
+// QueueOutbox saves a direct-share notification to the local outbox for
+// delivery when the recipient peer reconnects.
+func (s *Server) QueueOutbox(recipientFP, recipientHint, fileKey, fileName string, fileSize int64, isDir bool) error {
+	if s.StateDB == nil {
+		return fmt.Errorf("state database not available")
+	}
+	entry := State.OutboxEntry{
+		ID:            fmt.Sprintf("%s/%s/%d", recipientFP, fileKey, time.Now().UnixNano()),
+		RecipientFP:   recipientFP,
+		RecipientHint: recipientHint,
+		FileKey:       fileKey,
+		FileName:      fileName,
+		FileSize:      fileSize,
+		IsDir:         isDir,
+	}
+	return s.StateDB.AddOutboxEntry(entry)
+}
+
+// FlushOutbox delivers any pending outbox messages to a peer that just
+// connected. Called from OnPeer (outbound) and handleAnnounce (inbound remap).
+func (s *Server) FlushOutbox(peerAddr string) {
+	if s.StateDB == nil {
+		return
+	}
+	// Resolve fingerprint from cluster metadata.
+	fp := ""
+	if s.Cluster != nil {
+		if node, ok := s.Cluster.GetNode(peerAddr); ok && node.Metadata != nil {
+			fp = node.Metadata["fingerprint"]
+		}
+	}
+	if fp == "" {
+		return // can't match outbox entries without fingerprint
+	}
+
+	entries, err := s.StateDB.ListOutboxForPeer(fp)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+
+	for _, e := range entries {
+		if err := s.SendDirectShare(peerAddr, e.FileKey, e.FileName, e.FileSize, e.IsDir); err != nil {
+			log.Printf("[outbox] flush to %s failed for %q: %v", peerAddr, e.FileName, err)
+			return // peer went offline again, stop trying
+		}
+		_ = s.StateDB.RemoveOutboxEntry(e.ID)
+		log.Printf("[outbox] delivered %q to %s", e.FileName, peerAddr)
+	}
+}
+
+// GetInbox returns the local inbox entries (files sent to us by other peers).
+func (s *Server) GetInbox() ([]State.InboxEntry, error) {
+	if s.StateDB == nil {
+		return nil, nil
+	}
+	return s.StateDB.ListInbox()
+}
+
+// DeleteFile removes a file from local storage, records a tombstone, and
+// broadcasts the deletion to all connected peers.
+func (s *Server) DeleteFile(key string) (int, error) {
+	// Verify ownership: key must start with own fingerprint.
+	ownFP := ""
+	if s.identityMeta != nil {
+		ownFP = s.identityMeta["fingerprint"]
+	}
+	if ownFP == "" {
+		return 0, fmt.Errorf("no identity configured")
+	}
+	if !strings.HasPrefix(key, ownFP+"/") {
+		return 0, fmt.Errorf("not authorized: you can only delete your own files")
+	}
+
+	// Delete chunks from store.
+	manifestKey := chunker.ManifestStorageKey(key)
+	if _, rc, err := s.Store.ReadStream(manifestKey); err == nil {
+		manifestData, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr == nil {
+			var manifest chunker.ChunkManifest
+			if json.Unmarshal(manifestData, &manifest) == nil {
+				for _, ci := range manifest.Chunks {
+					sk := chunker.ChunkStorageKey(ci.EncHash)
+					_ = s.Store.Remove(sk)
+				}
+			}
+		}
+		_ = s.Store.Remove(manifestKey)
+	}
+
+	// Also try to delete directory manifest.
+	dirManifestKey := "dirmanifest:" + key
+	_ = s.Store.Remove(dirManifestKey)
+
+	// Remove from StateDB.
+	if s.StateDB != nil {
+		_ = s.StateDB.RemoveUpload(key)
+		_ = s.StateDB.RemovePublicFile(key)
+		_ = s.StateDB.AddTombstone(State.TombstoneEntry{
+			Key:         key,
+			DeletedAt:   time.Now().UnixNano(),
+			Fingerprint: ownFP,
+		})
+	}
+
+	// Update gossip metadata.
+	s.UpdatePublicCatalogMetadata()
+
+	// Broadcast to all connected peers.
+	delMsg := &Message{Payload: &MessageDeleteFile{
+		Key:         key,
+		Fingerprint: ownFP,
+	}}
+	propagated := 0
+	s.peerLock.RLock()
+	for addr, peer := range s.peers {
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(delMsg); err != nil {
+			continue
+		}
+		if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+			log.Printf("[delete] failed to broadcast to %s: %v", addr, err)
+			continue
+		}
+		propagated++
+	}
+	s.peerLock.RUnlock()
+
+	return propagated, nil
+}
+
+// handleDeleteFile processes a remote tombstone message.
+func (s *Server) handleDeleteFile(from string, msg *MessageDeleteFile) error {
+	// Verify ownership: key must start with sender's fingerprint.
+	if !strings.HasPrefix(msg.Key, msg.Fingerprint+"/") {
+		log.Printf("[delete] rejected: key %q doesn't match fingerprint %s from %s", msg.Key, msg.Fingerprint, from)
+		return nil
+	}
+
+	// Check if already tombstoned.
+	if s.StateDB != nil && s.StateDB.IsTombstoned(msg.Key) {
+		return nil // already processed
+	}
+
+	// Delete local chunks if we have them.
+	manifestKey := chunker.ManifestStorageKey(msg.Key)
+	if _, rc, err := s.Store.ReadStream(manifestKey); err == nil {
+		manifestData, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr == nil {
+			var manifest chunker.ChunkManifest
+			if json.Unmarshal(manifestData, &manifest) == nil {
+				for _, ci := range manifest.Chunks {
+					sk := chunker.ChunkStorageKey(ci.EncHash)
+					_ = s.Store.Remove(sk)
+				}
+			}
+		}
+		_ = s.Store.Remove(manifestKey)
+	}
+
+	// Remove directory manifest too.
+	_ = s.Store.Remove("dirmanifest:" + msg.Key)
+
+	// Record tombstone locally.
+	if s.StateDB != nil {
+		_ = s.StateDB.RemoveUpload(msg.Key)
+		_ = s.StateDB.RemovePublicFile(msg.Key)
+		_ = s.StateDB.AddTombstone(State.TombstoneEntry{
+			Key:         msg.Key,
+			DeletedAt:   time.Now().UnixNano(),
+			Fingerprint: msg.Fingerprint,
+		})
+	}
+
+	log.Printf("[delete] applied tombstone for %q from %s (via %s)", msg.Key, msg.Fingerprint, from)
+	return nil
+}
+
+// matchesQuery returns true if name matches all words in query (case-insensitive AND).
+func matchesQuery(name, query string) bool {
+	lower := strings.ToLower(name)
+	for _, w := range strings.Fields(strings.ToLower(query)) {
+		if !strings.Contains(lower, w) {
+			return false
+		}
+	}
+	return true
+}
+
+// SearchFiles searches the local public catalog and floods the query to peers.
+// Returns aggregated results after a timeout.
+func (s *Server) SearchFiles(query string) ([]SearchResult, error) {
+	requestID := fmt.Sprintf("%x", time.Now().UnixNano())
+	origin := s.effectiveSelfAddr()
+
+	// Search own public files.
+	var localResults []SearchResult
+	if s.StateDB != nil {
+		files, err := s.StateDB.ListPublicFiles()
+		if err == nil {
+			alias := ""
+			fp := ""
+			if s.identityMeta != nil {
+				alias = s.identityMeta["alias"]
+				fp = s.identityMeta["fingerprint"]
+			}
+			for _, f := range files {
+				if matchesQuery(f.Name, query) {
+					localResults = append(localResults, SearchResult{
+						Key:        f.Key,
+						Name:       f.Name,
+						Size:       f.Size,
+						IsDir:      f.IsDir,
+						OwnerAlias: alias,
+						OwnerFP:    fp,
+						NodeAddr:   origin,
+					})
+				}
+			}
+		}
+	}
+
+	// Set up response channel.
+	respKey := origin + "#search#" + requestID
+	ch := make(chan io.Reader, 64)
+	s.mu.Lock()
+	s.pendingFile[respKey] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingFile, respKey)
+		s.mu.Unlock()
+	}()
+
+	// Mark as seen to avoid echo.
+	s.searchSeen.SeenOrAdd(requestID)
+
+	// Flood to all peers.
+	searchMsg := &Message{Payload: &MessageSearchRequest{
+		Query:     query,
+		RequestID: requestID,
+		Origin:    origin,
+		TTL:       5,
+	}}
+	s.peerLock.RLock()
+	for addr, peer := range s.peers {
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(searchMsg); err != nil {
+			continue
+		}
+		if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+			log.Printf("[search] failed to send to %s: %v", addr, err)
+		}
+	}
+	s.peerLock.RUnlock()
+
+	// Collect responses with timeout.
+	allResults := append([]SearchResult{}, localResults...)
+	seen := make(map[string]bool)
+	for _, r := range localResults {
+		seen[r.Key] = true
+	}
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case reader := <-ch:
+			data, err := io.ReadAll(reader)
+			if err != nil {
+				continue
+			}
+			var resp MessageSearchResponse
+			if json.Unmarshal(data, &resp) != nil {
+				continue
+			}
+			for _, r := range resp.Results {
+				if !seen[r.Key] {
+					seen[r.Key] = true
+					allResults = append(allResults, r)
+				}
+			}
+		case <-timeout:
+			return allResults, nil
+		}
+	}
+}
+
+// handleSearchRequest processes an incoming search flood.
+func (s *Server) handleSearchRequest(from string, msg *MessageSearchRequest) error {
+	// Dedup: drop if already seen.
+	if s.searchSeen.SeenOrAdd(msg.RequestID) {
+		return nil
+	}
+
+	// Search local public files.
+	var results []SearchResult
+	if s.StateDB != nil {
+		files, err := s.StateDB.ListPublicFiles()
+		if err == nil {
+			alias := ""
+			fp := ""
+			if s.identityMeta != nil {
+				alias = s.identityMeta["alias"]
+				fp = s.identityMeta["fingerprint"]
+			}
+			selfAddr := s.effectiveSelfAddr()
+			for _, f := range files {
+				if matchesQuery(f.Name, msg.Query) {
+					results = append(results, SearchResult{
+						Key:        f.Key,
+						Name:       f.Name,
+						Size:       f.Size,
+						IsDir:      f.IsDir,
+						OwnerAlias: alias,
+						OwnerFP:    fp,
+						NodeAddr:   selfAddr,
+					})
+				}
+			}
+		}
+	}
+
+	// Send results directly to origin.
+	if len(results) > 0 {
+		resp := &Message{Payload: &MessageSearchResponse{
+			RequestID: msg.RequestID,
+			Results:   results,
+			FromNode:  s.effectiveSelfAddr(),
+		}}
+		_ = s.sendToAddr(msg.Origin, resp)
+	}
+
+	// Forward to other peers with TTL-1.
+	if msg.TTL > 1 {
+		fwdMsg := &Message{Payload: &MessageSearchRequest{
+			Query:     msg.Query,
+			RequestID: msg.RequestID,
+			Origin:    msg.Origin,
+			TTL:       msg.TTL - 1,
+		}}
+		s.peerLock.RLock()
+		for addr, peer := range s.peers {
+			if addr == from {
+				continue // don't echo back
+			}
+			buf := new(bytes.Buffer)
+			if err := gob.NewEncoder(buf).Encode(fwdMsg); err != nil {
+				continue
+			}
+			_ = peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+		}
+		s.peerLock.RUnlock()
+	}
+
+	return nil
+}
+
+// handleSearchResponse routes search results to the waiting SearchFiles call.
+func (s *Server) handleSearchResponse(from string, msg *MessageSearchResponse) error {
+	selfAddr := s.effectiveSelfAddr()
+	respKey := selfAddr + "#search#" + msg.RequestID
+
+	s.mu.Lock()
+	ch, ok := s.pendingFile[respKey]
+	s.mu.Unlock()
+
+	if ok {
+		data, _ := json.Marshal(msg)
+		ch <- bytes.NewReader(data)
+	}
+	return nil
+}
+
 // GracefulShutdown signals all peers that this node is leaving and waits briefly
 // for any in-flight operations to complete before the process exits.
 func (s *Server) GracefulShutdown() {
@@ -1631,6 +2613,12 @@ func (s *Server) GracefulShutdown() {
 	if s.AntiEntropy != nil {
 		s.AntiEntropy.Stop()
 	}
+	if s.BandwidthMgr != nil {
+		s.BandwidthMgr.Stop()
+	}
+	if s.StateDB != nil {
+		s.StateDB.Close()
+	}
 
 	// Give replication goroutines a moment to finish.
 	time.Sleep(300 * time.Millisecond)
@@ -1644,16 +2632,42 @@ func (s *Server) handleLeaving(addr string, msgGen uint64) error {
 	self := s.serverOpts.transport.Addr()
 	log.Printf("[TRACE][handleLeaving] self=%s received LEAVING from addr=%s msgGen=%d", self, addr, msgGen)
 
+	// Resolve the canonical peer address: the leaving message may carry a
+	// bare port (":3001") while the peers map stores "127.0.0.1:3001".
+	// Check the peers map directly, then try announceAdded reverse lookup.
+	canonicalAddr := addr
 	s.peerLock.RLock()
 	_, inPeers := s.peers[addr]
+	if !inPeers {
+		// Try announceAdded: canonical→ephemeral map, but we need the reverse.
+		// Also try every peer to match by port when the host is missing.
+		_, addrPort, _ := net.SplitHostPort(addr)
+		for peerAddr := range s.peers {
+			_, peerPort, _ := net.SplitHostPort(peerAddr)
+			if peerPort == addrPort {
+				canonicalAddr = peerAddr
+				inPeers = true
+				break
+			}
+		}
+	}
 	s.peerLock.RUnlock()
-	log.Printf("[TRACE][handleLeaving] self=%s addr=%s inPeers=%v ring_size_before=%d", self, addr, inPeers, s.HashRing.Size())
+	log.Printf("[TRACE][handleLeaving] self=%s addr=%s canonicalAddr=%s inPeers=%v ring_size_before=%d", self, addr, canonicalAddr, inPeers, s.HashRing.Size())
 
 	s.HashRing.RemoveNode(normalizeAddr(addr))
+	s.HashRing.RemoveNode(normalizeAddr(canonicalAddr))
 	log.Printf("[TRACE][handleLeaving] self=%s addr=%s ring_size_after=%d", self, addr, s.HashRing.Size())
 
 	if s.Cluster != nil {
+		// Try both the raw addr and the canonical for cluster state update.
+		lookupAddr := addr
 		info, ok := s.Cluster.GetNode(addr)
+		if !ok {
+			info, ok = s.Cluster.GetNode(canonicalAddr)
+			if ok {
+				lookupAddr = canonicalAddr
+			}
+		}
 		// Use msgGen+1 so StateLeft beats any stale gossip digest the leaving node
 		// already sent (which carries generation == msgGen == its epoch timestamp).
 		gen := msgGen + 1
@@ -1665,20 +2679,28 @@ func (s *Server) handleLeaving(addr string, msgGen uint64) error {
 			}
 		}
 		log.Printf("[TRACE][handleLeaving] self=%s updating cluster state addr=%s to StateLeft gen=%d (msgGen=%d was_known=%v prev_gen=%d prev_state=%v)",
-			self, addr, gen, msgGen, ok, info.Generation, info.State)
-		s.Cluster.UpdateState(addr, membership.StateLeft, gen)
+			self, lookupAddr, gen, msgGen, ok, info.Generation, info.State)
+		s.Cluster.UpdateState(lookupAddr, membership.StateLeft, gen)
 	}
 
 	// Remove from local peer map so heartbeats stop.
 	// Also clean up the announceAdded reverse-mapping so OnPeerDisconnect
 	// doesn't attempt a second (redundant) ring removal and doesn't leak memory.
 	s.peerLock.Lock()
-	if peer, ok := s.peers[addr]; ok {
-		log.Printf("[TRACE][handleLeaving] self=%s closing peer ptr=%p for addr=%s", self, peer, addr)
+	if peer, ok := s.peers[canonicalAddr]; ok {
+		log.Printf("[TRACE][handleLeaving] self=%s closing peer ptr=%p for addr=%s", self, peer, canonicalAddr)
 		_ = peer.Close()
-		delete(s.peers, addr)
+		delete(s.peers, canonicalAddr)
+	}
+	// Also try the raw addr in case it's stored differently.
+	if canonicalAddr != addr {
+		if peer, ok := s.peers[addr]; ok {
+			_ = peer.Close()
+			delete(s.peers, addr)
+		}
 	}
 	delete(s.announceAdded, addr)
+	delete(s.announceAdded, canonicalAddr)
 	s.peerLock.Unlock()
 
 	metrics.PeerCount.Set(float64(len(s.peers)))
@@ -1793,12 +2815,13 @@ func (s *Server) Start() error {
 		go s.discoverNAT()
 	}
 
-	if len(s.serverOpts.bootstrapNodes) != 0 {
-		if err := s.BootstrapNetwork(); err != nil {
-			return err
-		}
+	// Always attempt bootstrap — reconnects known peers from StateDB even
+	// without --peer flags. BootstrapNetwork handles empty bootstrap lists.
+	if err := s.BootstrapNetwork(); err != nil {
+		return err
 	}
 
+	go s.connectionManagerLoop()
 	go s.loop()
 	return nil
 }
@@ -1851,7 +2874,12 @@ func (s *Server) loop() {
 			log.Printf("[loop] Decoded message: %+v\n", message)
 			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
-			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg, RPC.StreamReader); err != nil {
+			// Sprint E: wrap incoming stream with download rate limiter.
+			streamReader := RPC.StreamReader
+			if s.BandwidthMgr != nil && streamReader != nil {
+				streamReader = s.BandwidthMgr.WrapReader(streamReader)
+			}
+			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg, streamReader); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
 				continue
 			}
@@ -1899,8 +2927,11 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return s.handleHeartbeat(from, peer, m)
 
 	case *MessageHeartbeatAck:
-		// RTT measurement could be recorded here in future; for now just log.
-		log.Printf("[handleMessage] HeartbeatAck from %s (rtt origin ts=%d)\n", from, m.Timestamp)
+		// An ack is proof the peer is alive — record it so the failure
+		// detector doesn't declare the peer dead while it's responding.
+		if s.HeartbeatSvc != nil {
+			s.HeartbeatSvc.RecordHeartbeat(from)
+		}
 		return nil
 
 	case *MessageAnnounce:
@@ -1910,6 +2941,10 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return s.handleAnnounceAck(m)
 
 	case *MessageGossipDigest:
+		// Any message from a peer is proof it's alive.
+		if s.HeartbeatSvc != nil {
+			s.HeartbeatSvc.RecordHeartbeat(from)
+		}
 		if s.GossipSvc != nil {
 			s.GossipSvc.HandleDigest(from, &gossip.MessageGossipDigest{
 				From:    m.From,
@@ -1937,6 +2972,9 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return nil
 
 	case *MessageGossipResponse:
+		if s.HeartbeatSvc != nil {
+			s.HeartbeatSvc.RecordHeartbeat(from)
+		}
 		if s.GossipSvc != nil {
 			s.GossipSvc.HandleResponse(from, &gossip.MessageGossipResponse{
 				From:     m.From,
@@ -2012,9 +3050,13 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return nil
 
 	case *MessageGetManifest:
-		// Peer is asking for our copy of the manifest. Reply immediately.
+		// Peer is asking for metadata. Unified stat: check dir manifest first,
+		// then file manifest — one network round-trip resolves either type.
 		resp := &MessageManifestResponse{FileKey: m.FileKey}
-		if manifest, ok := s.serverOpts.metaData.GetManifest(m.FileKey); ok {
+		if dirData, ok := s.serverOpts.metaData.GetDirManifest(m.FileKey); ok {
+			resp.ManifestJSON = dirData
+			resp.IsDirectory = true
+		} else if manifest, ok := s.serverOpts.metaData.GetManifest(m.FileKey); ok {
 			if data, err := json.Marshal(manifest); err == nil {
 				resp.ManifestJSON = data
 			}
@@ -2031,8 +3073,15 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		ch, ok := s.pendingFile["__manifest__"+m.FileKey]
 		s.mu.Unlock()
 		if ok && len(m.ManifestJSON) > 0 {
-			// Wrap JSON in a bytes.Buffer and send on the channel.
-			ch <- bytes.NewReader(m.ManifestJSON)
+			// Prefix with 1-byte type flag: 0x00=file, 0x01=directory.
+			typeByte := byte(0x00)
+			if m.IsDirectory {
+				typeByte = 0x01
+			}
+			payload := make([]byte, 1+len(m.ManifestJSON))
+			payload[0] = typeByte
+			copy(payload[1:], m.ManifestJSON)
+			ch <- bytes.NewReader(payload)
 		}
 		return nil
 
@@ -2089,6 +3138,19 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 				addr = from
 			}
 
+			// Fingerprint-based blocklist check: even if the peer's address
+			// changed (DHCP, NAT), the identity fingerprint stays the same.
+			if fp := m.Metadata["fingerprint"]; fp != "" && s.StateDB != nil && s.StateDB.IsIgnoredFingerprint(fp) {
+				log.Printf("[identity] REJECT: peer %s fingerprint %s is blocklisted, disconnecting", addr, fp)
+				s.peerLock.Lock()
+				if p, ok := s.peers[from]; ok {
+					p.Close()
+					delete(s.peers, from)
+				}
+				s.peerLock.Unlock()
+				return nil
+			}
+
 			// Ensure the node exists in cluster before setting metadata.
 			// This handles the case where the identity message arrives before
 			// handleAnnounce has added the node to the cluster.
@@ -2097,6 +3159,44 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 			log.Printf("[identity] stored metadata for %s (alias=%s fingerprint=%s)", addr, m.Metadata["alias"], m.Metadata["fingerprint"])
 		}
 		return nil
+
+	case *MessageGetPublicCatalog:
+		return s.handleGetPublicCatalog(from)
+
+	case *MessagePublicCatalogResponse:
+		// Handled via pendingFile channel (request-response pattern).
+		// The response may arrive from an ephemeral address, but the pending
+		// key was stored under the canonical address. Try both.
+		s.mu.Lock()
+		ch, ok := s.pendingFile[from+"#catalog"]
+		if !ok {
+			// Translate ephemeral → canonical via announceAdded reverse lookup.
+			s.peerLock.RLock()
+			for canonical, ephemeral := range s.announceAdded {
+				if ephemeral == from {
+					ch, ok = s.pendingFile[canonical+"#catalog"]
+					break
+				}
+			}
+			s.peerLock.RUnlock()
+		}
+		s.mu.Unlock()
+		if ok {
+			ch <- bytes.NewReader(m.CatalogJSON)
+		}
+		return nil
+
+	case *MessageDeleteFile:
+		return s.handleDeleteFile(from, m)
+
+	case *MessageSearchRequest:
+		return s.handleSearchRequest(from, m)
+
+	case *MessageSearchResponse:
+		return s.handleSearchResponse(from, m)
+
+	case *MessageDirectShare:
+		return s.handleDirectShare(from, m)
 
 	default:
 		typeName := strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main.")
@@ -2111,6 +3211,22 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 func (s *Server) sendToAddr(addr string, msg *Message) error {
 	s.peerLock.RLock()
 	peer, ok := s.peers[addr]
+	if !ok {
+		// Try the ephemeral address from announceAdded (canonical → ephemeral).
+		if eph, have := s.announceAdded[addr]; have {
+			peer, ok = s.peers[eph]
+		}
+	}
+	if !ok {
+		// Reverse lookup: addr might be an ephemeral address whose peer was
+		// remapped to a canonical address by handleAnnounce.
+		for canonical, ephemeral := range s.announceAdded {
+			if ephemeral == addr {
+				peer, ok = s.peers[canonical]
+				break
+			}
+		}
+	}
 	s.peerLock.RUnlock()
 
 	if !ok {
@@ -2199,6 +3315,25 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 		return nil
 	}
 
+	// Reject inbound connections from blocklisted peers. The initial inbound
+	// accepted under an ephemeral port, but now we know the canonical address.
+	if s.StateDB != nil && s.StateDB.IsIgnoredPeer(canonical) {
+		log.Printf("[handleAnnounce] REJECT: peer %s (canonical %s) is blocklisted, disconnecting", from, canonical)
+		s.peerLock.Lock()
+		if p, ok := s.peers[from]; ok {
+			p.Close()
+			delete(s.peers, from)
+		}
+		s.peerLock.Unlock()
+		// Clean up any cluster entry that was created under the ephemeral
+		// address by MessageIdentityMeta arriving before this announce.
+		if s.Cluster != nil {
+			// Remove the ephemeral cluster entry — it's an artifact.
+			s.Cluster.RemoveNode(from)
+		}
+		return nil
+	}
+
 	s.peerLock.Lock()
 	p, ok := s.peers[from]
 	if ok && !p.Outbound() {
@@ -2223,12 +3358,26 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 
 		if s.Cluster != nil {
 			s.Cluster.AddNode(canonical, nil)
+			// Do NOT bump the remote node's generation here. The node owns
+			// its own generation (unix-nano timestamp). Gossip heartbeats
+			// from the remote will naturally carry a generation higher than
+			// any stale Dead/Suspect state, and UpdateState will accept it.
 			// Migrate any identity metadata that was stored under the ephemeral
 			// address (if the identity message arrived before the announce).
-			if old, ok := s.Cluster.GetNode(from); ok && old.Metadata != nil && len(old.Metadata) > 0 {
-				s.Cluster.SetMetadata(canonical, old.Metadata)
-				log.Printf("[handleAnnounce] migrated metadata from %s to %s", from, canonical)
+			if old, ok := s.Cluster.GetNode(from); ok {
+				if old.Metadata != nil && len(old.Metadata) > 0 {
+					s.Cluster.SetMetadata(canonical, old.Metadata)
+				}
+				// Remove the ephemeral cluster entry — it's an artifact
+				// of the identity message arriving before the announce.
+				s.Cluster.RemoveNode(from)
+				log.Printf("[handleAnnounce] migrated metadata from %s to %s (ephemeral entry removed)", from, canonical)
 			}
+		}
+		// Reset failure detector for the inbound peer so stale heartbeat
+		// gaps from the previous session don't cause a premature death.
+		if s.HeartbeatSvc != nil {
+			s.HeartbeatSvc.RecordHeartbeat(canonical)
 		}
 		if s.HandoffSvc != nil {
 			s.HandoffSvc.OnPeerReconnect(canonical)
@@ -2236,6 +3385,8 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 		if s.Rebalancer != nil {
 			s.Rebalancer.OnNodeJoined(canonical)
 		}
+		// Flush outbox: deliver any pending direct-shares for this inbound peer.
+		go s.FlushOutbox(canonical)
 	}
 
 	// Send MessageAnnounceAck back to the peer telling it its externally-visible
@@ -2278,6 +3429,11 @@ func (s *Server) effectiveSelfAddr() string {
 		return ext
 	}
 	return normalizeAddr(s.serverOpts.transport.Addr())
+}
+
+// SelfAddr returns the node's canonical self address (public API for IPC handlers).
+func (s *Server) SelfAddr() string {
+	return s.effectiveSelfAddr()
 }
 
 // discoverNAT runs STUN discovery in the background. On success it sets the
@@ -2387,7 +3543,13 @@ func (s *Server) handleGetMessage(from string, peer peer2peer.Peer, msg *Message
 		return fmt.Errorf("HANDLE_GET: reading file data: %w", err)
 	}
 
-	if err = peer.SendStream(buf.Bytes(), fileData); err != nil {
+	// Sprint E: use throttled send for QUIC peers.
+	if qp, ok := peer.(*quicTransport.QUICPeer); ok && s.BandwidthMgr != nil {
+		err = qp.SendStreamThrottled(buf.Bytes(), fileData, s.BandwidthMgr.WrapWriter)
+	} else {
+		err = peer.SendStream(buf.Bytes(), fileData)
+	}
+	if err != nil {
 		log.Printf("[HANDLE_GET] Error sending message+stream to %s: %v\n", from, err)
 		return err
 	}
@@ -2497,6 +3659,11 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	self := s.serverOpts.transport.Addr()
 	log.Printf("[TRACE][OnPeerDisconnect] self=%s addr=%s outbound=%v ptr=%p", self, addr, p.Outbound(), p)
 
+	// Sprint E: stop RTT monitor for this peer.
+	if s.BandwidthMgr != nil {
+		s.BandwidthMgr.UnregisterPeer(addr)
+	}
+
 	s.peerLock.Lock()
 	// Only remove from map if the disconnecting peer is the SAME object
 	// currently stored. A duplicate connection that was rejected should
@@ -2535,11 +3702,22 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 			metrics.SetPeerCount(s.outboundPeerCount())
 			metrics.SetRingSize(s.HashRing.Size())
 			if s.Cluster != nil {
-				nextGen := s.Cluster.NextGeneration(canonicalToRemove)
-				s.Cluster.UpdateState(canonicalToRemove, membership.StateSuspect, nextGen)
+				// Ground truth: socket closed = peer is gone. Mark Dead
+				// immediately without bumping generation (node owns its own clock).
+				s.Cluster.ForceLocalState(canonicalToRemove, membership.StateDead)
 			}
 		} else {
 			log.Printf("[TRACE][OnPeerDisconnect] INBOUND closed: self=%s addr=%s (no ring change)", self, addr)
+			// Mark any ephemeral cluster entry as Dead so it doesn't
+			// linger in the peer list. This handles the case where
+			// MessageIdentityMeta added the node under the ephemeral
+			// address before handleAnnounce could remap it.
+			if s.Cluster != nil {
+				// Remove ephemeral cluster entry — it's an artifact of
+				// identity arriving before announce. Not a real node.
+				s.Cluster.RemoveNode(addr)
+				log.Printf("[TRACE][OnPeerDisconnect] removed ephemeral cluster entry: %s", addr)
+			}
 		}
 		return
 	}
@@ -2567,11 +3745,13 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 		s.HeartbeatSvc.RemovePeer(addr)
 	}
 
-	// Sprint 3: mark as suspect in membership table.
+	// Ground truth: the QUIC socket closed — this is cryptographic proof
+	// the peer is gone. Mark Dead immediately without bumping generation
+	// (the remote node owns its own clock). Its next heartbeat will
+	// naturally carry a higher generation and override this local state.
 	if s.Cluster != nil {
-		nextGen := s.Cluster.NextGeneration(addr)
-		log.Printf("[TRACE][OnPeerDisconnect] updating cluster: self=%s addr=%s to StateSuspect gen=%d", self, addr, nextGen)
-		s.Cluster.UpdateState(addr, membership.StateSuspect, nextGen)
+		log.Printf("[TRACE][OnPeerDisconnect] ground-truth Dead: self=%s addr=%s", self, addr)
+		s.Cluster.ForceLocalState(addr, membership.StateDead)
 	}
 }
 
@@ -2588,11 +3768,145 @@ func (s *Server) outboundPeerCount() int {
 	return count
 }
 
+// recordDialFailure bumps the backoff for a peer address.
+// Backoff schedule: 1min → 5min → 1hr (cap).
+func (s *Server) recordDialFailure(addr string) {
+	s.backoffMu.Lock()
+	defer s.backoffMu.Unlock()
+	exp := s.backoffExp[addr]
+	var dur time.Duration
+	switch exp {
+	case 0:
+		dur = 1 * time.Minute
+	case 1:
+		dur = 5 * time.Minute
+	default:
+		dur = 1 * time.Hour
+	}
+	s.backoffMap[addr] = time.Now().Add(dur)
+	if exp < 2 {
+		s.backoffExp[addr] = exp + 1
+	}
+}
+
+// clearBackoff resets backoff state for a peer (called on successful connect).
+func (s *Server) clearBackoff(addr string) {
+	s.backoffMu.Lock()
+	defer s.backoffMu.Unlock()
+	delete(s.backoffMap, addr)
+	delete(s.backoffExp, addr)
+}
+
+// isBackedOff returns true if the peer is still in its backoff penalty window.
+func (s *Server) isBackedOff(addr string) bool {
+	s.backoffMu.Lock()
+	defer s.backoffMu.Unlock()
+	earliest, ok := s.backoffMap[addr]
+	if !ok {
+		return false
+	}
+	if time.Now().After(earliest) {
+		// Backoff expired — allow retry.
+		delete(s.backoffMap, addr)
+		return false
+	}
+	return true
+}
+
+// connectionManagerLoop periodically attempts to reconnect known peers that
+// have gone offline. It respects maxPeers, exponential backoff, and the
+// ignored peers blocklist.
+func (s *Server) connectionManagerLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.quitch:
+			return
+		case <-ticker.C:
+			s.reconnectPass()
+		}
+	}
+}
+
+// reconnectPass dials known peers that are not currently connected, not
+// ignored, and not backed off. Limits dials to (maxPeers - active) per pass.
+func (s *Server) reconnectPass() {
+	active := s.outboundPeerCount()
+	if active >= s.maxPeers {
+		return // network healthy
+	}
+	needed := s.maxPeers - active
+
+	if s.StateDB == nil {
+		return
+	}
+	knownPeers, err := s.StateDB.ListKnownPeers()
+	if err != nil {
+		return
+	}
+
+	self := normalizeAddr(s.serverOpts.transport.Addr())
+
+	// Collect currently connected addrs.
+	s.peerLock.RLock()
+	connected := make(map[string]struct{}, len(s.peers))
+	for addr := range s.peers {
+		connected[addr] = struct{}{}
+	}
+	s.peerLock.RUnlock()
+
+	var candidates []string
+	for _, addr := range knownPeers {
+		addr = normalizeAddr(addr)
+		if addr == self {
+			continue
+		}
+		if _, ok := connected[addr]; ok {
+			continue
+		}
+		if s.StateDB.IsIgnoredPeer(addr) {
+			continue
+		}
+		if s.isBackedOff(addr) {
+			continue
+		}
+		// Skip if already dialing.
+		s.dialingLock.Lock()
+		_, dialing := s.dialingSet[addr]
+		s.dialingLock.Unlock()
+		if dialing {
+			continue
+		}
+		candidates = append(candidates, addr)
+		if len(candidates) >= needed {
+			break
+		}
+	}
+
+	for _, addr := range candidates {
+		go func(peerAddr string) {
+			log.Printf("[ConnMgr] attempting reconnect to %s", peerAddr)
+			if err := s.serverOpts.transport.Dial(peerAddr); err != nil {
+				log.Printf("[ConnMgr] failed to reconnect %s: %v", peerAddr, err)
+				s.recordDialFailure(peerAddr)
+			} else {
+				log.Printf("[ConnMgr] reconnected to %s", peerAddr)
+			}
+		}(addr)
+	}
+}
+
 func (s *Server) BootstrapNetwork() error {
 	var wg sync.WaitGroup
 	for _, addr := range s.serverOpts.bootstrapNodes {
 		if addr == "" {
 			continue
+		}
+		// Explicit --peers flag overrides any previous blocklist entry.
+		if s.StateDB != nil && s.StateDB.IsIgnoredPeer(addr) {
+			_ = s.StateDB.RemoveIgnoredPeer(addr)
+			log.Printf("[Bootstrap] Unblocked %s (explicit --peers flag)", addr)
 		}
 		wg.Add(1)
 		go func(addr string) {
@@ -2602,10 +3916,43 @@ func (s *Server) BootstrapNetwork() error {
 				log.Printf("[Bootstrap] Failed to dial %s: %v", addr, err)
 			} else {
 				log.Printf("[Bootstrap] Successfully connected to %s", addr)
+				if s.StateDB != nil {
+					_ = s.StateDB.AddKnownPeer(addr)
+				}
 			}
 		}(addr)
 	}
 	wg.Wait()
+
+	// Dial known peers asynchronously (fire-and-forget, don't block startup).
+	if s.StateDB != nil {
+		knownPeers, err := s.StateDB.ListKnownPeers()
+		if err == nil {
+			// Build set of bootstrap addrs to skip duplicates.
+			bootstrapSet := make(map[string]struct{}, len(s.serverOpts.bootstrapNodes))
+			for _, addr := range s.serverOpts.bootstrapNodes {
+				bootstrapSet[addr] = struct{}{}
+			}
+			for _, addr := range knownPeers {
+				if _, skip := bootstrapSet[addr]; skip {
+					continue
+				}
+				if s.StateDB.IsIgnoredPeer(addr) {
+					log.Printf("[Bootstrap] Skipping ignored peer: %s", addr)
+					continue
+				}
+				go func(peerAddr string) {
+					log.Printf("[Bootstrap] Reconnecting known peer: %s", peerAddr)
+					if err := s.serverOpts.transport.Dial(peerAddr); err != nil {
+						log.Printf("[Bootstrap] Known peer %s offline: %v", peerAddr, err)
+					} else {
+						log.Printf("[Bootstrap] Reconnected to known peer: %s", peerAddr)
+					}
+				}(addr)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -2621,6 +3968,17 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 		s.peerLock.Lock()
 		s.peers[addr] = p
 		s.peerLock.Unlock()
+		// Sprint E: register RTT monitor for adaptive throttling.
+		if s.BandwidthMgr != nil {
+			if src, ok := p.(ratelimit.RTTSource); ok {
+				s.BandwidthMgr.RegisterPeer(addr, src)
+			}
+		}
+		// SWIM Refutation: bump our own generation on any new connection
+		// so peers that previously marked us Dead will accept our heartbeats.
+		if s.Cluster != nil {
+			s.Cluster.BumpSelfGeneration()
+		}
 		log.Printf("[TRACE][OnPeer] INBOUND accepted from %s (not added to ring) self=%s", addr, self)
 		return nil
 	}
@@ -2642,6 +4000,7 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 	s.peerLock.Unlock()
 
 	s.HashRing.AddNode(normalizeAddr(addr))
+	s.clearBackoff(addr) // successful connect — reset any backoff
 	peerCount := s.outboundPeerCount()
 	log.Printf("[TRACE][OnPeer] RING UPDATED self=%s added=%s ring_size=%d peer_count=%d", self, normalizeAddr(addr), s.HashRing.Size(), peerCount)
 	metrics.SetPeerCount(peerCount)
@@ -2680,14 +4039,157 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 	}
 
 	// Sprint 3: record peer as Alive in membership table.
+	// Only insert new nodes here. For reconnecting nodes that were previously
+	// Dead/Suspect, we do NOT locally bump their generation — the remote node
+	// owns its own generation (unix-nano timestamp). The next gossip heartbeat
+	// from the remote will carry a generation higher than any stale local
+	// state, and UpdateState will naturally accept it.
 	if s.Cluster != nil {
 		s.Cluster.AddNode(addr, nil)
-		// If it was previously suspect/dead (reconnect), restore to Alive.
-		nextGen := s.Cluster.NextGeneration(addr)
-		s.Cluster.UpdateState(addr, membership.StateAlive, nextGen)
+		// SWIM Refutation: bump OUR OWN generation so that any peer that
+		// previously marked us Dead/Suspect will accept our heartbeats.
+		// We only bump self — never touch another node's generation.
+		s.Cluster.BumpSelfGeneration()
 	}
 
+	// Reset the failure detector for this peer so stale heartbeat gaps
+	// from the previous session don't trigger a premature death declaration.
+	if s.HeartbeatSvc != nil {
+		s.HeartbeatSvc.RecordHeartbeat(addr)
+	}
+
+	// Sprint E: register RTT monitor for adaptive throttling.
+	if s.BandwidthMgr != nil {
+		if src, ok := p.(ratelimit.RTTSource); ok {
+			s.BandwidthMgr.RegisterPeer(addr, src)
+		}
+	}
+
+	// Sprint G: auto-persist outbound peers for reconnection on restart.
+	if s.StateDB != nil {
+		_ = s.StateDB.AddKnownPeer(addr)
+	}
+
+	// Flush outbox: deliver any pending direct-shares queued while this peer was offline.
+	go s.FlushOutbox(addr)
+
 	return nil
+}
+
+// ConnectPeer dials a new peer and persists it in the known peers list.
+// If the peer was previously blocklisted, the blocklist entry is removed
+// since a manual connect is an explicit user intent to reconnect.
+func (s *Server) ConnectPeer(addr string) error {
+	// Clear blocklist entry if present — user explicitly wants this peer.
+	if s.StateDB != nil && s.StateDB.IsIgnoredPeer(addr) {
+		_ = s.StateDB.RemoveIgnoredPeer(addr)
+		log.Printf("[ConnectPeer] removed %s from blocklist (manual reconnect)", addr)
+	}
+	if err := s.serverOpts.transport.Dial(addr); err != nil {
+		return fmt.Errorf("dial %s: %w", addr, err)
+	}
+	if s.StateDB != nil {
+		_ = s.StateDB.AddKnownPeer(addr)
+	}
+	return nil
+}
+
+// IsPeerConnected returns true if addr has an active transport connection.
+func (s *Server) IsPeerConnected(addr string) bool {
+	s.peerLock.RLock()
+	_, ok := s.peers[addr]
+	s.peerLock.RUnlock()
+	return ok
+}
+
+// DisconnectPeer closes the connection to a peer and removes it from known peers.
+// Also closes any inbound connection from the same node (stored under an
+// ephemeral address) so the peer cannot continue sending gossip after disconnect.
+func (s *Server) DisconnectPeer(addr string) error {
+	s.peerLock.Lock()
+	p, ok := s.peers[addr]
+	if !ok {
+		s.peerLock.Unlock()
+		return fmt.Errorf("peer %s not found", addr)
+	}
+	delete(s.peers, addr)
+
+	// Also close the reverse inbound connection if one exists.
+	// announceAdded maps canonical → ephemeral for inbound peers.
+	// We also need to check for any inbound peer stored under addr
+	// (when the canonical IS the addr used by announceAdded).
+	var inboundPeer peer2peer.Peer
+	var inboundAddr string
+	for canonical, ephemeral := range s.announceAdded {
+		if canonical == addr {
+			// Our outbound addr matches a canonical that was announce-added.
+			// The inbound may be stored under the ephemeral or canonical.
+			if ip, bok := s.peers[ephemeral]; bok {
+				inboundPeer = ip
+				inboundAddr = ephemeral
+			}
+			delete(s.announceAdded, canonical)
+			break
+		}
+	}
+	if inboundPeer != nil {
+		delete(s.peers, inboundAddr)
+	}
+	s.peerLock.Unlock()
+
+	p.Close()
+	if inboundPeer != nil {
+		inboundPeer.Close()
+		log.Printf("[DisconnectPeer] also closed inbound connection from %s (ephemeral %s)", addr, inboundAddr)
+	}
+	s.HashRing.RemoveNode(addr)
+
+	if s.Cluster != nil {
+		// Ground truth: we closed the connection. Mark Dead without
+		// stealing the remote node's generation clock.
+		s.Cluster.ForceLocalState(addr, membership.StateDead)
+	}
+	if s.BandwidthMgr != nil {
+		s.BandwidthMgr.UnregisterPeer(addr)
+	}
+	if s.StateDB != nil {
+		_ = s.StateDB.RemoveKnownPeer(addr)
+	}
+	return nil
+}
+
+// DisconnectAndIgnorePeer disconnects a peer AND adds it to the blocklist
+// so gossip won't re-dial it. Use UnblockPeer to reverse.
+func (s *Server) DisconnectAndIgnorePeer(addr string) error {
+	// Look up the peer's identity fingerprint before disconnecting,
+	// so the blocklist entry survives IP/port changes (DHCP, NAT).
+	var fingerprint string
+	if s.Cluster != nil {
+		if node, ok := s.Cluster.GetNode(addr); ok && node.Metadata != nil {
+			fingerprint = node.Metadata["fingerprint"]
+		}
+	}
+
+	// Best-effort disconnect — peer may already be gone (e.g. remote side
+	// closed first).  We still need to add it to the blocklist below.
+	_ = s.DisconnectPeer(addr)
+
+	if s.StateDB != nil {
+		_ = s.StateDB.AddIgnoredPeer(State.IgnoredPeerEntry{
+			Addr:        addr,
+			Fingerprint: fingerprint,
+			IgnoredAt:   time.Now().UnixNano(),
+		})
+	}
+	return nil
+}
+
+// UnblockPeer removes a peer from the ignored list, allowing reconnection.
+func (s *Server) UnblockPeer(addr string) error {
+	if s.StateDB == nil {
+		return fmt.Errorf("no state DB")
+	}
+	return s.StateDB.RemoveIgnoredPeer(addr)
 }
 
 func init() {
@@ -2717,12 +4219,21 @@ func init() {
 	gob.Register(&MessageChunkOffer{})
 	gob.Register(&MessageChunkNeed{})
 	gob.Register(&MessageIdentityMeta{})
+	gob.Register(&MessageGetPublicCatalog{})
+	gob.Register(&MessagePublicCatalogResponse{})
+	gob.Register(&MessageDeleteFile{})
+	gob.Register(&MessageSearchRequest{})
+	gob.Register(&MessageSearchResponse{})
+	gob.Register(&MessageDirectShare{})
 }
 
 // MakeServerOpts holds optional configuration for MakeServer.
 type MakeServerOpts struct {
 	IdentityMeta map[string]string // gossip metadata from identity (alias, fingerprint, keys)
 	DisableSTUN  bool              // skip STUN-based NAT traversal (default: false = STUN enabled)
+	MaxTransfers int               // concurrent transfer limit (0 = unlimited)
+	MaxPeers     int               // target active peer connections (0 = default 8, clamped to 100)
+	StateDBPath  string            // path to persistent state DB (empty = disabled)
 }
 
 func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOpts, node ...string) *Server {
@@ -2808,6 +4319,38 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 
 	s := NewServer(opts)
 	sptr = s // wire closure so transport callbacks reach the server
+
+	// Sprint E: adaptive bandwidth management (always-on LEDBAT-lite).
+	s.BandwidthMgr = ratelimit.New(ratelimit.Config{
+		MaxTransfers: makeOpts.MaxTransfers,
+	})
+
+	// Sprint F: persistent local state.
+	if makeOpts.StateDBPath != "" {
+		sdb, err := State.Open(makeOpts.StateDBPath)
+		if err != nil {
+			log.Printf("[WARN] failed to open state DB at %s: %v (continuing without state)", makeOpts.StateDBPath, err)
+		} else {
+			s.StateDB = sdb
+		}
+	}
+
+	// Sprint G: active transfer queue + search dedup.
+	s.TransferMgr = transfer.NewManager()
+	s.searchSeen = NewSearchRequestCache()
+
+	// Connection Manager: backoff tracking + target peer count.
+	s.backoffMap = make(map[string]time.Time)
+	s.backoffExp = make(map[string]int)
+	const absoluteMaxPeers = 100
+	if makeOpts.MaxPeers > 0 {
+		s.maxPeers = makeOpts.MaxPeers
+	} else {
+		s.maxPeers = 8
+	}
+	if s.maxPeers > absoluteMaxPeers {
+		s.maxPeers = absoluteMaxPeers
+	}
 
 	// Sprint 2: wire HeartbeatService
 	hbCfg := failure.DefaultConfig()
@@ -3060,7 +4603,7 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	reg := prometheus.NewRegistry()
 	metrics.Reset()
 	metrics.Init(reg)
-	s.HealthSrv = health.New(healthPort, s.healthStatus, reg)
+	s.HealthSrv = health.New(healthPort, s.HealthStatus, reg)
 	if err := s.HealthSrv.Start(); err != nil {
 		log.Printf("[MakeServer] health server on %s failed to start: %v (continuing without health endpoint)", healthPort, err)
 		s.HealthSrv = nil
@@ -3125,6 +4668,21 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 			if addrPort == selfPort && isLocalAddr(addrHost) {
 				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (self-loopback via local interface)", self, addr)
 				return
+			}
+
+			// Blocklist check — manually disconnected peers stay disconnected.
+			if s.StateDB != nil && s.StateDB.IsIgnoredPeer(addr) {
+				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (ignored/blocklisted by addr)", self, addr)
+				return
+			}
+			// Fingerprint-based blocklist: catches peers that changed IP (DHCP).
+			if s.StateDB != nil && s.Cluster != nil {
+				if node, ok := s.Cluster.GetNode(addr); ok && node.Metadata != nil {
+					if fp := node.Metadata["fingerprint"]; fp != "" && s.StateDB.IsIgnoredFingerprint(fp) {
+						log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (ignored/blocklisted by fingerprint %s)", self, addr, fp)
+						return
+					}
+				}
 			}
 
 			// Check peers map first — fastest path.

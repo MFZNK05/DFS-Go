@@ -31,6 +31,7 @@ package tracing
 import (
 	"context"
 
+	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -51,9 +52,12 @@ const tracerName = "github.com/Faizan2005/DFS-Go"
 // Returns a shutdown function that must be called on process exit to flush
 // buffered spans. It is safe to call even when the no-op tracer is active.
 func Init(serviceName, endpoint string) (shutdown func(context.Context) error, err error) {
+	// Silence OTel's internal logger (it captures os.Stderr at init time).
+	otel.SetLogger(logr.Discard())
+
 	if endpoint == "" {
-		// No-op: install the default (no-op) tracer. Nothing to flush.
-		otel.SetTracerProvider(otel.GetTracerProvider())
+		// No-op: just set up propagators. Don't call SetTracerProvider with
+		// the default provider — that triggers a spurious warning log.
 		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{},
 			propagation.Baggage{},

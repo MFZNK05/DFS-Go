@@ -79,6 +79,15 @@ func InitWithWriter(w io.Writer, component string, level Level) {
 	Global = &Logger{zl: zl}
 }
 
+// SetOutput redirects the Global logger to w.  Call after Init.
+// This is used to redirect daemon logs to a file when running under the TUI.
+func SetOutput(w io.Writer) {
+	if Global == nil {
+		return
+	}
+	Global.zl = Global.zl.Output(w)
+}
+
 // New creates a standalone Logger (does not affect Global).
 func New(component string, level Level) *Logger {
 	zerolog.TimeFieldFormat = time.RFC3339Nano

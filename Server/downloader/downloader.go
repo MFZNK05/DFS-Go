@@ -12,6 +12,7 @@
 package downloader
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -93,7 +94,7 @@ func New(cfg Config, sel *selector.Selector, fetch FetchFunc, decrypt DecryptFun
 //
 // Memory: MaxParallel * ChunkSize (e.g., 4 * 4 MiB = 16 MiB).
 // Concurrent WriteAt to different offsets on *os.File is safe on POSIX.
-func (m *Manager) DownloadToFile(manifest *chunker.ChunkManifest, dst io.WriterAt, progress ProgressFunc, dek []byte) error {
+func (m *Manager) DownloadToFile(ctx context.Context, manifest *chunker.ChunkManifest, dst io.WriterAt, progress ProgressFunc, dek []byte) error {
 	n := len(manifest.Chunks)
 	if n == 0 {
 		return nil
@@ -105,6 +106,9 @@ func (m *Manager) DownloadToFile(manifest *chunker.ChunkManifest, dst io.WriterA
 	var completed atomic.Int32
 
 	for i, info := range manifest.Chunks {
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{} // acquire slot
 
@@ -165,6 +169,7 @@ type ChunkRecordFunc func(index int, hash string)
 // After each new chunk is written, onChunkDone is called so the caller can
 // record it in the resume sidecar. onChunkDone may be nil.
 func (m *Manager) DownloadToFileResumable(
+	ctx context.Context,
 	manifest *chunker.ChunkManifest,
 	dst io.WriterAt,
 	skipSet map[int]bool,
@@ -202,6 +207,9 @@ func (m *Manager) DownloadToFileResumable(
 	}
 
 	for i, info := range manifest.Chunks {
+		if ctx.Err() != nil {
+			break
+		}
 		if skipSet[i] {
 			continue // already verified on disk
 		}
