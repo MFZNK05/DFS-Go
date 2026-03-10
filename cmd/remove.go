@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/Faizan2005/DFS-Go/Crypto/identity"
 	"github.com/spf13/cobra"
@@ -17,12 +16,12 @@ var removeCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id, err := identity.Load(identity.DefaultPath())
 		if err != nil {
-			return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+			return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 		}
 
 		key := id.Fingerprint() + "/" + args[0]
 
-		conn, err := net.Dial("unix", socketPath(removeNode))
+		conn, err := ipcDial(socketPath(removeNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

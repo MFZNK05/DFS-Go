@@ -26,7 +26,7 @@ func runUnified() error {
 	homeDir, _ := os.UserHomeDir()
 	var logFile *os.File
 	if homeDir != "" {
-		logDir := filepath.Join(homeDir, ".dfs")
+		logDir := filepath.Join(homeDir, ".hermond")
 		os.MkdirAll(logDir, 0700)
 		var err error
 		logFile, err = os.OpenFile(filepath.Join(logDir, "daemon.log"),
@@ -53,13 +53,31 @@ func runUnified() error {
 	})
 }
 
+// migrateConfigDir renames ~/.dfs to ~/.hermond for users upgrading from the old name.
+func migrateConfigDir() {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return
+	}
+	oldDir := filepath.Join(home, ".dfs")
+	newDir := filepath.Join(home, ".hermond")
+	if _, err := os.Stat(newDir); err == nil {
+		return // already migrated
+	}
+	if _, err := os.Stat(oldDir); err != nil {
+		return // nothing to migrate
+	}
+	os.Rename(oldDir, newDir)
+}
+
 func ensureIdentity() (*identity.Identity, error) {
+	migrateConfigDir()
 	path := identity.DefaultPath()
 	if id, err := identity.Load(path); err == nil {
 		return id, nil
 	}
 
-	fmt.Print("Welcome to DFS! Enter your alias: ")
+	fmt.Print("Welcome to Hermond! Enter your alias: ")
 	var alias string
 	fmt.Scanln(&alias)
 	alias = strings.TrimSpace(alias)

@@ -1,8 +1,8 @@
 build:
-		@go build -o bin/dfs
+		@go build -o bin/hermond
 
 run: build
-		@./bin/dfs
+		@./bin/hermond
 
 test:
 		@go test -v ./...

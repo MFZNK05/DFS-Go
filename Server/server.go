@@ -523,7 +523,7 @@ func (s *Server) GetDataToFile(ctx context.Context, key string, filePath string,
 	sidecar.Close()
 	_ = resume.Cleanup(filePath)
 
-	if err := os.Rename(partPath, filePath); err != nil {
+	if err := storage.SafeRename(partPath, filePath); err != nil {
 		return fmt.Errorf("GetDataToFile: rename %q → %q: %w", partPath, filePath, err)
 	}
 

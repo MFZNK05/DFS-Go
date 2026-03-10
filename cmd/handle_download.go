@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +27,7 @@ func DownloadFile(name, outputPath, fromAlias, fromKey, sockPath string) error {
 	// Load identity — required for all downloads (fingerprint namespace).
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 	}
 
 	// Determine the owner's fingerprint.
@@ -79,7 +78,7 @@ func downloadToFile(storageKey, outputPath string, dek []byte, sockPath string) 
 		return fmt.Errorf("resolve path: %w", err)
 	}
 
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return err
 	}
@@ -126,7 +125,7 @@ func downloadToFile(storageKey, outputPath string, dek []byte, sockPath string) 
 // downloadToStream uses the legacy streaming path (opcode 0x02/0x04).
 // Bytes flow sequentially over the IPC socket to stdout.
 func downloadToStream(storageKey string, dek []byte, sockPath string) error {
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return err
 	}
@@ -169,7 +168,7 @@ func resolveOwner(id *identity.Identity, fromAlias, fromKey, sockPath string) (s
 		return fromKey, nil
 	}
 	if fromAlias != "" {
-		resolveConn, err := net.Dial("unix", sockPath)
+		resolveConn, err := ipcDial(sockPath)
 		if err != nil {
 			return "", err
 		}
@@ -200,7 +199,7 @@ func resolveOwner(id *identity.Identity, fromAlias, fromKey, sockPath string) (s
 
 // fetchManifestInfo retrieves the manifest metadata for the given key.
 func fetchManifestInfo(storageKey, sockPath string) (*manifestInfoResponse, error) {
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +247,7 @@ func unwrapDEK(id *identity.Identity, resp *manifestInfoResponse) ([]byte, error
 func DownloadDirectory(name, outputDir, fromAlias, fromKey, sockPath string) error {
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 	}
 
 	ownerFingerprint, err := resolveOwner(id, fromAlias, fromKey, sockPath)
@@ -284,7 +283,7 @@ func downloadDirectoryInner(storageKey, outputDir string, id *identity.Identity,
 		return fmt.Errorf("resolve path: %w", err)
 	}
 
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return err
 	}

@@ -8,19 +8,20 @@ import (
 	"github.com/Faizan2005/DFS-Go/ipc"
 )
 
-// DaemonClient communicates with the DFS daemon over a Unix socket.
+// DaemonClient communicates with the daemon over IPC
+// (Unix socket on Linux/macOS, named pipe on Windows).
 type DaemonClient struct {
 	SockPath string
 }
 
-// NewDaemonClient creates a client for the given socket path.
+// NewDaemonClient creates a client for the given IPC address.
 func NewDaemonClient(sockPath string) *DaemonClient {
 	return &DaemonClient{SockPath: sockPath}
 }
 
 // dial opens a new connection to the daemon.
 func (c *DaemonClient) dial() (net.Conn, error) {
-	return net.Dial("unix", c.SockPath)
+	return ipc.Dial(c.SockPath)
 }
 
 // NodeStatus queries the daemon for node status info.

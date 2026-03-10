@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -12,10 +11,10 @@ var disconnectNode string
 var disconnectCmd = &cobra.Command{
 	Use:   "disconnect <addr-or-alias>",
 	Short: "Disconnect and blocklist a peer",
-	Long:  "Disconnects from a peer and adds it to the local blocklist so it won't reconnect automatically. Use 'dfs unblock' to reverse.",
+	Long:  "Disconnects from a peer and adds it to the local blocklist so it won't reconnect automatically. Use 'hermond unblock' to reverse.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(disconnectNode))
+		conn, err := ipcDial(socketPath(disconnectNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

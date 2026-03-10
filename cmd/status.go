@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -14,7 +13,7 @@ var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show node status",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(statusNode))
+		conn, err := ipcDial(socketPath(statusNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

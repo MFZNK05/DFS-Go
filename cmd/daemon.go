@@ -41,16 +41,16 @@ func StartDaemonAsync(port string, peers []string, replicationFactor int, disabl
 	}
 
 	otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	shutdownTracing, err := tracing.Init("dfs-node", otlpEndpoint)
+	shutdownTracing, err := tracing.Init("hermond-node", otlpEndpoint)
 	if err != nil {
 		logging.Global.Warn("tracing init failed, continuing without tracing", "err", err)
 		shutdownTracing = func(_ context.Context) error { return nil }
 	}
 
 	sockPath := socketPath(port)
-	_ = os.RemoveAll(sockPath)
+	cleanupSocket(sockPath)
 
-	listener, err := net.Listen("unix", sockPath)
+	listener, err := ipcListen(sockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -60,12 +60,12 @@ func StartDaemonAsync(port string, peers []string, replicationFactor int, disabl
 		logging.Global.Info("identity loaded", "alias", id.Alias, "fingerprint", id.Fingerprint())
 		makeOpts.IdentityMeta = id.GossipMetadata()
 	} else {
-		logging.Global.Warn("no identity found — ECDH sharing disabled. Run 'dfs identity init --alias <name>'")
+		logging.Global.Warn("no identity found — ECDH sharing disabled. Run 'hermond identity init --alias <name>'")
 	}
 
 	homeDir, _ := os.UserHomeDir()
 	if homeDir != "" {
-		stateDir := filepath.Join(homeDir, ".dfs")
+		stateDir := filepath.Join(homeDir, ".hermond")
 		os.MkdirAll(stateDir, 0700)
 		dbName := fmt.Sprintf("state-%s.db", strings.TrimLeft(port, ":"))
 		makeOpts.StateDBPath = filepath.Join(stateDir, dbName)

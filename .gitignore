@@ -6,6 +6,8 @@
 
 # Binary outputs
 bin/
+hermond
+dfs
 *.exe
 
 # Go build cache
@@ -21,6 +23,14 @@ bin/
 .DS_Store
 Thumbs.db
 
-# Data directories (created at runtime)
+# Data directories and runtime files
 *_network/
 *_metadata.json
+*.db
+
+# Transfer artifacts
+*.part
+*.resume
+
+# Stress test data
+_stress_test/

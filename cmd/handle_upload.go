@@ -28,7 +28,7 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public
 	// Load identity — required for all uploads (fingerprint namespace).
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 	}
 
 	f, err := os.Open(filePath)
@@ -45,7 +45,7 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public
 	// Storage key = fingerprint/name (prevents collisions between users).
 	storageKey := id.Fingerprint() + "/" + name
 
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return err
 	}
@@ -111,7 +111,7 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public
 
 		// Need a fresh connection — the resolve alias calls consumed the first one.
 		conn.Close()
-		conn, err = net.Dial("unix", sockPath)
+		conn, err = ipcDial(sockPath)
 		if err != nil {
 			return err
 		}
@@ -181,8 +181,10 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public
 	}
 
 	// Signal EOF so the daemon's io.Reader sees end-of-stream.
-	if uc, ok := conn.(*net.UnixConn); ok {
-		uc.CloseWrite()
+	// Works with Unix sockets (net.UnixConn) and named pipes (npipe).
+	type closeWriter interface{ CloseWrite() error }
+	if cw, ok := conn.(closeWriter); ok {
+		cw.CloseWrite()
 	}
 
 	// Wait for the daemon's final response.
@@ -224,7 +226,7 @@ func resolveRecipients(conn net.Conn, shareWith, shareWithKey, sockPath string) 
 			}
 
 			// Each alias resolution needs its own connection.
-			resolveConn, err := net.Dial("unix", sockPath)
+			resolveConn, err := ipcDial(sockPath)
 			if err != nil {
 				return nil, fmt.Errorf("connect for alias resolution: %w", err)
 			}
@@ -272,7 +274,7 @@ func resolveRecipients(conn net.Conn, shareWith, shareWithKey, sockPath string) 
 			// TODO: For now, treat as direct X25519 pub hex if it's 64 chars.
 			// A proper approach would add a fingerprint-based lookup opcode.
 			// Since fingerprints are propagated via gossip, we search all nodes.
-			resolveConn, err := net.Dial("unix", sockPath)
+			resolveConn, err := ipcDial(sockPath)
 			if err != nil {
 				return nil, fmt.Errorf("connect for key resolution: %w", err)
 			}
@@ -303,7 +305,7 @@ func resolveRecipients(conn net.Conn, shareWith, shareWithKey, sockPath string) 
 func UploadDirectory(name, dirPath, shareWith, shareWithKey, sockPath string, public bool) error {
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 	}
 
 	storageKey := id.Fingerprint() + "/" + name
@@ -313,7 +315,7 @@ func UploadDirectory(name, dirPath, shareWith, shareWithKey, sockPath string, pu
 		return fmt.Errorf("resolve path: %w", err)
 	}
 
-	conn, err := net.Dial("unix", sockPath)
+	conn, err := ipcDial(sockPath)
 	if err != nil {
 		return err
 	}
@@ -371,7 +373,7 @@ func UploadDirectory(name, dirPath, shareWith, shareWithKey, sockPath string, pu
 		}
 
 		conn.Close()
-		conn, err = net.Dial("unix", sockPath)
+		conn, err = ipcDial(sockPath)
 		if err != nil {
 			return err
 		}
@@ -440,7 +442,7 @@ func autoNotifyRecipients(sockPath, storageKey, shareWith string) {
 		if alias == "" {
 			continue
 		}
-		notifyConn, err := net.Dial("unix", sockPath)
+		notifyConn, err := ipcDial(sockPath)
 		if err != nil {
 			fmt.Printf("  (could not notify %s: %v)\n", alias, err)
 			continue

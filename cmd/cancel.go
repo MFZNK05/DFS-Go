@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -14,7 +13,7 @@ var cancelCmd = &cobra.Command{
 	Short: "Cancel an active transfer",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(cancelNode))
+		conn, err := ipcDial(socketPath(cancelNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

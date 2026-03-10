@@ -193,8 +193,9 @@ func (s *Store) WriteStream(key string, r io.Reader) (int64, error) {
 	finalPath := filepath.Join(fullPath, pathKey.filename)
 	log.Printf("WRITE_STREAM: Final path for file: %s", finalPath)
 
-	// Rename temp file to final content-addressed path
-	if err := os.Rename(tempPath, finalPath); err != nil {
+	// Rename temp file to final content-addressed path.
+	// SafeRename handles Windows where os.Rename fails if dst exists.
+	if err := SafeRename(tempPath, finalPath); err != nil {
 		log.Printf("WRITE_STREAM: Failed to rename temp file: %v", err)
 		return 0, err
 	}

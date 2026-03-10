@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -15,7 +14,7 @@ var connectCmd = &cobra.Command{
 	Long:  "Manually connect to a peer. If the peer was previously blocklisted, the blocklist entry is removed.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(connectNode))
+		conn, err := ipcDial(socketPath(connectNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

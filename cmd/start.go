@@ -15,7 +15,7 @@ var maxPeers int
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start the DFS daemon server",
+	Short: "Start the Hermond daemon server",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Starting daemon on", port)
 		return StartDaemon(port, peers, replicationFactor, noSTUN, maxTransfers, maxPeers)

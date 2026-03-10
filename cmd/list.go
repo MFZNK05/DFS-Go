@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/Faizan2005/DFS-Go/State"
@@ -25,7 +24,7 @@ var listUploadsCmd = &cobra.Command{
 	Use:   "uploads",
 	Short: "List upload history",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(listNode))
+		conn, err := ipcDial(socketPath(listNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}
@@ -91,7 +90,7 @@ var listPublicCmd = &cobra.Command{
 	Use:   "public",
 	Short: "List public file catalog",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(listNode))
+		conn, err := ipcDial(socketPath(listNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}
@@ -141,7 +140,7 @@ var listDownloadsCmd = &cobra.Command{
 	Use:   "downloads",
 	Short: "List download history",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(listNode))
+		conn, err := ipcDial(socketPath(listNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

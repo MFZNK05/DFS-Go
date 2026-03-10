@@ -54,7 +54,7 @@ var identityShowCmd = &cobra.Command{
 		path := identity.DefaultPath()
 		id, err := identity.Load(path)
 		if err != nil {
-			return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+			return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 		}
 
 		fmt.Printf("Alias:         %s\n", id.Alias)

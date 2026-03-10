@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -14,7 +13,7 @@ var peersCmd = &cobra.Command{
 	Use:   "peers",
 	Short: "List connected peers",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(peersNode))
+		conn, err := ipcDial(socketPath(peersNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

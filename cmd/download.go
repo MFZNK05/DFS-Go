@@ -28,7 +28,7 @@ var downloadCmd = &cobra.Command{
 		// Unified stat: one IPC round-trip tells us if it's a file or directory.
 		id, err := identity.Load(identity.DefaultPath())
 		if err != nil {
-			return fmt.Errorf("no identity found. Run 'dfs identity init --alias <name>' first")
+			return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
 		}
 		ownerFingerprint, err := resolveOwner(id, downloadFrom, downloadFromKey, sock)
 		if err != nil {

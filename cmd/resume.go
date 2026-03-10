@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -14,7 +13,7 @@ var resumeCmd = &cobra.Command{
 	Short: "Resume a paused transfer",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(resumeNode))
+		conn, err := ipcDial(socketPath(resumeNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

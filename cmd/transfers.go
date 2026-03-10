@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/Faizan2005/DFS-Go/ipc"
@@ -16,7 +15,7 @@ var transfersCmd = &cobra.Command{
 	Use:   "transfers",
 	Short: "List active transfers",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(transfersNode))
+		conn, err := ipcDial(socketPath(transfersNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

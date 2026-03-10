@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 
 	"github.com/Faizan2005/DFS-Go/State"
 	"github.com/spf13/cobra"
@@ -18,7 +17,7 @@ var browseCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		peerAddr := args[0]
 
-		conn, err := net.Dial("unix", socketPath(browseNode))
+		conn, err := ipcDial(socketPath(browseNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

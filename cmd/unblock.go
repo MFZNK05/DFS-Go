@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/spf13/cobra"
 )
@@ -12,10 +11,10 @@ var unblockNode string
 var unblockCmd = &cobra.Command{
 	Use:   "unblock <addr-or-alias>",
 	Short: "Remove a peer from the blocklist",
-	Long:  "Removes a previously disconnected peer from the blocklist, allowing it to reconnect. Use 'dfs connect' afterwards to re-establish the connection.",
+	Long:  "Removes a previously disconnected peer from the blocklist, allowing it to reconnect. Use 'hermond connect' afterwards to re-establish the connection.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(unblockNode))
+		conn, err := ipcDial(socketPath(unblockNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

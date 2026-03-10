@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/Faizan2005/DFS-Go/ipc"
 	"github.com/spf13/cobra"
@@ -13,12 +12,12 @@ var sendNode string
 var sendCmd = &cobra.Command{
 	Use:   "send <file-key> <peer-addr-or-alias>",
 	Short: "Send a file directly to a peer",
-	Long:  "Sends a direct-share notification for one of your uploaded files to a specific peer. The file must already be uploaded (visible in 'dfs list uploads').",
+	Long:  "Sends a direct-share notification for one of your uploaded files to a specific peer. The file must already be uploaded (visible in 'hermond list uploads').",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fileKey, peer := args[0], args[1]
 
-		conn, err := net.Dial("unix", socketPath(sendNode))
+		conn, err := ipcDial(socketPath(sendNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}

@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 
 	server "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/spf13/cobra"
@@ -16,7 +15,7 @@ var searchCmd = &cobra.Command{
 	Short: "Search for files across the network",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		conn, err := net.Dial("unix", socketPath(searchNode))
+		conn, err := ipcDial(socketPath(searchNode))
 		if err != nil {
 			return fmt.Errorf("connect to daemon: %w", err)
 		}
