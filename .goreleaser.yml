@@ -33,9 +33,9 @@ checksum:
 
 brews:
   - repository:
-      owner: Faizan2005
+      owner: MFZNK05
       name: homebrew-hermond
-    homepage: "https://github.com/Faizan2005/DFS-Go"
+    homepage: "https://github.com/MFZNK05/DFS-Go"
     description: "Hermond – P2P File Sharing for Campus Networks"
     license: "MIT"
     install: |
