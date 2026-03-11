@@ -150,6 +150,12 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case LANScanMsg:
+		if msg.Err == nil {
+			m.network.SetDiscovered(msg.Peers)
+		}
+		return m, nil
+
 	case BrowseResultsMsg:
 		if msg.Err != nil {
 			return m, m.setError("browse: %v", msg.Err)
@@ -279,7 +285,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, fetchStatus(m.client))
 		switch m.activeTab {
 		case tabNetwork:
-			cmds = append(cmds, fetchPeers(m.client))
+			cmds = append(cmds, fetchPeers(m.client), fetchLANPeers(m.client))
 		case tabTransfers:
 			cmds = append(cmds, fetchTransfers(m.client))
 		case tabVault:
@@ -379,7 +385,7 @@ func (m RootModel) switchTab(tab int) RootModel {
 func (m RootModel) onTabActivated(tab int) tea.Cmd {
 	switch tab {
 	case tabNetwork:
-		return fetchPeers(m.client)
+		return tea.Batch(fetchPeers(m.client), fetchLANPeers(m.client))
 	case tabTransfers:
 		return fetchTransfers(m.client)
 	case tabVault:
@@ -504,6 +510,13 @@ func fetchInbox(c *DaemonClient) tea.Cmd {
 	return func() tea.Msg {
 		inbox, err := c.ListInbox()
 		return InboxUpdatedMsg{Inbox: inbox, Err: err}
+	}
+}
+
+func fetchLANPeers(c *DaemonClient) tea.Cmd {
+	return func() tea.Msg {
+		peers, err := c.ScanLAN()
+		return LANScanMsg{Peers: peers, Err: err}
 	}
 }
 

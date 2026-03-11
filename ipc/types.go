@@ -151,3 +151,10 @@ type BrowseEntry struct {
 	Label      string `json:"label"`              // "public", "shared", "inbox"
 	Timestamp  int64  `json:"timestamp,omitempty"` // unix nano, for sorting
 }
+
+// DiscoveredPeer holds a node found via mDNS LAN scan.
+type DiscoveredPeer struct {
+	Alias       string `json:"alias"`
+	Fingerprint string `json:"fingerprint"`
+	Addr        string `json:"addr"` // host:port
+}

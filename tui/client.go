@@ -299,6 +299,30 @@ func (c *DaemonClient) SendToPeer(fileKey, peerAddr string) (string, error) {
 	return msg, nil
 }
 
+// ScanLAN triggers an mDNS scan for Hermond peers on the local network.
+func (c *DaemonClient) ScanLAN() ([]ipc.DiscoveredPeer, error) {
+	conn, err := c.dial()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{ipc.OpScanLAN}); err != nil {
+		return nil, err
+	}
+
+	data, err := ipc.ReadJSONResponse(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	var peers []ipc.DiscoveredPeer
+	if err := json.Unmarshal(data, &peers); err != nil {
+		return nil, err
+	}
+	return peers, nil
+}
+
 func (c *DaemonClient) peerAction(op byte, addr string) (string, error) {
 	conn, err := c.dial()
 	if err != nil {

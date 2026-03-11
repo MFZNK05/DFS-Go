@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"github.com/Faizan2005/DFS-Go/Observability/logging"
 	"github.com/Faizan2005/DFS-Go/Observability/metrics"
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
+	peermdns "github.com/Faizan2005/DFS-Go/Peer2Peer/mdns"
 	"github.com/Faizan2005/DFS-Go/Peer2Peer/nat"
 	quicTransport "github.com/Faizan2005/DFS-Go/Peer2Peer/quic"
 	"github.com/Faizan2005/DFS-Go/Server/downloader"
@@ -155,6 +157,9 @@ type Server struct {
 
 	// Sprint G: search request dedup cache (flood loop prevention).
 	searchSeen *SearchRequestCache
+
+	// mDNS LAN auto-discovery advertiser (nil if identity not loaded).
+	MDNSAdvertiser *peermdns.Advertiser
 
 	// Connection Manager: auto-reconnection with exponential backoff.
 	backoffMu  sync.Mutex
@@ -1804,6 +1809,21 @@ func normalizeAddr(addr string) string {
 	return addr
 }
 
+// DefaultPort is the well-known default port for Hermond nodes.
+const DefaultPort = "3000"
+
+// NormalizeUserAddr ensures addr has a port. Bare IPs get DefaultPort appended.
+// Used at all user-input boundaries (--peer flag, TUI connect, CLI connect).
+func NormalizeUserAddr(addr string) string {
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr // already has port
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		return net.JoinHostPort(addr, DefaultPort)
+	}
+	return addr // hostname or alias — return as-is
+}
+
 // isLocalAddr returns true if host matches one of this machine's own network
 // interface addresses. Used by handleAnnounce to reject self-connections that
 // arrive when gossip causes a node to dial its own alternate IP.
@@ -2613,6 +2633,9 @@ func (s *Server) GracefulShutdown() {
 	if s.AntiEntropy != nil {
 		s.AntiEntropy.Stop()
 	}
+	if s.MDNSAdvertiser != nil {
+		s.MDNSAdvertiser.Stop()
+	}
 	if s.BandwidthMgr != nil {
 		s.BandwidthMgr.Stop()
 	}
@@ -2813,6 +2836,21 @@ func (s *Server) Start() error {
 	// Phase 3: proactive NAT traversal via STUN.
 	if s.NATService != nil {
 		go s.discoverNAT()
+	}
+
+	// mDNS LAN auto-discovery: advertise this node so peers can find us.
+	if s.identityMeta != nil {
+		selfAddr := s.effectiveSelfAddr()
+		host, portStr, _ := net.SplitHostPort(selfAddr)
+		port, _ := strconv.Atoi(portStr)
+		alias := s.identityMeta["alias"]
+		fp := s.identityMeta["fingerprint"]
+		if adv, err := peermdns.NewAdvertiser(host, alias, fp, port); err != nil {
+			log.Printf("[mDNS] advertiser failed (LAN discovery disabled): %v", err)
+		} else {
+			s.MDNSAdvertiser = adv
+			log.Printf("[mDNS] advertising as %s on %s:%d", alias, host, port)
+		}
 	}
 
 	// Always attempt bootstrap — reconnects known peers from StateDB even
@@ -3419,8 +3457,51 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 	return nil
 }
 
+// resolveOutboundIP returns this machine's preferred outbound LAN IP.
+// Tier 1: UDP dial trick — lets the OS pick the right interface (no traffic sent).
+// Tier 2: Interface enumeration — works on air-gapped/offline LANs.
+// Tier 3: 127.0.0.1 — absolute last resort (single-machine only).
+func resolveOutboundIP() string {
+	// Tier 1: UDP routing trick (works if any default route exists).
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	}
+
+	// Tier 2: Iterate non-loopback interfaces (air-gapped campus LAN).
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range ifaces {
+			if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, _ := i.Addrs()
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() {
+					continue
+				}
+				if ip4 := ip.To4(); ip4 != nil {
+					return ip4.String()
+				}
+			}
+		}
+	}
+
+	// Tier 3: Last resort.
+	return "127.0.0.1"
+}
+
 // effectiveSelfAddr returns the externally-visible address if known (via
-// AnnounceAck), otherwise falls back to normalizeAddr(transport.Addr()).
+// AnnounceAck or STUN), otherwise resolves the real LAN IP for unspecified
+// bind addresses so peer announcements carry a routable address.
 func (s *Server) effectiveSelfAddr() string {
 	s.externalAddrMu.Lock()
 	ext := s.externalAddr
@@ -3428,7 +3509,17 @@ func (s *Server) effectiveSelfAddr() string {
 	if ext != "" {
 		return ext
 	}
-	return normalizeAddr(s.serverOpts.transport.Addr())
+	addr := s.serverOpts.transport.Addr()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return normalizeAddr(addr)
+	}
+	ip := net.ParseIP(host)
+	// Bound to all interfaces (":3000" or "0.0.0.0:3000") — resolve real LAN IP.
+	if host == "" || (ip != nil && ip.IsUnspecified()) {
+		return net.JoinHostPort(resolveOutboundIP(), port)
+	}
+	return normalizeAddr(addr)
 }
 
 // SelfAddr returns the node's canonical self address (public API for IPC handlers).
@@ -3908,6 +3999,7 @@ func (s *Server) reconnectPass() {
 func (s *Server) BootstrapNetwork() error {
 	var wg sync.WaitGroup
 	for _, addr := range s.serverOpts.bootstrapNodes {
+		addr = NormalizeUserAddr(addr) // bare IPs get :3000 appended
 		if addr == "" {
 			continue
 		}
@@ -4254,7 +4346,11 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	canonAddr := normalizeAddr(listenAddr)
 
 	// Sprint 5: initialise structured logging and Prometheus metrics.
-	logging.Init("server", logging.LevelInfo)
+	// Skip if the caller already configured logging (e.g. daemon redirects
+	// to a file so stdout stays clean for the TUI).
+	if logging.Global == nil {
+		logging.Init("server", logging.LevelInfo)
+	}
 	metrics.Init(prometheus.DefaultRegisterer)
 
 	// Load .env file (ignore error if not found - will use OS env vars)

@@ -6,26 +6,23 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/Faizan2005/DFS-Go/Crypto/envelope"
 	"github.com/Faizan2005/DFS-Go/Crypto/identity"
+	peermdns "github.com/Faizan2005/DFS-Go/Peer2Peer/mdns"
 	server "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 	"github.com/Faizan2005/DFS-Go/ipc"
 )
 
 // resolveAddr resolves an input string to a peer address.
-// If it looks like host:port, returns it unchanged.
-// If it's a bare IP address, appends the default port :3000.
+// If it looks like host:port or a bare IP, normalizes it (bare IPs get :3000).
 // Otherwise, tries alias lookup via cluster gossip metadata.
 func resolveAddr(input string, s *server.Server) (string, error) {
-	// Already has a port — use as-is.
-	if _, _, err := net.SplitHostPort(input); err == nil {
-		return input, nil
-	}
-	// Bare IP address without port — append default :3000.
-	if ip := net.ParseIP(input); ip != nil {
-		return net.JoinHostPort(input, "3000"), nil
+	normalized := server.NormalizeUserAddr(input)
+	if normalized != input || strings.Contains(input, ":") {
+		return normalized, nil
 	}
 	// Treat as alias — lookup via gossip.
 	results := s.LookupAlias(input)
@@ -368,4 +365,34 @@ func handleListInbox(conn net.Conn, s *server.Server) {
 		return
 	}
 	writeJSONResponse(conn, entries)
+}
+
+// handleScanLAN performs an mDNS scan for Hermond peers on the local network.
+func handleScanLAN(conn net.Conn, s *server.Server) {
+	found, err := peermdns.Scan(3 * time.Second)
+	if err != nil {
+		writeJSONResponse(conn, []ipc.DiscoveredPeer{})
+		return
+	}
+	// Filter out self by fingerprint and address.
+	selfFP := s.SelfFingerprint()
+	selfAddr := s.SelfAddr()
+	var peers []ipc.DiscoveredPeer
+	for _, f := range found {
+		if selfFP != "" && f.Fingerprint == selfFP {
+			continue
+		}
+		if f.Addr == selfAddr {
+			continue
+		}
+		peers = append(peers, ipc.DiscoveredPeer{
+			Alias:       f.Alias,
+			Fingerprint: f.Fingerprint,
+			Addr:        f.Addr,
+		})
+	}
+	if peers == nil {
+		peers = []ipc.DiscoveredPeer{}
+	}
+	writeJSONResponse(conn, peers)
 }

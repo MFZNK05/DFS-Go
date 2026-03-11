@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/Faizan2005/DFS-Go/Crypto/identity"
 	"github.com/Faizan2005/DFS-Go/tui"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 var (
@@ -45,7 +47,24 @@ func runUnified() error {
 	}
 	defer handle.Stop()
 
-	// 4. Launch TUI (blocks until user quits).
+	// 4. Redirect Go's standard log package to the daemon log file.
+	// NOTE: Do NOT redirect os.Stdout/os.Stderr — bubbletea needs the
+	// real stdout to render the TUI. The log.SetOutput here catches any
+	// third-party library using log.Printf. The structured logger was
+	// already redirected in StartDaemonAsync via logging.InitWithWriter.
+	if logFile != nil {
+		log.SetOutput(logFile)
+	}
+
+	// 5. Bubbletea debug log capture (catches tea's internal debug output).
+	if homeDir != "" {
+		teaLog, teaErr := tea.LogToFile(filepath.Join(homeDir, ".hermond", "tui-debug.log"), "debug")
+		if teaErr == nil {
+			defer teaLog.Close()
+		}
+	}
+
+	// 6. Launch TUI (blocks until user quits).
 	return tui.Run(handle.SockPath, tui.Handlers{
 		UploadFile:      UploadFile,
 		UploadDirectory: UploadDirectory,

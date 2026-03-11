@@ -41,6 +41,7 @@ const (
 	opcodeSendToPeer         = ipc.OpSendToPeer
 	opcodeListInbox          = ipc.OpListInbox
 	opcodeUnblockPeer        = ipc.OpUnblockPeer
+	opcodeScanLAN            = ipc.OpScanLAN
 	statusOK                 = ipc.StatusOK
 	statusError              = ipc.StatusError
 	statusProgress           = ipc.StatusProgress

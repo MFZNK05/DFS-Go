@@ -45,6 +45,7 @@ type NetworkTab struct {
 	focus focus
 
 	peers       []ipc.PeerInfo
+	discovered  []ipc.DiscoveredPeer // mDNS LAN scan results
 	peerTable   components.Table
 	browseFiles []ipc.BrowseEntry
 	resultTable components.Table
@@ -91,9 +92,34 @@ func (n *NetworkTab) SetSize(w, h int) {
 // SetPeers updates the peer list.
 func (n *NetworkTab) SetPeers(peers []ipc.PeerInfo) {
 	n.peers = peers
-	rows := make([][]string, len(peers))
-	for i, p := range peers {
-		rows[i] = []string{p.Alias, p.Addr, p.State}
+	n.rebuildPeerTable()
+}
+
+// SetDiscovered updates the mDNS-discovered peers list.
+func (n *NetworkTab) SetDiscovered(peers []ipc.DiscoveredPeer) {
+	n.discovered = peers
+	n.rebuildPeerTable()
+}
+
+// rebuildPeerTable merges connected peers and discovered (unconnected) peers.
+func (n *NetworkTab) rebuildPeerTable() {
+	// Build set of connected peer fingerprints + addresses to avoid dupes.
+	connectedFP := make(map[string]bool)
+	connectedAddr := make(map[string]bool)
+	var rows [][]string
+	for _, p := range n.peers {
+		rows = append(rows, []string{p.Alias, p.Addr, p.State})
+		if p.Fingerprint != "" {
+			connectedFP[p.Fingerprint] = true
+		}
+		connectedAddr[p.Addr] = true
+	}
+	// Append discovered peers that aren't already connected.
+	for _, d := range n.discovered {
+		if connectedFP[d.Fingerprint] || connectedAddr[d.Addr] {
+			continue
+		}
+		rows = append(rows, []string{d.Alias, d.Addr, "LAN"})
 	}
 	n.peerTable.SetRows(rows)
 }
@@ -217,13 +243,22 @@ func (n *NetworkTab) Update(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	// Enter on peer → browse
+	// Enter on peer → browse (connected) or connect (LAN-discovered)
 	if n.focus == focusPeers && key.Matches(msg, key.NewBinding(key.WithKeys("enter"))) {
 		idx := n.peerTable.SelectedRow()
 		if idx >= 0 && idx < len(n.peers) {
+			// Connected peer → browse their files.
 			addr := n.peers[idx].Addr
 			return func() tea.Msg {
 				return NetworkBrowseMsg{PeerAddr: addr}
+			}
+		}
+		// LAN-discovered (unconnected) peer → connect.
+		discIdx := idx - len(n.peers)
+		if discIdx >= 0 && discIdx < len(n.discovered) {
+			addr := n.discovered[discIdx].Addr
+			return func() tea.Msg {
+				return NetworkConnectMsg{Addr: addr}
 			}
 		}
 		return nil
@@ -294,7 +329,7 @@ func (n NetworkTab) FooterHints() []components.FooterHint {
 	}
 	if n.focus == focusPeers {
 		hints = append(hints,
-			components.FooterHint{Key: "Enter", Desc: "Browse peer"},
+			components.FooterHint{Key: "Enter", Desc: "Browse/Connect"},
 			components.FooterHint{Key: "a", Desc: "Add peer"},
 			components.FooterHint{Key: "x", Desc: "Disconnect"},
 		)

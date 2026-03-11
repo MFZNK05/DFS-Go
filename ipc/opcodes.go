@@ -34,6 +34,7 @@ const (
 	OpSendToPeer         byte = 0x1C
 	OpListInbox          byte = 0x1D
 	OpUnblockPeer        byte = 0x1E
+	OpScanLAN            byte = 0x1F
 )
 
 // Status codes for IPC responses.

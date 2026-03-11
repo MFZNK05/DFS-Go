@@ -207,6 +207,8 @@ func HandleClient(conn net.Conn, s *server.Server) {
 		handleListInbox(conn, s)
 	case opcodeUnblockPeer:
 		handleUnblockPeer(conn, s)
+	case opcodeScanLAN:
+		handleScanLAN(conn, s)
 	default:
 		log.Printf("IPC: unknown opcode 0x%02x", opcode[0])
 	}

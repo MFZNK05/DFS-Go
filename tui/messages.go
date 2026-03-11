@@ -45,6 +45,11 @@ type BrowseResultsMsg struct {
 	Err      error
 }
 
+type LANScanMsg struct {
+	Peers []ipc.DiscoveredPeer
+	Err   error
+}
+
 type TransferActionMsg struct {
 	Action string
 	ID     string
