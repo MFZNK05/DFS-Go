@@ -40,6 +40,12 @@ A comprehensive technical reference for engineers who want to understand how Her
 - [IP Resolution & Address Normalization](#ip-resolution--address-normalization-serverservergo)
 - [Cross-Platform Firewall Auto-Configuration](#cross-platform-firewall-auto-configuration-cmdfirewallgo)
 - [TUI Logging Safety](#tui-logging-safety-cmdunifiedgo)
+- [Dual-Port Architecture: Control Plane + Data Plane](#dual-port-architecture-control-plane--data-plane)
+- [Cross-Platform Connectivity: Challenges & Solutions](#cross-platform-connectivity-challenges--solutions)
+- [Daemon/TUI Lifecycle: Process Architecture](#daemontui-lifecycle-process-architecture)
+- [Swarm Cache & Seed-in-Place](#swarm-cache--seed-in-place)
+- [Memory Monitor & OOM Forensics](#memory-monitor--oom-forensics)
+- [Upload Priority & Background Task Yielding](#upload-priority--background-task-yielding)
 - [Performance Optimizations](#performance-optimizations)
 - [Package Map](#package-map)
 
@@ -895,6 +901,524 @@ Response format varies by opcode:
 
 ---
 
+## Dual-Port Architecture: Control Plane + Data Plane
+
+One of Hermod's most impactful architectural decisions is separating network traffic into two dedicated QUIC ports: a **control port** (N) for cluster coordination and a **data port** (N+1) for bulk chunk transfers.
+
+### The Problem: Head-of-Line Blocking at the Application Layer
+
+Even though QUIC eliminates TCP's head-of-line blocking at the transport level (each stream is independent), a single UDP socket still shares the same congestion window and flow control budget. When a 4 MiB chunk transfer saturates the connection, tiny gossip digests (< 500 bytes) and heartbeats (< 100 bytes) queue behind the chunk data at the application level. This delays failure detection (heartbeats arrive late → phi accrual spikes → false suspect/dead transitions) and slows membership convergence.
+
+```
+PROBLEM — Single Port:
+┌─────────────────────────────────────────────┐
+│           Port 3000 (shared UDP socket)      │
+│                                              │
+│  Gossip [500B] ─┐                            │
+│  Heartbeat [100B]┼── compete for same ──→ 🐢│
+│  Chunk [4 MiB]  ─┘   congestion window       │
+│                                              │
+│  Result: heartbeat delayed 200ms → phi spike │
+│          → false Dead transition              │
+└─────────────────────────────────────────────┘
+
+SOLUTION — Dual Port:
+┌──────────────────────┐  ┌──────────────────────┐
+│  Port 3000 (control) │  │  Port 3001 (data)    │
+│                      │  │                      │
+│  Gossip [500B]    ✓  │  │  Chunk [4 MiB]    ✓  │
+│  Heartbeat [100B] ✓  │  │  StoreFile        ✓  │
+│  Announce         ✓  │  │  GetFile          ✓  │
+│  Metadata         ✓  │  │  LocalFile        ✓  │
+│                      │  │  GetChunkSwarm    ✓  │
+│  Tiny QUIC windows   │  │  Large QUIC windows  │
+│  (256KB/stream)      │  │  (8MB/stream)        │
+└──────────────────────┘  └──────────────────────┘
+
+Control messages: sub-millisecond delivery (no congestion from chunks)
+Data transfers: full bandwidth (no starvation from gossip flood)
+```
+
+### Port Assignment
+
+Automatic — the user configures one port; the data port is always N+1:
+
+```go
+// cmd/daemon.go
+if factory.ProtocolFromEnv() == factory.ProtocolQUIC {
+    dataPort := fmt.Sprintf(":%d", portNum+1)
+    makeOpts.DataPort = dataPort
+}
+```
+
+User runs `hermod --port :3000` → control on `:3000`, data on `:3001`. No extra configuration.
+
+### QUIC Flow Control Tuning by Role
+
+Each transport has tuned flow control windows matching its traffic pattern:
+
+| Role | Stream Window | Connection Window | Rationale |
+|------|---------------|-------------------|-----------|
+| `RoleControl` | 256 KiB | 1 MiB | Gossip/heartbeat are tiny — small windows prevent buffer bloat |
+| `RoleData` | 8 MiB | 64 MiB | Chunks are 4 MiB — window must hold ≥ 2 in-flight chunks |
+| `RoleUnified` (legacy) | 8 MiB | 32 MiB | Balanced for single-port backward compatibility |
+
+ALPN protocol negotiation prevents misrouted connections: `"dfs-ctrl"` vs `"dfs-data"` vs `"dfs-quic"`.
+
+### DialDual: Atomic Parallel Connection
+
+When connecting to a peer, both transports are dialed simultaneously:
+
+```go
+// Peer2Peer/quic/transport.go
+func DialDual(ctrlTransport, dataTransport *Transport, addr string) error {
+    host, portStr, _ := net.SplitHostPort(addr)
+    port, _ := strconv.Atoi(portStr)
+    dataAddr := net.JoinHostPort(host, strconv.Itoa(port+1))
+
+    var wg sync.WaitGroup
+    var ctrlErr, dataErr error
+    wg.Add(2)
+    go func() { defer wg.Done(); ctrlErr = ctrlTransport.Dial(addr) }()
+    go func() { defer wg.Done(); dataErr = dataTransport.Dial(dataAddr) }()
+    wg.Wait()
+
+    if ctrlErr != nil {
+        return fmt.Errorf("control dial failed: %w", ctrlErr)
+    }
+    if dataErr != nil {
+        log.Printf("[DUAL-DIAL] data dial failed (peer may be single-port): %v", dataErr)
+        // Degraded mode: all traffic over control port. Still works.
+    }
+    return nil
+}
+```
+
+**Backward compatible:** If the remote peer is an older single-port node, the data dial fails gracefully. The system falls back to unified mode — all traffic over the control port. No crash, no error.
+
+### Data Peer Routing with Fallback
+
+```go
+// Server/server.go
+func (s *Server) getDataPeer(addr string) (peer2peer.Peer, bool) {
+    // Try data-plane peer first (fast path)
+    s.dataPeerLock.RLock()
+    dp, ok := s.dataPeers[addr]
+    s.dataPeerLock.RUnlock()
+    if ok { return dp, true }
+
+    // Fallback: control-plane peer (single-port mode)
+    s.peerLock.RLock()
+    cp, ok := s.peers[addr]
+    s.peerLock.RUnlock()
+    return cp, ok
+}
+```
+
+Data peers are indexed by their **control port address** (derived by subtracting 1 from the data port). This allows lookup by canonical peer identity while routing through the correct transport.
+
+### Message Routing Rules
+
+The `dataLoop()` goroutine explicitly rejects non-data messages — any control message that arrives on the data port is logged and dropped:
+
+| Message Type | Port | Handler |
+|---|---|---|
+| `MessageGossipDigest` | Control (N) | `handleGossipDigest` |
+| `MessageGossipResponse` | Control (N) | `handleGossipResponse` |
+| `MessageHeartbeat` | Control (N) | `handleHeartbeat` |
+| `MessageAnnounce` / `Ack` | Control (N) | `handleAnnounce` / `handleAnnounceAck` |
+| `MessageIdentityMeta` | Control (N) | `handleIdentityMeta` |
+| `MessageGetManifest` | Control (N) | `handleGetManifest` |
+| `MessageStoreFile` | **Data (N+1)** | `handleStoreMessage` |
+| `MessageGetFile` | **Data (N+1)** | `handleGetMessage` |
+| `MessageLocalFile` | **Data (N+1)** | `handleLocalMessage` |
+| `MessageGetChunkSwarm` | **Data (N+1)** | `handleGetChunkSwarmBidi` |
+
+### Impact
+
+In a 3-node cluster with concurrent upload + gossip:
+- **Before (single-port):** Heartbeat jitter spikes to 200ms during 4 MiB chunk transfer → phi reaches suspect threshold → false Dead transitions
+- **After (dual-port):** Heartbeat delivery remains < 5ms regardless of data transfer load → zero false positives
+
+---
+
+## Cross-Platform Connectivity: Challenges & Solutions
+
+Building a P2P application that works identically on Linux, macOS, and Windows required solving several non-obvious platform differences.
+
+### Challenge 1: IPC — Unix Sockets vs Windows Named Pipes
+
+Unix domain sockets don't exist on Windows. Named pipes have entirely different semantics (virtual filesystem, no file on disk).
+
+```
+Linux/macOS:                        Windows:
+  /tmp/hermod-3000.sock               \\.\pipe\hermod-3000
+  Real file on disk                   Virtual (no file to clean up)
+  net.Listen("unix", path)            winio.ListenPipe(path, nil)
+  os.RemoveAll() for cleanup          No cleanup needed
+```
+
+**Solution:** Build-tag-gated implementations with a shared interface:
+
+```go
+// cmd/ipcconn_unix.go — //go:build !windows
+func ipcListen(path string) (net.Listener, error) {
+    return net.Listen("unix", path)
+}
+func platformSocketPath(port string) string {
+    return filepath.Join(os.TempDir(), fmt.Sprintf("hermod-%s.sock", port))
+}
+
+// cmd/ipcconn_windows.go — //go:build windows
+func ipcListen(path string) (net.Listener, error) {
+    return winio.ListenPipe(path, nil)  // github.com/Microsoft/go-winio
+}
+func platformSocketPath(port string) string {
+    return fmt.Sprintf(`\\.\pipe\hermod-%s`, port)
+}
+```
+
+Originally used `npipe.v2`, but it didn't support Windows ARM64. Replaced with `go-winio` (maintained by Microsoft, supports all architectures).
+
+### Challenge 2: Firewall Blocks Inbound UDP
+
+QUIC runs over UDP. **Windows and macOS block inbound UDP by default.** A user installs Hermod, starts it, and no peers can connect — because the OS firewall silently drops all inbound packets. This is the #1 reason peers can't discover each other.
+
+**Solution:** Auto-configure the firewall on first startup, per-platform:
+
+```
+Windows:
+  1. Try netsh directly (may already be admin)
+  2. If not admin → ShellExecuteW("runas", "netsh", ...)
+     → Standard UAC dialog appears, user clicks "Yes" once
+  3. Adds port-only rules (no program= filter for binary-location independence)
+
+macOS:
+  1. osascript "with administrator privileges"
+     → macOS shows native password prompt
+  2. socketfilterfw --add + --unblockapp
+
+Linux:
+  1. Try ufw → firewall-cmd → iptables (in order)
+  2. Uses sudo -n (non-interactive) if not root
+  3. No GUI dependency (works on headless/SSH)
+```
+
+**Version-gated re-trigger:** A flag file (`~/.hermod/.firewall-configured`) contains a version string (e.g., `v4`). On upgrade, version bumps force re-execution of firewall rules. This allowed us to fix the Windows `program=` filter bug — `v3` had `program=hermod.exe` which broke when the binary moved; `v4` uses port-only rules.
+
+Three ports are opened: control port, data port (+1), and mDNS (5353).
+
+### Challenge 3: Process Detachment
+
+The daemon must survive the parent terminal closing. Unix and Windows handle this differently:
+
+```go
+// cmd/detach_unix.go — //go:build !windows
+func detachCmd(cmd *exec.Cmd) {
+    cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+    // New session → disowned from controlling terminal
+}
+
+// cmd/detach_windows.go — //go:build windows
+func detachCmd(cmd *exec.Cmd) {
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+        CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+    }
+}
+```
+
+Both redirect stdout/stderr to `~/.hermod/daemon.log` for post-mortem debugging.
+
+### Challenge 4: mDNS Multicast Isolation
+
+mDNS uses multicast UDP (224.0.0.251:5353). On campus networks, multicast is frequently blocked between clients (wireless isolation). Two peers on `10.145.16.x` and `10.145.113.x` are on different broadcast domains — mDNS packets never reach each other.
+
+**Solution:** mDNS is for **same-subnet zero-config** discovery only. Cross-subnet connectivity uses explicit `--peer <ip:port>` or the TUI connect dialog. Both work because QUIC connections are unicast (not multicast).
+
+### Challenge 5: Binary Runs from Any Working Directory
+
+Early versions stored CAS data, metadata DB, and state DB relative to the current working directory. Running `hermod` from different directories created fragmented storage.
+
+**Solution:** All runtime data roots under `~/.hermod/` via `MakeServerOpts.DataDir`:
+
+```go
+// cmd/daemon.go
+homeDir, _ := os.UserHomeDir()
+dataDir := filepath.Join(homeDir, ".hermod")
+os.MkdirAll(dataDir, 0700)
+makeOpts.DataDir = dataDir
+
+// Server/server.go — MakeServer()
+if makeOpts.DataDir != "" {
+    pathAddr = filepath.Join(makeOpts.DataDir, pathAddr)
+}
+// All CAS storage, metadata DBs, and network state now under ~/.hermod/
+```
+
+```
+~/.hermod/
+├── identity.json          # Ed25519 + X25519 keypairs (permanent)
+├── config.json            # Port preference (from first-run prompt)
+├── daemon.log             # Daemon stdout/stderr
+├── tui-debug.log          # Bubbletea debug output
+├── state-3000.db          # BoltDB (uploads, downloads, peers)
+├── .firewall-configured   # Version flag ("v4\n")
+├── _3000_metadata.db      # Chunk manifests, file metadata
+├── _3000_network/         # CAS storage (SHA-256 dirs)
+│   └── <sha256 segments>/<md5>.dat
+└── _3000_network/.hints/  # Hinted handoff queue
+```
+
+Port-specific DB names (`state-3000.db`) allow multiple daemons on different ports simultaneously.
+
+---
+
+## Daemon/TUI Lifecycle: Process Architecture
+
+Hermod follows a **daemon + client** model inspired by DC++: a background daemon handles all P2P networking, and the TUI is a stateless client that connects via IPC.
+
+### Lifecycle Flow
+
+```
+User runs: hermod
+                │
+                ▼
+        ┌──────────────┐
+        │ ensureIdentity│ ← First run? Prompt for alias + port
+        └──────┬───────┘
+               │
+        ┌──────▼───────┐
+        │isDaemonRunning│ ← Dial socket with 500ms timeout
+        └──┬────────┬──┘
+           │        │
+         yes       no
+           │        │
+           │   ┌────▼─────┐
+           │   │forkDaemon │ ← Resolve executable, build args,
+           │   │           │   redirect stdout/stderr to daemon.log,
+           │   │           │   call detachCmd(), cmd.Start(), cmd.Process.Release()
+           │   └────┬──────┘
+           │        │
+           │   ┌────▼──────────┐
+           │   │waitForDaemon  │ ← Poll socket every 100ms until connectable
+           │   │(10s timeout)  │   or timeout
+           │   └────┬──────────┘
+           │        │
+        ┌──▼────────▼──┐
+        │  Launch TUI   │ ← Stateless IPC client (Bubble Tea)
+        │  (blocks)     │   Connect to daemon socket, render terminal UI
+        └──────┬────────┘
+               │
+         User presses 'q'
+               │
+        ┌──────▼────────────────────────────────────┐
+        │ "Hermod is still running in the background.│
+        │  Use 'hermod stop' to shut it down."       │
+        └───────────────────────────────────────────┘
+```
+
+### Stale Socket Detection
+
+A socket file existing on disk doesn't mean a daemon is running. The previous daemon may have crashed without cleaning up.
+
+```go
+func isDaemonRunning(sockPath string) bool {
+    conn, err := ipcDialTimeout(sockPath, 500*time.Millisecond)
+    if err != nil {
+        cleanupSocket(sockPath)  // Remove stale socket file
+        return false
+    }
+    conn.Close()
+    return true  // Something answered — daemon is alive
+}
+```
+
+This prevents "address already in use" errors when restarting after a crash.
+
+### Graceful Shutdown (`hermod stop`)
+
+```
+hermod stop --node :3000
+        │
+        ▼
+  ┌─────────────┐
+  │ Dial socket  │ ← 500ms timeout
+  └──────┬──────┘
+         │
+  ┌──────▼──────┐
+  │ Send 0x24   │ ← OpShutdown opcode (1 byte)
+  │ (shutdown)  │
+  └──────┬──────┘
+         │
+  Server side:
+  ┌──────▼──────────────┐
+  │ writeStatus(OK)      │
+  │ conn.Close()         │
+  │ getDaemonStopFunc()()│ ← Registered by StartDaemonAsync
+  │   → GracefulShutdown │     Broadcast MessageLeaving to peers
+  │   → Close listeners  │     Close IPC socket, QUIC transports
+  │   → Flush tracing    │
+  │ os.Exit(0)           │
+  └─────────────────────┘
+```
+
+The shutdown function is registered via `setDaemonStopFunc()` at daemon startup, making it callable from the IPC handler without circular dependencies.
+
+### First-Time Setup
+
+On first run (no identity file exists), the user is prompted for alias and port:
+
+```
+$ hermod
+Welcome to Hermod!
+Enter your alias: alice
+Control port (default 3000, data port will be 3001): 3000
+
+Identity created: alice (fingerprint: c34144eb91e1cb10)
+Port configured: 3000 (data port: 3001)
+```
+
+Both are saved to disk (`~/.hermod/identity.json` and `~/.hermod/config.json`). Subsequent runs load the config unless `--port` is explicitly passed (detected via `cmd.Flags().Changed("port")` — not string comparison, which can't distinguish "user passed :3000" from "cobra default :3000").
+
+---
+
+## Swarm Cache & Seed-in-Place
+
+Traditional P2P file systems require the uploader to copy file data into internal storage (CAS) before sharing. For a 50 GB game folder, this means 50 GB of disk space wasted on a duplicate copy.
+
+### Seed-in-Place Architecture
+
+The uploader serves chunks **directly from the original file** on disk — no CAS copy needed:
+
+```
+Traditional:
+  Game folder (50 GB) → CAS copy (50 GB) → Serve from CAS
+  Total disk: 100 GB for one file
+
+Seed-in-Place:
+  Game folder (50 GB) → Serve directly from source path
+  Total disk: 50 GB (zero overhead)
+```
+
+```go
+type SeedSource struct {
+    OriginalPath string   // "/home/alice/Games/Elden Ring/" — read directly
+    CASBacked    bool     // false for uploader (serves from OriginalPath)
+    ChunkSize    int
+    TotalChunks  int
+    Bitfield     []byte   // bit-packed availability (1 bit per chunk)
+}
+```
+
+The `Bitfield` is compact: 1 MB covers 8 million chunks (32 TB of data at 4 MiB chunks).
+
+### Secondary Seeder Cache
+
+When a peer downloads a file, it caches chunks in CAS for re-seeding. This is managed by `CacheManager` with LRU eviction:
+
+```go
+type CacheManager struct {
+    store    CacheStore
+    limit    int64        // default 50 GB
+    evict    EvictFunc    // callback to delete CAS chunks
+}
+```
+
+- **Touch-on-access:** Each chunk read updates `LastAccessed` timestamp
+- **LRU eviction:** Background goroutine periodically sorts by `LastAccessed`, evicts oldest until under limit
+- **Non-blocking:** Eviction runs in its own goroutine, never blocks the hot path
+
+### Provider Registry
+
+```go
+type ProviderRecord struct {
+    Addr         string   // peer that has this chunk
+    ChunkCount   int      // how many chunks this peer has
+    TotalChunks  int
+    RegisteredAt int64    // for expiry
+}
+```
+
+The download path queries the provider registry: "who has chunks for key X?" → returns a list of seeders, ranked by availability (chunk count) and latency (EWMA score).
+
+---
+
+## Memory Monitor & OOM Forensics
+
+When a process is killed by the OOM killer (`SIGKILL`), it cannot catch the signal, write a log, or dump a stack trace. The process simply vanishes, leaving no forensic evidence.
+
+### Proactive Heap Profiling
+
+The `memlog.Monitor` runs a background goroutine that samples `runtime.MemStats` and auto-dumps heap profiles at predefined thresholds:
+
+```go
+type Monitor struct {
+    dumpDir  string
+    interval time.Duration  // default 30s
+    dumped   map[uint64]bool // tracks which thresholds have been dumped
+}
+
+// Auto-dump thresholds: 500 MB, 1 GB, 2 GB, 4 GB
+// Only ONE dump per threshold (prevents disk flooding)
+```
+
+Every 30 seconds:
+1. Read `runtime.MemStats` → log `HeapAlloc`, `HeapSys`, `HeapInuse`, `Goroutines`, `GC runs`
+2. If `HeapAlloc` crosses a threshold not yet dumped → write `heap-<timestamp>-<sizeMB>.prof`
+3. After OOM kill: `go tool pprof ~/.hermod/heap-1710432000-2048MB.prof` reveals the allocation pattern
+
+**Key insight:** The 2 GB dump captured *before* the 4 GB OOM kill still shows the allocation trend. Combined with the periodic log entries, you can reconstruct the memory growth curve.
+
+---
+
+## Upload Priority & Background Task Yielding
+
+Hermod runs several background maintenance tasks concurrently: anti-entropy repair, hinted handoff delivery, and rebalancing. All of these send large chunk data over the same QUIC connections used by foreground uploads.
+
+### The Problem
+
+Without coordination, a 1,072-file directory upload competes with anti-entropy's bulk repair transfers. Both saturate the connection → uploads slow to a crawl → user experience degrades.
+
+### The Solution: Atomic Upload Counter
+
+```go
+type Server struct {
+    activeUploads atomic.Int32  // incremented at upload start, decremented at end
+}
+
+// Upload path:
+func (s *Server) StoreDataWithProgress(...) error {
+    s.activeUploads.Add(1)
+    defer s.activeUploads.Add(-1)
+    // ... upload logic ...
+}
+```
+
+All background tasks check `activeUploads` before doing heavy work:
+
+```go
+// Hinted handoff: waits until uploads finish
+if s.activeUploads.Load() > 0 {
+    for s.activeUploads.Load() > 0 {
+        time.Sleep(500 * time.Millisecond)
+    }
+}
+
+// Rebalancer: same wait pattern
+if s.activeUploads.Load() > 0 {
+    // defer migration until upload completes
+}
+
+// Anti-entropy: completely yields (returns immediately)
+if s.activeUploads.Load() > 0 {
+    return  // foreground upload has priority — try again next cycle
+}
+```
+
+**Design choice:** Anti-entropy returns immediately (it runs every 10 minutes, so missing one cycle is fine). Handoff and rebalance wait patiently (they have data that must eventually be delivered). All three give absolute priority to user-initiated uploads.
+
+---
+
 ## Performance Optimizations
 
 ### Zero-Allocation Upload Pipeline
@@ -936,6 +1460,30 @@ For streaming downloads (pipes, IPC sockets without random-access):
 
 Memory bounded at `MaxParallel × ChunkSize = 16 MiB` regardless of file size.
 
+### Async CAS Cache Write
+
+When a node downloads a chunk from a peer, the chunk is delivered to the downloader **immediately** (zero disk I/O on the hot path). The CAS cache write happens asynchronously via a buffered channel:
+
+```go
+// Hot path: deliver chunk to waiting downloader (no disk I/O)
+ch <- data  // non-blocking send
+
+// Background: queue CAS write (best-effort, loss acceptable)
+select {
+case s.casWriteCh <- casWriteRequest{key: msg.Key, data: copy}:
+default:  // channel full? drop (chunk still exists in cluster)
+}
+
+// Background goroutine: serialized CAS writes
+func (s *Server) casWriteLoop() {
+    for req := range s.casWriteCh {
+        s.Store.WriteStream(req.key, bytes.NewReader(req.data))
+    }
+}
+```
+
+**Why this matters:** Disk I/O for a 4 MiB CAS write takes 10-50ms. On the hot download path, this blocks chunk delivery and inflates EWMA latency scores. Moving the write to a background queue keeps chunk delivery under 1ms.
+
 ---
 
 ## Package Map
@@ -943,10 +1491,11 @@ Memory bounded at `MaxParallel × ChunkSize = 16 MiB` regardless of file size.
 ```
 hermod/
 ├── Server/
-│   ├── server.go              Core orchestrator (peer lifecycle, message dispatch)
-│   ├── downloader/            Parallel multi-source chunk fetcher
-│   ├── transfer/              Transfer registry (pause/resume/cancel)
-│   └── ratelimit/             LEDBAT-lite adaptive bandwidth
+│   ├── server.go              Core orchestrator (peer lifecycle, message dispatch,
+│   │                           dual-port routing, sync.Pool pipeline, upload priority)
+│   ├── downloader/            Parallel multi-source chunk fetcher (3 strategies:
+│   │                           DownloadToFile, DownloadToStream, DownloadToFileResumable)
+│   └── transfer/              Transfer registry (pause/resume/cancel)
 │
 ├── Storage/
 │   ├── storage.go             CAS engine (SHA-256 paths, AES-GCM encryption)
@@ -954,7 +1503,8 @@ hermod/
 │   ├── compression/           Zstd compression with entropy heuristic
 │   ├── dirmanifest/           Multi-file directory manifests
 │   ├── resume/                Download resume (append-only sidecar)
-│   └── pending/               Upload resume (append-only sidecar)
+│   ├── pending/               Upload resume (append-only sidecar)
+│   └── swarm/                 Seed-in-place + LRU cache manager (50 GB default)
 │
 ├── Cluster/
 │   ├── gossip/                Push-pull epidemic protocol (O(log N))
@@ -974,14 +1524,28 @@ hermod/
 │   └── envelope/              ECDH key wrapping + Ed25519 signing
 │
 ├── Peer2Peer/
-│   ├── quic/                  QUIC transport (TLS 1.3, per-stream)
+│   ├── quic/                  QUIC transport (TLS 1.3, per-stream, dual-port,
+│   │                           DialDual, role-based flow control windows)
+│   ├── mdns/                  mDNS LAN auto-discovery (advertiser + scanner)
 │   └── nat/                   STUN-based NAT traversal
 │
-├── State/                     BoltDB persistent state (9 buckets)
-├── ipc/                       Binary IPC protocol (18 opcodes)
-├── tui/                       Bubble Tea terminal UI (4 tabs)
-├── cmd/                       Cobra CLI commands
+├── State/                     BoltDB persistent state (10 buckets)
+├── ipc/                       Binary IPC protocol (24 opcodes)
+├── tui/                       Bubble Tea terminal UI (stateless IPC client)
+├── cmd/                       Cobra CLI commands + daemon lifecycle
+│   ├── unified.go             Daemon fork, TUI launch, config persistence
+│   ├── daemon.go              StartDaemonAsync, DataDir setup, shutdown registration
+│   ├── stop.go                `hermod stop` — OpShutdown over IPC
+│   ├── detach_unix.go         Unix process detach (Setsid)
+│   ├── detach_windows.go      Windows process detach (CREATE_NEW_PROCESS_GROUP)
+│   ├── firewall.go            Cross-platform firewall auto-configuration
+│   ├── firewall_darwin.go     macOS: osascript + socketfilterfw
+│   ├── firewall_linux.go      Linux: ufw → firewall-cmd → iptables
+│   ├── firewall_windows.go    Windows: ShellExecuteW + netsh
+│   ├── ipcconn_unix.go        Unix domain socket IPC
+│   └── ipcconn_windows.go     Windows named pipe IPC (go-winio)
 └── Observability/
+    ├── memlog/                In-memory ring-buffer monitor + auto heap dump
     ├── health/                HTTP health + pprof endpoints
     ├── metrics/               Prometheus instrumentation
     ├── tracing/               OpenTelemetry (OTLP → Jaeger)
@@ -2421,4 +2985,4 @@ The table below shows which struct field on `Server` wires to which subsystem ca
 
 ---
 
-*Implementation reference reflects codebase as of v0.2.x. Last updated March 2026.*
+*Implementation reference reflects codebase as of v0.3.0. Last updated March 2026.*
