@@ -16,7 +16,7 @@ var removeCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id, err := identity.Load(identity.DefaultPath())
 		if err != nil {
-			return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
+			return fmt.Errorf("no identity found. Run 'hermod identity init --alias <name>' first")
 		}
 
 		key := id.Fingerprint() + "/" + args[0]

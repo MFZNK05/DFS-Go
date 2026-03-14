@@ -51,6 +51,10 @@ type Options struct {
 
 	OnPeer           func(peer2peer.Peer) error
 	OnPeerDisconnect func(peer2peer.Peer)
+
+	// QUICRole sets the transport role (control/data/unified) for QUIC transports.
+	// Ignored for TCP. Default: RoleUnified (0).
+	QUICRole quictransport.TransportRole
 }
 
 // New creates a Transport for the given protocol and listen address.
@@ -63,6 +67,7 @@ func New(protocol Protocol, listenAddr string, opts Options) (peer2peer.Transpor
 			TLSConfig:        opts.TLSConfig,
 			OnPeer:           opts.OnPeer,
 			OnPeerDisconnect: opts.OnPeerDisconnect,
+			Role:             opts.QUICRole,
 		})
 
 	case ProtocolTCP:

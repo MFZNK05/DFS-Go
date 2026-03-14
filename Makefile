@@ -1,8 +1,8 @@
 build:
-		@go build -o bin/hermond
+		@go build -o bin/hermod
 
 run: build
-		@./bin/hermond
+		@./bin/hermod
 
 test:
 		@go test -v ./...

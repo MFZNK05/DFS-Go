@@ -29,11 +29,15 @@ type Config struct {
 	Interval time.Duration // gossip round period, default 200ms
 }
 
+// TraceLog enables verbose per-message TRACE logging in gossip handlers.
+// Default false — set to true for debugging gossip convergence issues.
+var TraceLog bool
+
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		FanOut:   3,
-		Interval: 200 * time.Millisecond,
+		FanOut:   2,
+		Interval: 3 * time.Second,
 	}
 }
 
@@ -249,8 +253,10 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 		digestMap[d.Addr] = d
 	}
 
-	log.Printf("[TRACE][HandleDigest] self=%s from=%s needFull=%v knownBefore_count=%d digest_count=%d",
-		selfAddr, from, needFull, len(knownBefore), len(msg.Digests))
+	if TraceLog {
+		log.Printf("[TRACE][HandleDigest] self=%s from=%s needFull=%v knownBefore_count=%d digest_count=%d",
+			selfAddr, from, needFull, len(knownBefore), len(msg.Digests))
+	}
 
 	// Collect addresses to dial — use a set to avoid dialling the same addr twice
 	// (both the needFull loop and the digest_scan loop might flag the same addr).
@@ -263,18 +269,26 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 			}
 			connected := gs.isConnected(addr)
 			d := digestMap[addr]
-			log.Printf("[TRACE][HandleDigest] needFull: self=%s addr=%s connected=%v knownBefore=%v d.State=%v d.Gen=%d",
-				selfAddr, addr, connected, knownBefore[addr], d.State, d.Generation)
+			if TraceLog {
+				log.Printf("[TRACE][HandleDigest] needFull: self=%s addr=%s connected=%v knownBefore=%v d.State=%v d.Gen=%d",
+					selfAddr, addr, connected, knownBefore[addr], d.State, d.Generation)
+			}
 			if !connected {
 				if !knownBefore[addr] {
-					log.Printf("[TRACE][HandleDigest] NEW peer %s via digest from %s → queued", addr, from)
+					if TraceLog {
+						log.Printf("[TRACE][HandleDigest] NEW peer %s via digest from %s → queued", addr, from)
+					}
 					toDialSet[addr] = struct{}{}
 				} else if d.State == membership.StateAlive {
 					// Previously known but was StateLeft/StateDead — now alive again (rejoin).
 					local, ok := gs.cluster.GetNode(addr)
-					log.Printf("[TRACE][HandleDigest] KNOWN addr=%s local.State=%v local.Gen=%d ok=%v d.Gen=%d", addr, local.State, local.Generation, ok, d.Generation)
+					if TraceLog {
+						log.Printf("[TRACE][HandleDigest] KNOWN addr=%s local.State=%v local.Gen=%d ok=%v d.Gen=%d", addr, local.State, local.Generation, ok, d.Generation)
+					}
 					if ok && local.State != membership.StateAlive {
-						log.Printf("[TRACE][HandleDigest] REJOIN via needFull: addr=%s was=%v → queued", addr, local.State)
+						if TraceLog {
+							log.Printf("[TRACE][HandleDigest] REJOIN via needFull: addr=%s was=%v → queued", addr, local.State)
+						}
 						toDialSet[addr] = struct{}{}
 					}
 				}
@@ -286,22 +300,30 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 				continue
 			}
 			connected := gs.isConnected(d.Addr)
-			log.Printf("[TRACE][HandleDigest] digest_scan: self=%s addr=%s d.State=%v d.Gen=%d connected=%v knownBefore=%v",
-				selfAddr, d.Addr, d.State, d.Generation, connected, knownBefore[d.Addr])
+			if TraceLog {
+				log.Printf("[TRACE][HandleDigest] digest_scan: self=%s addr=%s d.State=%v d.Gen=%d connected=%v knownBefore=%v",
+					selfAddr, d.Addr, d.State, d.Generation, connected, knownBefore[d.Addr])
+			}
 			if d.State == membership.StateAlive && !connected {
 				if !knownBefore[d.Addr] {
 					// Ensure the node is registered in our membership table.
 					gs.cluster.AddNode(d.Addr, nil)
 					gs.cluster.UpdateState(d.Addr, d.State, d.Generation)
-					log.Printf("[TRACE][HandleDigest] digest_scan NEW: addr=%s from=%s → queued", d.Addr, from)
+					if TraceLog {
+						log.Printf("[TRACE][HandleDigest] digest_scan NEW: addr=%s from=%s → queued", d.Addr, from)
+					}
 					toDialSet[d.Addr] = struct{}{}
 				} else {
 					// Known node — check if it was non-alive and is now advertising Alive with higher gen.
 					local, ok := gs.cluster.GetNode(d.Addr)
-					log.Printf("[TRACE][HandleDigest] digest_scan KNOWN: addr=%s local.State=%v local.Gen=%d d.Gen=%d ok=%v",
-						d.Addr, local.State, local.Generation, d.Generation, ok)
+					if TraceLog {
+						log.Printf("[TRACE][HandleDigest] digest_scan KNOWN: addr=%s local.State=%v local.Gen=%d d.Gen=%d ok=%v",
+							d.Addr, local.State, local.Generation, d.Generation, ok)
+					}
 					if ok && local.State != membership.StateAlive && d.Generation > local.Generation {
-						log.Printf("[TRACE][HandleDigest] REJOIN via scan: addr=%s was=%v gen=%d>%d → queued", d.Addr, local.State, d.Generation, local.Generation)
+						if TraceLog {
+							log.Printf("[TRACE][HandleDigest] REJOIN via scan: addr=%s was=%v gen=%d>%d → queued", d.Addr, local.State, d.Generation, local.Generation)
+						}
 						toDialSet[d.Addr] = struct{}{}
 					}
 				}
@@ -310,7 +332,9 @@ func (gs *GossipService) HandleDigest(from string, msg *MessageGossipDigest, rep
 
 		// Dial all queued addresses exactly once.
 		for addr := range toDialSet {
-			log.Printf("[TRACE][HandleDigest] DIALLING addr=%s from self=%s", addr, selfAddr)
+			if TraceLog {
+				log.Printf("[TRACE][HandleDigest] DIALLING addr=%s from self=%s", addr, selfAddr)
+			}
 			go gs.onNewPeer(addr)
 		}
 	}
@@ -342,8 +366,10 @@ func (gs *GossipService) HandleResponse(from string, msg *MessageGossipResponse)
 		knownBefore[n.Addr] = true
 	}
 
-	log.Printf("[TRACE][HandleResponse] self=%s from=%s full_count=%d my_digest_count=%d knownBefore=%d",
-		selfAddr, from, len(msg.Full), len(msg.MyDigest), len(knownBefore))
+	if TraceLog {
+		log.Printf("[TRACE][HandleResponse] self=%s from=%s full_count=%d my_digest_count=%d knownBefore=%d",
+			selfAddr, from, len(msg.Full), len(msg.MyDigest), len(knownBefore))
+	}
 
 	// Apply full NodeInfo updates.
 	for _, info := range msg.Full {
@@ -364,18 +390,24 @@ func (gs *GossipService) HandleResponse(from string, msg *MessageGossipResponse)
 			gs.cluster.SetMetadata(info.Addr, info.Metadata)
 		}
 		connected := gs.isConnected(info.Addr)
-		log.Printf("[TRACE][HandleResponse] self=%s info.Addr=%s info.State=%v info.Gen=%d applied=%v connected=%v knownBefore=%v",
-			selfAddr, info.Addr, info.State, info.Generation, applied, connected, knownBefore[info.Addr])
+		if TraceLog {
+			log.Printf("[TRACE][HandleResponse] self=%s info.Addr=%s info.State=%v info.Gen=%d applied=%v connected=%v knownBefore=%v",
+				selfAddr, info.Addr, info.State, info.Generation, applied, connected, knownBefore[info.Addr])
+		}
 
 		// If this is a node we hadn't seen before and it is Alive, notify.
 		if !knownBefore[info.Addr] && info.State == membership.StateAlive && gs.onNewPeer != nil {
-			log.Printf("[TRACE][HandleResponse] NEW peer %s via response from %s → dialling", info.Addr, from)
+			if TraceLog {
+				log.Printf("[TRACE][HandleResponse] NEW peer %s via response from %s → dialling", info.Addr, from)
+			}
 			go gs.onNewPeer(info.Addr)
 		} else if knownBefore[info.Addr] && info.State == membership.StateAlive && !connected && gs.onNewPeer != nil {
 			// Known node that was non-Alive and is now Alive — rejoin case from Response path.
-			localBefore, lokOk := gs.cluster.GetNode(info.Addr)
-			log.Printf("[TRACE][HandleResponse] KNOWN alive addr=%s lokOk=%v local.State=%v local.Gen=%d info.Gen=%d",
-				info.Addr, lokOk, localBefore.State, localBefore.Generation, info.Generation)
+			if TraceLog {
+				localBefore, lokOk := gs.cluster.GetNode(info.Addr)
+				log.Printf("[TRACE][HandleResponse] KNOWN alive addr=%s lokOk=%v local.State=%v local.Gen=%d info.Gen=%d",
+					info.Addr, lokOk, localBefore.State, localBefore.Generation, info.Generation)
+			}
 		}
 	}
 

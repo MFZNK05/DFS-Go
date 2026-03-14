@@ -3,7 +3,6 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/Faizan2005/DFS-Go/ipc"
 	"github.com/spf13/cobra"
@@ -86,16 +85,6 @@ func formatSpeed(bytesPerSec float64) string {
 	default:
 		return fmt.Sprintf("%.0f B/s", bytesPerSec)
 	}
-}
-
-func formatDuration(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
-	}
-	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 func init() {

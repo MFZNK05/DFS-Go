@@ -27,7 +27,7 @@ func DownloadFile(name, outputPath, fromAlias, fromKey, sockPath string) error {
 	// Load identity — required for all downloads (fingerprint namespace).
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermod identity init --alias <name>' first")
 	}
 
 	// Determine the owner's fingerprint.
@@ -249,7 +249,7 @@ func unwrapDEK(id *identity.Identity, resp *manifestInfoResponse) ([]byte, error
 func DownloadDirectory(name, outputDir, fromAlias, fromKey, sockPath string) error {
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermod identity init --alias <name>' first")
 	}
 
 	ownerFingerprint, err := resolveOwner(id, fromAlias, fromKey, sockPath)

@@ -12,17 +12,18 @@ import (
 )
 
 const (
-	DefaultMaxHints = 1000
-	DefaultMaxAge   = 24 * time.Hour
+	DefaultMaxHints    = 200
+	DefaultMaxAge      = 24 * time.Hour
+	DefaultMaxDataSize = 512 << 20 // 512 MiB total hint data budget across all targets
 )
 
 // Hint represents a pending write that could not be delivered to its intended
 // target node because the target was unreachable at write time.
-// The data stored here is already encrypted — safe to persist to disk.
+// Data is NOT stored in the hint — it lives in CAS storage and is read on delivery.
 type Hint struct {
 	Key        string    `json:"key"`
 	TargetAddr string    `json:"target_addr"`
-	Data       []byte    `json:"data"` // raw (possibly encrypted) file bytes
+	DataSize   int64     `json:"data_size"` // size for accounting (data read from CAS on delivery)
 	CreatedAt  time.Time `json:"created_at"`
 	Attempts   int       `json:"attempts"`
 }
@@ -30,21 +31,26 @@ type Hint struct {
 // Store persists hints to disk so they survive process restarts.
 // Hints are keyed by target address and stored as JSON files.
 type Store struct {
-	mu       sync.Mutex
-	hints    map[string][]Hint // targetAddr → pending hints
-	dir      string            // directory for hint JSON files
-	maxHints int               // per-target cap
-	maxAge   time.Duration     // discard hints older than this
+	mu            sync.Mutex
+	hints         map[string][]Hint // targetAddr → pending hints
+	dir           string            // directory for hint JSON files
+	maxHints      int               // per-target cap
+	maxAge        time.Duration     // discard hints older than this
+	totalDataSize int64             // sum of len(h.Data) across all hints
+	maxDataSize   int64             // global data cap (0 = unlimited)
 }
 
 // NewStore creates (or loads) a hint store rooted at dir.
 // Expired hints are purged on load.
-func NewStore(dir string, maxHints int, maxAge time.Duration) (*Store, error) {
+func NewStore(dir string, maxHints int, maxAge time.Duration, maxDataSize int64) (*Store, error) {
 	if maxHints <= 0 {
 		maxHints = DefaultMaxHints
 	}
 	if maxAge <= 0 {
 		maxAge = DefaultMaxAge
+	}
+	if maxDataSize <= 0 {
+		maxDataSize = DefaultMaxDataSize
 	}
 
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -52,10 +58,11 @@ func NewStore(dir string, maxHints int, maxAge time.Duration) (*Store, error) {
 	}
 
 	s := &Store{
-		hints:    make(map[string][]Hint),
-		dir:      dir,
-		maxHints: maxHints,
-		maxAge:   maxAge,
+		hints:       make(map[string][]Hint),
+		dir:         dir,
+		maxHints:    maxHints,
+		maxAge:      maxAge,
+		maxDataSize: maxDataSize,
 	}
 
 	if err := s.load(); err != nil {
@@ -66,22 +73,43 @@ func NewStore(dir string, maxHints int, maxAge time.Duration) (*Store, error) {
 	return s, nil
 }
 
+// TotalDataSize returns the current total hint data bytes across all targets.
+func (s *Store) TotalDataSize() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.totalDataSize
+}
+
 // AddHint stores a hint for later delivery.
+// If the global data budget is exceeded the hint is dropped (anti-entropy repairs later).
 // If the per-target cap is exceeded the oldest hint is evicted.
 func (s *Store) AddHint(h Hint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	dataLen := h.DataSize
+
+	// Global data budget check — prevents OOM during large uploads with
+	// disconnected peers. Dropped hints are repaired by anti-entropy.
+	if s.maxDataSize > 0 && s.totalDataSize+dataLen > s.maxDataSize {
+		log.Printf("[handoff] global data budget exceeded (%dMB + %dMB > %dMB), dropping hint key=%s for %s",
+			s.totalDataSize>>20, dataLen>>20, s.maxDataSize>>20, h.Key, h.TargetAddr)
+		return nil
+	}
+
 	hints := s.hints[h.TargetAddr]
 
 	if len(hints) >= s.maxHints {
 		// Evict the oldest (index 0 after chronological ordering).
-		log.Printf("[handoff] hint cap reached for %s, evicting oldest hint (key=%s)", h.TargetAddr, hints[0].Key)
+		evicted := hints[0]
+		s.totalDataSize -= evicted.DataSize
+		log.Printf("[handoff] hint cap reached for %s, evicting oldest hint (key=%s)", h.TargetAddr, evicted.Key)
 		hints = hints[1:]
 	}
 
 	hints = append(hints, h)
 	s.hints[h.TargetAddr] = hints
+	s.totalDataSize += dataLen
 
 	return s.persistLocked(h.TargetAddr)
 }
@@ -110,6 +138,8 @@ func (s *Store) DeleteHint(targetAddr, key string) error {
 	for _, h := range hints {
 		if h.Key != key {
 			filtered = append(filtered, h)
+		} else {
+			s.totalDataSize -= h.DataSize
 		}
 	}
 	s.hints[targetAddr] = filtered
@@ -157,6 +187,8 @@ func (s *Store) purgeExpiredLocked() {
 		for _, h := range hints {
 			if h.CreatedAt.After(cutoff) {
 				fresh = append(fresh, h)
+			} else {
+				s.totalDataSize -= h.DataSize
 			}
 		}
 		if len(fresh) != len(hints) {
@@ -223,6 +255,11 @@ func (s *Store) load() error {
 		// Use TargetAddr from the hint itself — avoids filename sanitisation issues.
 		addr := hints[0].TargetAddr
 		s.hints[addr] = hints
+
+		// Track total data size from loaded hints.
+		for _, h := range hints {
+			s.totalDataSize += h.DataSize
+		}
 	}
 
 	return nil

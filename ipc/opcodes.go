@@ -35,6 +35,13 @@ const (
 	OpListInbox          byte = 0x1D
 	OpUnblockPeer        byte = 0x1E
 	OpScanLAN            byte = 0x1F
+
+	// Swarm architecture opcodes.
+	OpSeedUpload     byte = 0x20 // seed-in-place upload (path-based, no CAS copy)
+	OpSeedECDHUpload byte = 0x21 // seed-in-place ECDH upload (path-based)
+	OpSeedDirUpload      byte = 0x22 // seed-in-place directory upload
+	OpSeedECDHDirUpload  byte = 0x23 // seed-in-place ECDH directory upload
+	OpShutdown           byte = 0x24 // graceful daemon shutdown
 )
 
 // Status codes for IPC responses.

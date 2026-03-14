@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -17,27 +16,28 @@ import (
 
 // UploadFile uploads a file to the daemon via Unix socket IPC.
 //
+// Default mode: Seed In Place (swarm architecture). The CLI sends the file
+// path to the daemon, which hashes it in place and builds a manifest without
+// copying data to CAS. Chunks are served on-demand from the original file.
+//
 // When shareWith is non-empty (comma-separated aliases or hex fingerprints),
 // the CLI generates a random DEK, wraps it for each recipient via ECDH,
-// signs the manifest, and sends the ECDH upload request (opcode 0x03).
-// The daemon encrypts each chunk with the DEK before storing/replicating.
+// signs the manifest, and sends the seed ECDH upload request (opcode 0x21).
 //
-// When shareWith is empty, a plaintext upload (opcode 0x01) is sent.
-// Identity is required in both cases for fingerprint-based namespacing.
+// Identity is required in all cases for fingerprint-based namespacing.
 func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public bool) error {
 	// Load identity — required for all uploads (fingerprint namespace).
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermod identity init --alias <name>' first")
 	}
 
-	f, err := os.Open(filePath)
+	absPath, err := filepath.Abs(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve path: %w", err)
 	}
-	defer f.Close()
 
-	fi, err := f.Stat()
+	fi, err := os.Stat(absPath)
 	if err != nil {
 		return err
 	}
@@ -117,86 +117,58 @@ func UploadFile(name, filePath, shareWith, shareWithKey, sockPath string, public
 		}
 		defer conn.Close()
 
-		req := ecdhUploadRequest{
-			StorageKey:    storageKey,
+		// Seed In Place ECDH: send path, not file data.
+		req := seedECDHUploadRequest{
+			Key:           storageKey,
+			FilePath:      absPath,
+			FileSize:      fi.Size(),
 			DEK:           dek,
 			OwnerPubKey:   ownerPubHex,
 			OwnerEdPubKey: ownerEdPubHex,
 			AccessList:    accessList,
 			Signature:     sig,
-			FileSize:      fi.Size(),
 			Public:        public,
 		}
-		if err := writeECDHUploadRequest(conn, req); err != nil {
-			return fmt.Errorf("send ECDH header: %w", err)
+		if err := writeSeedECDHUploadRequest(conn, req); err != nil {
+			return fmt.Errorf("send seed ECDH header: %w", err)
 		}
 	} else {
-		// Plaintext path: no encryption.
-		if err := writeUploadRequest(conn, storageKey, fi.Size(), public); err != nil {
-			return fmt.Errorf("send header: %w", err)
+		// Seed In Place plaintext: send path, not file data.
+		if err := writeSeedUploadRequest(conn, storageKey, absPath, fi.Size(), public); err != nil {
+			return fmt.Errorf("send seed header: %w", err)
 		}
 	}
 
-	// Start a goroutine to read progress updates from the daemon.
-	// The Unix socket is full-duplex: we send file data on the main goroutine
-	// while reading progress updates here.
-	type uploadResult struct {
-		ok  bool
-		msg string
-		err error
+	// Read progress updates from the daemon.
+	// No file data is sent over IPC — the daemon reads directly from disk.
+	tid, err := readTransferID(conn)
+	if err != nil {
+		return fmt.Errorf("read transfer ID: %w", err)
 	}
-	resultCh := make(chan uploadResult, 1)
-	go func() {
-		// Read transfer ID sent by daemon before progress.
-		tid, err := readTransferID(conn)
+	fmt.Printf("Transfer %s started (seed-in-place)\n", tid)
+
+	for {
+		completed, total, isProgress, finalOK, msg, err := readProgressOrStatus(conn)
 		if err != nil {
-			resultCh <- uploadResult{err: err}
-			return
+			return fmt.Errorf("read response: %w", err)
 		}
-		fmt.Printf("Transfer %s started\n", tid)
-
-		for {
-			completed, total, isProgress, finalOK, msg, err := readProgressOrStatus(conn)
-			if err != nil {
-				resultCh <- uploadResult{err: err}
-				return
+		if isProgress {
+			if total > 0 {
+				pct := float64(completed) / float64(total) * 100
+				fmt.Printf("\rIndexing: %d/%d chunks (%.0f%%)", completed, total, pct)
+			} else {
+				fmt.Printf("\rIndexing: %d chunks", completed)
 			}
-			if isProgress {
-				if total > 0 {
-					pct := float64(completed) / float64(total) * 100
-					fmt.Printf("\rUploading: %d/%d chunks (%.0f%%)", completed, total, pct)
-				} else {
-					fmt.Printf("\rUploading: %d chunks", completed)
-				}
-				continue
-			}
-			// Final status.
-			resultCh <- uploadResult{ok: finalOK, msg: msg}
-			return
+			continue
 		}
-	}()
-
-	if _, err := io.Copy(conn, f); err != nil {
-		return fmt.Errorf("stream file: %w", err)
+		// Final status.
+		fmt.Println() // newline after progress
+		if !finalOK {
+			return fmt.Errorf("upload failed: %s", msg)
+		}
+		fmt.Println("Seeded:", msg)
+		break
 	}
-
-	// Signal EOF so the daemon's io.Reader sees end-of-stream.
-	// Works with Unix sockets (net.UnixConn) and named pipes (npipe).
-	type closeWriter interface{ CloseWrite() error }
-	if cw, ok := conn.(closeWriter); ok {
-		cw.CloseWrite()
-	}
-
-	// Wait for the daemon's final response.
-	res := <-resultCh
-	fmt.Println() // newline after progress
-	if res.err != nil {
-		return fmt.Errorf("read response: %w", res.err)
-	}
-	if !res.ok {
-		return fmt.Errorf("upload failed: %s", res.msg)
-	}
-	fmt.Println("Uploaded:", res.msg)
 
 	// Auto-notify share-with recipients so the file appears in their inbox.
 	if shareWith != "" {
@@ -305,7 +277,7 @@ func resolveRecipients(conn net.Conn, shareWith, shareWithKey, sockPath string) 
 func UploadDirectory(name, dirPath, shareWith, shareWithKey, sockPath string, public bool) error {
 	id, err := identity.Load(identity.DefaultPath())
 	if err != nil {
-		return fmt.Errorf("no identity found. Run 'hermond identity init --alias <name>' first")
+		return fmt.Errorf("no identity found. Run 'hermod identity init --alias <name>' first")
 	}
 
 	storageKey := id.Fingerprint() + "/" + name

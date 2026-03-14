@@ -75,6 +75,10 @@ type ChunkManifest struct {
 	OwnerEdPubKey string        `json:"owner_ed_pub_key,omitempty"` // hex Ed25519 pub of uploader
 	AccessList    []AccessEntry `json:"access_list,omitempty"`      // one entry per recipient
 	Signature     string        `json:"signature,omitempty"`        // hex Ed25519 signature
+
+	// Swarm mode fields (set when SeedMode=true).
+	SeedMode       bool   `json:"seed_mode,omitempty"`       // true = chunks served on-demand, not stored in CAS
+	OriginalSeeder string `json:"original_seeder,omitempty"` // addr of the uploading node
 }
 
 // ChunkReader reads from r in chunkSize-byte increments and sends each chunk

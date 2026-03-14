@@ -18,7 +18,7 @@ func ipcDial(path string) (net.Conn, error) {
 }
 
 func platformSocketPath(port string) string {
-	return fmt.Sprintf(`\\.\pipe\hermond-%s`, port)
+	return fmt.Sprintf(`\\.\pipe\hermod-%s`, port)
 }
 
 func cleanupSocket(path string) {

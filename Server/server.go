@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -33,6 +35,7 @@ import (
 	"github.com/Faizan2005/DFS-Go/Cluster/selector"
 	"github.com/Faizan2005/DFS-Go/Cluster/vclock"
 	crypto "github.com/Faizan2005/DFS-Go/Crypto"
+	"github.com/Faizan2005/DFS-Go/Crypto/envelope"
 	"github.com/Faizan2005/DFS-Go/Observability/health"
 	"github.com/Faizan2005/DFS-Go/Observability/logging"
 	"github.com/Faizan2005/DFS-Go/Observability/metrics"
@@ -41,7 +44,6 @@ import (
 	"github.com/Faizan2005/DFS-Go/Peer2Peer/nat"
 	quicTransport "github.com/Faizan2005/DFS-Go/Peer2Peer/quic"
 	"github.com/Faizan2005/DFS-Go/Server/downloader"
-	"github.com/Faizan2005/DFS-Go/Server/ratelimit"
 	"github.com/Faizan2005/DFS-Go/Server/transfer"
 	"github.com/Faizan2005/DFS-Go/State"
 	storage "github.com/Faizan2005/DFS-Go/Storage"
@@ -50,6 +52,7 @@ import (
 	"github.com/Faizan2005/DFS-Go/Storage/dirmanifest"
 	"github.com/Faizan2005/DFS-Go/Storage/pending"
 	"github.com/Faizan2005/DFS-Go/Storage/resume"
+	"github.com/Faizan2005/DFS-Go/Storage/swarm"
 	"github.com/Faizan2005/DFS-Go/factory"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -107,8 +110,9 @@ type Server struct {
 	Store        *storage.Store
 	HashRing     *hashring.HashRing
 	quitch       chan struct{}
-	pendingFile  map[string]chan io.Reader
+	pendingFile  map[string]chan []byte
 	pendingOffer map[string]chan []string // key: peerAddr → missing hashes reply
+	casWriteCh   chan casWriteRequest     // async CAS cache writes (non-blocking from hot path)
 	mu           sync.Mutex
 	shutdownOnce sync.Once
 
@@ -146,9 +150,6 @@ type Server struct {
 	externalAddr   string
 	externalAddrMu sync.Mutex
 
-	// Sprint E: adaptive bandwidth management (LEDBAT-lite).
-	BandwidthMgr *ratelimit.BandwidthManager
-
 	// Sprint F: persistent local state (upload/download history, public files).
 	StateDB *State.StateDB
 
@@ -158,14 +159,41 @@ type Server struct {
 	// Sprint G: search request dedup cache (flood loop prevention).
 	searchSeen *SearchRequestCache
 
+	// Swarm: DEK cache for on-demand ECDH encryption (fileKey → unwrapped DEK).
+	dekCache sync.Map
+	// Swarm: X25519 private key for DEK unwrapping from manifest AccessList.
+	x25519Priv []byte
+	// Swarm: CAS cache manager for LRU eviction of secondary seeder chunks.
+	CacheMgr *swarm.CacheManager
+
+	// Two-Port Architecture: separate data-plane transport (nil = single-port mode).
+	// When non-nil, chunk transfers (StoreFile, GetFile, LocalFile, GetChunkSwarm)
+	// are routed through this transport on port N+1, keeping the main transport
+	// (port N) free for gossip/heartbeat/announce/metadata.
+	dataTransport peer2peer.Transport
+	dataPeers     map[string]peer2peer.Peer
+	dataPeerLock  sync.RWMutex
+
 	// mDNS LAN auto-discovery advertiser (nil if identity not loaded).
 	MDNSAdvertiser *peermdns.Advertiser
+
+	// Cached mDNS LAN discovery results (updated by background goroutine).
+	lanPeersMu sync.RWMutex
+	lanPeers   []peermdns.DiscoveredPeer
 
 	// Connection Manager: auto-reconnection with exponential backoff.
 	backoffMu  sync.Mutex
 	backoffMap map[string]time.Time // addr → earliest next dial
 	backoffExp map[string]int       // addr → exponent (0→1min, 1→5min, 2+→1hr)
 	maxPeers   int                  // target active peer connections
+
+	// bootstrapAddrs holds the normalized addresses from --peer flags.
+	// Used to bypass fingerprint blocklist for explicitly requested peers.
+	bootstrapAddrs map[string]struct{}
+
+	// activeUploads tracks in-progress uploads. Anti-entropy yields when > 0
+	// to avoid Head-of-Line blocking on the shared QUIC connection.
+	activeUploads atomic.Int32
 }
 
 type Message struct {
@@ -360,6 +388,44 @@ type MessageSearchResponse struct {
 	FromNode  string
 }
 
+// ── Swarm architecture messages ───────────────────────────────────────
+
+// MessageGetChunkSwarm requests a chunk by file key + index (swarm mode).
+// Unlike MessageGetFile which uses a CAS storage key, this uses the file-level
+// key and chunk index so the seeder can serve from the original file on disk.
+type MessageGetChunkSwarm struct {
+	FileKey    string
+	ChunkIndex int
+	EncHash    string // expected SHA-256 of encrypted/compressed chunk
+}
+
+// MessageRegisterProvider registers a node as a seeder for a file.
+// Sent to hash ring nodes responsible for the file key.
+type MessageRegisterProvider struct {
+	FileKey     string
+	Provider    string // addr of the seeder
+	ChunkCount  int
+	TotalChunks int
+}
+
+// MessageGetProviders queries hash ring nodes for the seeder list of a file.
+type MessageGetProviders struct {
+	FileKey string
+}
+
+// MessageProvidersResponse carries the seeder list back to the requester.
+type MessageProvidersResponse struct {
+	FileKey   string
+	Providers []ProviderInfo
+}
+
+// ProviderInfo is the wire-format provider record (matches swarm.ProviderRecord).
+type ProviderInfo struct {
+	Addr        string
+	ChunkCount  int
+	TotalChunks int
+}
+
 // SearchResult represents a single file matching a search query.
 type SearchResult struct {
 	Key        string `json:"key"`
@@ -514,7 +580,7 @@ func (s *Server) GetDataToFile(ctx context.Context, key string, filePath string,
 	}
 
 	if s.Downloader != nil {
-		if err := s.Downloader.DownloadToFileResumable(ctx, manifest, f, skipSet, progress, onChunkDone, dek); err != nil {
+		if err := s.Downloader.DownloadToFileResumable(ctx, key, manifest, f, skipSet, progress, onChunkDone, dek); err != nil {
 			return fmt.Errorf("GetDataToFile: %w", err)
 		}
 	} else {
@@ -533,6 +599,19 @@ func (s *Server) GetDataToFile(ctx context.Context, key string, filePath string,
 	}
 
 	go s.readRepair(key)
+
+	// Swarm: after successful download, register as CAS-backed seeder so other
+	// nodes can fetch chunks from us (downloaders become seeders).
+	if manifest.SeedMode && s.StateDB != nil {
+		_ = s.StateDB.SetSeedSource(key, &swarm.SeedSource{
+			CASBacked:   true,
+			ChunkSize:   manifest.ChunkSize,
+			TotalChunks: len(manifest.Chunks),
+			Bitfield:    swarm.NewFullBitfield(len(manifest.Chunks)),
+		})
+		s.registerProvider(key, len(manifest.Chunks), len(manifest.Chunks))
+	}
+
 	return nil
 }
 
@@ -629,7 +708,7 @@ func (s *Server) serialDownloadToFile(ctx context.Context, manifest *chunker.Chu
 				return fmt.Errorf("read bytes chunk %d: %w", info.Index, err)
 			}
 		} else {
-			data, err := s.fetchChunkFromPeers(storageKey)
+			data, err := s.fetchChunkFromPeers(ctx, storageKey)
 			if err != nil {
 				return fmt.Errorf("fetch chunk %d from peers: %w", info.Index, err)
 			}
@@ -640,7 +719,7 @@ func (s *Server) serialDownloadToFile(ctx context.Context, manifest *chunker.Chu
 		plainBytes := chunkData
 		if dek != nil {
 			var plain bytes.Buffer
-			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek); err != nil {
+			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek, uint64(info.Index)); err != nil {
 				return fmt.Errorf("decrypt chunk %d: %w", info.Index, err)
 			}
 			plainBytes = plain.Bytes()
@@ -695,7 +774,7 @@ func (s *Server) getChunked(key string, dek []byte) (io.ReadCloser, error) {
 	if s.Downloader != nil {
 		// Parallel path: sliding-window streaming via DownloadToStream.
 		go func() {
-			err := s.Downloader.DownloadToStream(manifest, pw, nil, dek)
+			err := s.Downloader.DownloadToStream(context.Background(), key, manifest, pw, nil, dek)
 			pw.CloseWithError(err) // nil err closes cleanly
 			if err == nil {
 				go s.readRepair(key)
@@ -723,7 +802,9 @@ func (s *Server) getChunked(key string, dek []byte) (io.ReadCloser, error) {
 					return
 				}
 			} else {
-				data, err := s.fetchChunkFromPeers(storageKey)
+				fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				data, err := s.fetchChunkFromPeers(fetchCtx, storageKey)
+				fetchCancel()
 				if err != nil {
 					pw.CloseWithError(fmt.Errorf("getChunked: fetch chunk %d from peers: %w", info.Index, err))
 					return
@@ -735,7 +816,7 @@ func (s *Server) getChunked(key string, dek []byte) (io.ReadCloser, error) {
 			plainBytes := chunkData
 			if dek != nil {
 				var plain bytes.Buffer
-				if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek); err != nil {
+				if err := crypto.DecryptStreamWithDEK(bytes.NewReader(chunkData), &plain, dek, uint64(info.Index)); err != nil {
 					pw.CloseWithError(fmt.Errorf("getChunked: decrypt chunk %d: %w", info.Index, err))
 					return
 				}
@@ -773,7 +854,7 @@ func (s *Server) getChunked(key string, dek []byte) (io.ReadCloser, error) {
 
 // fetchChunkFromPeers requests a chunk's encrypted bytes from the ring-
 // responsible peers and returns the raw encrypted data.
-func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
+func (s *Server) fetchChunkFromPeers(ctx context.Context, storageKey string) ([]byte, error) {
 	selfAddr := s.serverOpts.transport.Addr()
 	targetNodes := s.HashRing.GetNodes(storageKey, s.HashRing.ReplicationFactor())
 
@@ -783,7 +864,7 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 	s.mu.Lock()
 	ch, alreadyFetching := s.pendingFile[storageKey]
 	if !alreadyFetching {
-		ch = make(chan io.Reader, 1)
+		ch = make(chan []byte, 1)
 		s.pendingFile[storageKey] = ch
 	}
 	s.mu.Unlock()
@@ -791,17 +872,17 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 	if alreadyFetching {
 		// Another goroutine owns this fetch — wait for its result.
 		select {
-		case r := <-ch:
-			if r == nil {
-				return nil, fmt.Errorf("fetchChunkFromPeers: nil reader for '%s'", storageKey)
+		case data := <-ch:
+			if data == nil {
+				return nil, fmt.Errorf("fetchChunkFromPeers: nil data for '%s'", storageKey)
 			}
 			// Put it back so any other waiter also gets it (best-effort).
 			select {
-			case ch <- r:
+			case ch <- data:
 			default:
 			}
-			return io.ReadAll(r)
-		case <-time.After(10 * time.Second):
+			return data, nil
+		case <-ctx.Done():
 			return nil, fmt.Errorf("fetchChunkFromPeers: timeout waiting for in-flight fetch of '%s'", storageKey)
 		}
 	}
@@ -841,12 +922,12 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 	}
 
 	select {
-	case r := <-ch:
-		if r == nil {
-			return nil, fmt.Errorf("nil reader for chunk '%s'", storageKey)
+	case data := <-ch:
+		if data == nil {
+			return nil, fmt.Errorf("nil data for chunk '%s'", storageKey)
 		}
-		return io.ReadAll(r)
-	case <-time.After(10 * time.Second):
+		return data, nil
+	case <-ctx.Done():
 		return nil, fmt.Errorf("timeout fetching chunk '%s'", storageKey)
 	}
 }
@@ -855,7 +936,7 @@ func (s *Server) fetchChunkFromPeers(storageKey string) ([]byte, error) {
 // specific peer. Used by the Downloader which has already selected the best
 // peer via the Selector — so we send to that peer only.
 // When peerAddr == selfAddr the chunk is read directly from local storage.
-func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error) {
+func (s *Server) fetchChunkFromPeer(ctx context.Context, storageKey, peerAddr string) ([]byte, error) {
 	// Local read: chunk is on disk here — no network hop needed.
 	// Check s.Store.Has first so that a node whose ring address doesn't match
 	// its transport.Addr() string (e.g. Docker container whose canonical addr
@@ -874,23 +955,23 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 	s.mu.Lock()
 	ch, alreadyFetching := s.pendingFile[storageKey]
 	if !alreadyFetching {
-		ch = make(chan io.Reader, 1)
+		ch = make(chan []byte, 1)
 		s.pendingFile[storageKey] = ch
 	}
 	s.mu.Unlock()
 
 	if alreadyFetching {
 		select {
-		case r := <-ch:
-			if r == nil {
-				return nil, fmt.Errorf("fetchChunkFromPeer: nil reader for '%s'", storageKey)
+		case data := <-ch:
+			if data == nil {
+				return nil, fmt.Errorf("fetchChunkFromPeer: nil data for '%s'", storageKey)
 			}
 			select {
-			case ch <- r:
+			case ch <- data:
 			default:
 			}
-			return io.ReadAll(r)
-		case <-time.After(10 * time.Second):
+			return data, nil
+		case <-ctx.Done():
 			return nil, fmt.Errorf("fetchChunkFromPeer: timeout waiting for in-flight fetch of '%s'", storageKey)
 		}
 	}
@@ -918,12 +999,12 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 	}
 
 	select {
-	case r := <-ch:
-		if r == nil {
-			return nil, fmt.Errorf("fetchChunkFromPeer: nil reader for '%s'", storageKey)
+	case data := <-ch:
+		if data == nil {
+			return nil, fmt.Errorf("fetchChunkFromPeer: nil data for '%s'", storageKey)
 		}
-		return io.ReadAll(r)
-	case <-time.After(10 * time.Second):
+		return data, nil
+	case <-ctx.Done():
 		return nil, fmt.Errorf("fetchChunkFromPeer: timeout for '%s'", storageKey)
 	}
 }
@@ -931,12 +1012,12 @@ func (s *Server) fetchChunkFromPeer(storageKey, peerAddr string) ([]byte, error)
 // fetchMetadataFromPeers sends a unified metadata request to peers.
 // Returns raw JSON bytes and isDirectory flag. The caller unmarshals
 // into ChunkManifest or DirectoryManifest based on the flag.
-func (s *Server) fetchMetadataFromPeers(key string) (data []byte, isDirectory bool, err error) {
+func (s *Server) fetchMetadataFromPeers(ctx context.Context, key string) (data []byte, isDirectory bool, err error) {
 	selfAddr := s.serverOpts.transport.Addr()
 	targetNodes := s.HashRing.GetNodes(key, s.HashRing.ReplicationFactor())
 
 	pendingKey := "__manifest__" + key
-	ch := make(chan io.Reader, len(targetNodes))
+	ch := make(chan []byte, len(targetNodes))
 	s.mu.Lock()
 	s.pendingFile[pendingKey] = ch
 	s.mu.Unlock()
@@ -975,24 +1056,22 @@ func (s *Server) fetchMetadataFromPeers(key string) (data []byte, isDirectory bo
 	}
 
 	select {
-	case r := <-ch:
-		payload, err := io.ReadAll(r)
-		if err != nil {
-			return nil, false, fmt.Errorf("fetchMetadata: read response: %w", err)
-		}
+	case payload := <-ch:
 		if len(payload) < 1 {
 			return nil, false, fmt.Errorf("fetchMetadata: empty response")
 		}
 		// First byte is type flag: 0x00=file, 0x01=directory.
 		return payload[1:], payload[0] == 0x01, nil
-	case <-time.After(10 * time.Second):
+	case <-ctx.Done():
 		return nil, false, fmt.Errorf("timeout fetching metadata for '%s'", key)
 	}
 }
 
 // fetchManifestFromPeers retrieves a ChunkManifest from peers for key.
 func (s *Server) fetchManifestFromPeers(key string) (*chunker.ChunkManifest, error) {
-	data, isDir, err := s.fetchMetadataFromPeers(key)
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	data, isDir, err := s.fetchMetadataFromPeers(fetchCtx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -1064,6 +1143,9 @@ func (s *Server) StoreDataCollectMeta(ctx context.Context, key string, w io.Read
 }
 
 func (s *Server) storeDataInternal(ctx context.Context, key string, w io.Reader, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc, deferMeta bool) (*StoredFileResult, error) {
+	s.activeUploads.Add(1)
+	defer s.activeUploads.Add(-1)
+
 	t0 := time.Now()
 	log.Println("STORE_DATA: Starting chunked storage for key:", key)
 	defer func() { metrics.RecordStore("store", nil, time.Since(t0)) }()
@@ -1150,7 +1232,7 @@ func (s *Server) storeDataInternal(ctx context.Context, key string, w io.Reader,
 			// Encrypt only when encryption metadata was provided (ECDH path).
 			if enc != nil {
 				var encBuf bytes.Buffer
-				if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, enc.DEK, &encBufPool); err != nil {
+				if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, enc.DEK, &encBufPool, uint64(chunk.Index)); err != nil {
 					// Return pooled data before bailing.
 					b := pooledData[:cap(pooledData)]
 					chunkDataPool.Put(&b)
@@ -1200,7 +1282,7 @@ func (s *Server) storeDataInternal(ctx context.Context, key string, w io.Reader,
 	// blocks when all replication slots are busy.  This creates backpressure
 	// all the way back to Stage 1 / the disk reader, capping resident memory
 	// at (maxInFlight + procCh cap) × chunkSize regardless of file size.
-	const maxInFlight = 4
+	const maxInFlight = 8
 	sem := make(chan struct{}, maxInFlight)
 	var replWg sync.WaitGroup
 
@@ -1334,6 +1416,182 @@ func (s *Server) storeDataInternal(ctx context.Context, key string, w io.Reader,
 	return nil, nil
 }
 
+// ── Seed In Place (swarm mode upload) ─────────────────────────────────
+
+// SeedInPlace indexes a file for swarm-mode serving without copying it to CAS.
+// It reads the file to compute chunk hashes, builds a manifest, replicates the
+// manifest to hash ring nodes, and registers this node as a provider. The file
+// stays where it is — chunks are served on-demand from the original path.
+func (s *Server) SeedInPlace(ctx context.Context, key, filePath string, enc *EncryptionMeta, fileSize int64, progress UploadProgressFunc) error {
+	s.activeUploads.Add(1)
+	defer s.activeUploads.Add(-1)
+
+	t0 := time.Now()
+	log.Printf("SEED_IN_PLACE: Starting for key=%q path=%q size=%d", key, filePath, fileSize)
+	defer func() { metrics.RecordStore("seed_in_place", nil, time.Since(t0)) }()
+
+	selfAddr := normalizeAddr(s.serverOpts.transport.Addr())
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("SEED_IN_PLACE: open: %w", err)
+	}
+	defer f.Close()
+
+	// If fileSize wasn't provided, stat the file.
+	if fileSize <= 0 {
+		info, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("SEED_IN_PLACE: stat: %w", err)
+		}
+		fileSize = info.Size()
+	}
+
+	totalChunks := int((fileSize + int64(chunker.DefaultChunkSize) - 1) / int64(chunker.DefaultChunkSize))
+
+	chunkCh, errCh := chunker.ChunkReaderWithPool(f, chunker.DefaultChunkSize, &chunkReadBufPool, &chunkDataPool)
+	var chunkInfos []chunker.ChunkInfo
+
+	for chunk := range chunkCh {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		processed := chunk.Data
+		pooledData := chunk.Data
+		wasCompressed := false
+		if compression.ShouldCompress(chunk.Data) {
+			if c, wc, compErr := compression.CompressChunkWithPool(chunk.Data, compression.LevelFastest, &compBufPool); compErr == nil && wc {
+				processed = c
+				wasCompressed = true
+			}
+		}
+
+		// Encrypt if ECDH — needed to compute EncHash (deterministic nonces
+		// guarantee identical ciphertext when re-encrypted on-demand).
+		if enc != nil {
+			var encBuf bytes.Buffer
+			if encErr := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, enc.DEK, &encBufPool, uint64(chunk.Index)); encErr != nil {
+				b := pooledData[:cap(pooledData)]
+				chunkDataPool.Put(&b)
+				return fmt.Errorf("SEED_IN_PLACE: encrypt chunk %d: %w", chunk.Index, encErr)
+			}
+			processed = encBuf.Bytes()
+		}
+
+		// Compute hash BEFORE returning pooled data — processed may alias the
+		// pooled buffer (plaintext + no compression), so the chunker goroutine
+		// could overwrite it once we return it to the pool.
+		hashRaw := sha256.Sum256(processed)
+		hashHex := hex.EncodeToString(hashRaw[:])
+
+		// Return pooled data — we only needed the hash.
+		b := pooledData[:cap(pooledData)]
+		chunkDataPool.Put(&b)
+
+		chunkInfos = append(chunkInfos, chunker.ChunkInfo{
+			Index:      chunk.Index,
+			Hash:       hex.EncodeToString(chunk.Hash[:]),
+			Size:       chunk.Size,
+			EncHash:    hashHex,
+			Compressed: wasCompressed,
+		})
+
+		if progress != nil {
+			progress(len(chunkInfos), totalChunks)
+		}
+	}
+
+	if err := <-errCh; err != nil {
+		return fmt.Errorf("SEED_IN_PLACE: chunker: %w", err)
+	}
+
+	// Build manifest with swarm fields.
+	manifest := chunker.BuildManifest(key, chunkInfos, time.Now().UnixNano())
+	manifest.SeedMode = true
+	manifest.OriginalSeeder = s.effectiveSelfAddr()
+	if enc != nil {
+		manifest.Encrypted = true
+		manifest.OwnerPubKey = enc.OwnerPubKey
+		manifest.OwnerEdPubKey = enc.OwnerEdPubKey
+		manifest.AccessList = enc.AccessList
+		manifest.Signature = enc.Signature
+	}
+
+	// Store manifest locally.
+	if err := s.serverOpts.metaData.SetManifest(key, manifest); err != nil {
+		return fmt.Errorf("SEED_IN_PLACE: store manifest: %w", err)
+	}
+
+	// Update top-level file metadata.
+	topFm, _ := s.serverOpts.metaData.Get(key)
+	if topFm.VClock == nil {
+		topFm.VClock = make(map[string]uint64)
+	}
+	topFm.VClock[selfAddr]++
+	topFm.Chunked = true
+	topFm.Timestamp = time.Now().UnixNano()
+	if err := s.serverOpts.metaData.Set(key, topFm); err != nil {
+		return fmt.Errorf("SEED_IN_PLACE: update file meta: %w", err)
+	}
+
+	// Replicate manifest to hash ring (fire-and-forget).
+	s.replicateManifest(key, selfAddr, manifest)
+
+	// Store local seed source (so this node can serve chunks on-demand).
+	if s.StateDB != nil {
+		_ = s.StateDB.SetSeedSource(key, &swarm.SeedSource{
+			OriginalPath: filePath,
+			ChunkSize:    chunker.DefaultChunkSize,
+			TotalChunks:  len(chunkInfos),
+			Bitfield:     swarm.NewFullBitfield(len(chunkInfos)),
+		})
+	}
+
+	// Register as provider on hash ring nodes.
+	s.registerProvider(key, len(chunkInfos), len(chunkInfos))
+
+	elapsed := time.Since(t0)
+	log.Printf("SEED_IN_PLACE: key=%q indexed %d chunks in %v (zero CAS writes)", key, len(chunkInfos), elapsed)
+	return nil
+}
+
+// registerProvider sends a provider registration to hash ring nodes for fileKey.
+func (s *Server) registerProvider(fileKey string, chunkCount, totalChunks int) {
+	selfAddr := s.effectiveSelfAddr()
+	targets := s.HashRing.GetNodes(fileKey, s.HashRing.ReplicationFactor())
+	msg := &Message{Payload: &MessageRegisterProvider{
+		FileKey:     fileKey,
+		Provider:    selfAddr,
+		ChunkCount:  chunkCount,
+		TotalChunks: totalChunks,
+	}}
+	for _, addr := range targets {
+		if normalizeAddr(addr) == normalizeAddr(selfAddr) {
+			// Store locally instead of sending to self.
+			if s.StateDB != nil {
+				_ = s.StateDB.AddProvider(fileKey, swarm.ProviderRecord{
+					Addr:         selfAddr,
+					ChunkCount:   chunkCount,
+					TotalChunks:  totalChunks,
+					RegisteredAt: time.Now().UnixNano(),
+				})
+			}
+			continue
+		}
+		_ = s.sendToAddr(addr, msg)
+	}
+}
+
+// deregisterProvider removes this node from the provider list for fileKey.
+func (s *Server) deregisterProvider(fileKey string) {
+	selfAddr := s.effectiveSelfAddr()
+	if s.StateDB != nil {
+		_ = s.StateDB.RemoveProvider(fileKey, selfAddr)
+	}
+	// Note: remote hash ring nodes will expire the record via TTL.
+}
+
 // DirUploadProgressFunc reports directory upload progress.
 // fileIdx/fileTotal track which file, chunkIdx/chunkTotal track chunks within.
 type DirUploadProgressFunc func(fileIdx, fileTotal, chunkIdx, chunkTotal int)
@@ -1464,7 +1722,9 @@ func (s *Server) GetDirectoryManifest(key string) (*dirmanifest.DirectoryManifes
 	data, ok := s.serverOpts.metaData.GetDirManifest(key)
 	if !ok {
 		// Not local — ask peers via unified metadata fetch.
-		peerData, isDir, err := s.fetchMetadataFromPeers(key)
+		fetchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		peerData, isDir, err := s.fetchMetadataFromPeers(fetchCtx, key)
 		if err != nil || !isDir {
 			return nil, fmt.Errorf("no directory manifest for %q", key)
 		}
@@ -1485,42 +1745,222 @@ func (s *Server) IsDirectoryManifest(key string) bool {
 	return ok
 }
 
-// GetDirectory downloads all files from a directory manifest to outputDir.
-func (s *Server) GetDirectory(ctx context.Context, key string, outputDir string, dek []byte, progress DirUploadProgressFunc) error {
+// DownloadReport summarises a directory download.
+type DownloadReport struct {
+	Succeeded   int
+	Failed      int
+	FailedFiles []string
+}
+
+// GetDirectory downloads all files from a directory manifest to outputDir
+// using a global chunk work pool (BitTorrent-style). All chunks from all
+// files are flattened into a single queue with N concurrent workers.
+//
+// Phase 1 (resume-first): scans local disk for already-complete files.
+// Phase 2 (global queue): downloads remaining chunks across all files in parallel.
+func (s *Server) GetDirectory(ctx context.Context, key string, outputDir string, dek []byte, progress DirUploadProgressFunc) (*DownloadReport, error) {
 	dm, err := s.GetDirectoryManifest(key)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	fileTotal := dm.FileCount
+	files, totalChunks, alreadyDoneFiles, err := s.prepareDirectoryDownload(ctx, dm, outputDir, dek)
+	if err != nil {
+		cleanupFileContexts(files)
+		return nil, err
+	}
+	defer cleanupFileContexts(files)
+
+	log.Printf("GET_DIRECTORY: %d/%d files already complete, %d files need chunks (%d total chunks)",
+		alreadyDoneFiles, dm.FileCount, len(files), totalChunks)
+
+	if len(files) == 0 {
+		report := &DownloadReport{Succeeded: alreadyDoneFiles}
+		log.Printf("GET_DIRECTORY: key '%s' — all %d files already on disk", key, alreadyDoneFiles)
+		return report, nil
+	}
+
+	// Adapt DirProgressFunc → DirUploadProgressFunc for IPC.
+	var progressAdapter downloader.DirProgressFunc
+	if progress != nil {
+		progressAdapter = func(fc, ft, cc, ct int) {
+			progress(alreadyDoneFiles+fc, dm.FileCount, cc, ct)
+		}
+	}
+
+	result := s.Downloader.DownloadDirectory(ctx, files, 0, dek, progressAdapter)
+
+	report := &DownloadReport{
+		Succeeded:   alreadyDoneFiles + result.Succeeded,
+		Failed:      result.Failed,
+		FailedFiles: result.FailedFiles,
+	}
+
+	log.Printf("GET_DIRECTORY: key '%s' — %d/%d files downloaded to %s, %d failed",
+		key, report.Succeeded, dm.FileCount, outputDir, report.Failed)
+	return report, nil
+}
+
+// prepareDirectoryDownload scans outputDir for already-complete files, fetches
+// manifests for remaining files, loads resume sidecars, and returns FileContext
+// objects ready for the global chunk queue.
+func (s *Server) prepareDirectoryDownload(
+	ctx context.Context,
+	dm *dirmanifest.DirectoryManifest,
+	outputDir string,
+	dek []byte,
+) (files []*downloader.FileContext, totalChunks int, alreadyDoneFiles int, err error) {
+
 	for i, entry := range dm.Files {
 		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		outPath, err := dirmanifest.SafeOutputPath(outputDir, entry.RelativePath)
-		if err != nil {
-			return fmt.Errorf("GetDirectory: %w", err)
+			return files, totalChunks, alreadyDoneFiles, ctx.Err()
 		}
 
-		// Ensure parent directory exists.
-		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-			return fmt.Errorf("GetDirectory: mkdir %s: %w", entry.RelativePath, err)
+		outPath, pathErr := dirmanifest.SafeOutputPath(outputDir, entry.RelativePath)
+		if pathErr != nil {
+			log.Printf("GET_DIRECTORY: SKIP %s: %v", entry.RelativePath, pathErr)
+			continue
 		}
 
-		fileIdx := i
-		fileProgress := func(chunkIdx, chunkTotal int) {
-			if progress != nil {
-				progress(fileIdx+1, fileTotal, chunkIdx, chunkTotal)
+		if mkErr := os.MkdirAll(filepath.Dir(outPath), 0o755); mkErr != nil {
+			log.Printf("GET_DIRECTORY: SKIP %s: mkdir: %v", entry.RelativePath, mkErr)
+			continue
+		}
+
+		// Phase 1: Check if file is already complete on disk.
+		if info, statErr := os.Stat(outPath); statErr == nil && info.Size() == entry.Size {
+			// Clean up any orphaned .part / .part.resume from prior attempts.
+			partPath := resume.PartPath(outPath)
+			if _, pErr := os.Stat(partPath); pErr == nil {
+				_ = os.Remove(partPath)
+				_ = resume.Cleanup(outPath)
+			}
+			alreadyDoneFiles++
+			continue
+		}
+
+		// Fetch this file's chunk manifest.
+		manifest, manErr := s.EnsureManifest(entry.ManifestKey)
+		if manErr != nil {
+			log.Printf("GET_DIRECTORY: SKIP %s: manifest: %v", entry.RelativePath, manErr)
+			continue
+		}
+
+		// Load existing resume sidecar (if any).
+		partPath := resume.PartPath(outPath)
+		skipSet := make(map[int]bool)
+		var sidecar *resume.Sidecar
+
+		existing, claimed, openErr := resume.Open(outPath)
+		if openErr != nil {
+			log.Printf("GET_DIRECTORY: corrupt sidecar for %q, starting fresh: %v", outPath, openErr)
+			_ = resume.Cleanup(outPath)
+		} else if existing != nil {
+			if existing.Matches(entry.ManifestKey, manifest.MerkleRoot, len(manifest.Chunks), manifest.TotalSize) {
+				skipSet = s.fastVerifyChunks(partPath, manifest, claimed)
+				sidecar = existing
+				log.Printf("GET_DIRECTORY: [RESUME] %s: verified %d/%d chunks", entry.RelativePath, len(skipSet), len(manifest.Chunks))
+			} else {
+				existing.Close()
+				_ = resume.Cleanup(outPath)
+				_ = os.Remove(partPath)
 			}
 		}
 
-		if err := s.GetDataToFile(ctx, entry.ManifestKey, outPath, dek, fileProgress); err != nil {
-			return fmt.Errorf("GetDirectory: download %s: %w", entry.RelativePath, err)
+		// If all chunks are already verified, finalize immediately.
+		if len(skipSet) == len(manifest.Chunks) {
+			if sidecar != nil {
+				sidecar.Close()
+			}
+			if verErr := chunker.VerifyMerkleRoot(manifest.Chunks, manifest.MerkleRoot); verErr == nil {
+				_ = resume.Cleanup(outPath)
+				_ = storage.SafeRename(partPath, outPath)
+				alreadyDoneFiles++
+				log.Printf("GET_DIRECTORY: [RESUME] %s: all chunks verified, finalized", entry.RelativePath)
+				continue
+			}
+			// Merkle failed — re-download all chunks.
+			skipSet = make(map[int]bool)
+			_ = os.Remove(partPath)
 		}
+
+		// Create sidecar if we don't have one.
+		if sidecar == nil {
+			sidecar, err = resume.Create(outPath, entry.ManifestKey, manifest.MerkleRoot,
+				len(manifest.Chunks), manifest.TotalSize, manifest.ChunkSize)
+			if err != nil {
+				log.Printf("GET_DIRECTORY: SKIP %s: sidecar create: %v", entry.RelativePath, err)
+				continue
+			}
+		}
+
+		// Open/allocate .part file.
+		f, fErr := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+		if fErr != nil {
+			sidecar.Close()
+			log.Printf("GET_DIRECTORY: SKIP %s: open .part: %v", entry.RelativePath, fErr)
+			continue
+		}
+		if tErr := f.Truncate(manifest.TotalSize); tErr != nil {
+			f.Close()
+			sidecar.Close()
+			log.Printf("GET_DIRECTORY: SKIP %s: truncate: %v", entry.RelativePath, tErr)
+			continue
+		}
+
+		remaining := len(manifest.Chunks) - len(skipSet)
+
+		// Capture variables for closures.
+		outPathCopy := outPath
+		manifestCopy := manifest
+		sidecarCopy := sidecar
+		fileCopy := f
+
+		fc := &downloader.FileContext{
+			Index:        i,
+			FileKey:      entry.ManifestKey,
+			RelativePath: entry.RelativePath,
+			ChunkSize:    manifest.ChunkSize,
+			Chunks:       manifest.Chunks,
+			Writer:       f,
+			SkipSet:      skipSet,
+			TotalChunks:  len(manifest.Chunks),
+			OnChunkDone: func(index int, hash string) {
+				if err := sidecarCopy.RecordChunk(index); err != nil {
+					log.Printf("GET_DIRECTORY: [RESUME] failed to record chunk %d for %s: %v", index, outPathCopy, err)
+				}
+			},
+			OnFinalize: func() error {
+				if err := chunker.VerifyMerkleRoot(manifestCopy.Chunks, manifestCopy.MerkleRoot); err != nil {
+					return err
+				}
+				fileCopy.Close()
+				sidecarCopy.Close()
+				_ = resume.Cleanup(outPathCopy)
+				return storage.SafeRename(resume.PartPath(outPathCopy), outPathCopy)
+			},
+			Cleanup: func() {
+				fileCopy.Close()
+				sidecarCopy.Close()
+			},
+		}
+		fc.Remaining.Store(int32(remaining))
+		fc.InitErrors(len(manifest.Chunks))
+
+		files = append(files, fc)
+		totalChunks += len(manifest.Chunks)
 	}
 
-	log.Printf("GET_DIRECTORY: key '%s' — %d files downloaded to %s", key, fileTotal, outputDir)
-	return nil
+	return files, totalChunks, alreadyDoneFiles, nil
+}
+
+// cleanupFileContexts closes any file handles that weren't finalized.
+func cleanupFileContexts(files []*downloader.FileContext) {
+	for _, fc := range files {
+		if fc.Cleanup != nil && fc.Remaining.Load() > 0 {
+			fc.Cleanup()
+		}
+	}
 }
 
 // replicateChunk sends storageKey's encrypted bytes to all targetNodes that
@@ -1550,42 +1990,42 @@ func (s *Server) replicateChunk(selfAddr, storageKey string, data []byte, target
 	}
 	msgBytes := buf.Bytes()
 
-	s.peerLock.RLock()
-	peers := make(map[string]peer2peer.Peer, len(s.peers))
-	for a, p := range s.peers {
-		peers[a] = p
-	}
-	s.peerLock.RUnlock()
-
 	log.Printf("REPLICATE_CHUNK: key=%s selfAddr=%s targets=%v", storageKey, selfAddr, targetNodes)
 
 	type result struct{ err error }
 	needed := 0
 	resultCh := make(chan result, len(targetNodes))
 
+	// Timeout: 30s base + 1s per MB. Prevents stalled peers from freezing the pipeline.
+	replicateTimeout := 30*time.Second + time.Duration(len(data)/(1024*1024))*time.Second
+
 	for _, nodeAddr := range targetNodes {
 		if nodeAddr == selfAddr {
 			continue
 		}
-		p, ok := peers[nodeAddr]
+		// Use data-plane peer when available (Two-Port), fallback to control peer.
+		p, ok := s.getDataPeer(nodeAddr)
 		if !ok {
 			log.Printf("REPLICATE_CHUNK: peer %s NOT FOUND, storing hint", nodeAddr)
-			s.storeHint(nodeAddr, storageKey, data)
+			s.storeHint(nodeAddr, storageKey, int64(len(data)))
 			metrics.RecordReplication("hint")
 			continue
 		}
 		needed++
 		go func(addr string, peer peer2peer.Peer) {
-			// Sprint E: use throttled send for QUIC peers.
+			done := make(chan error, 1)
+			go func() { done <- peer.SendStream(msgBytes, data) }()
+
 			var err error
-			if qp, ok := peer.(*quicTransport.QUICPeer); ok && s.BandwidthMgr != nil {
-				err = qp.SendStreamThrottled(msgBytes, data, s.BandwidthMgr.WrapWriter)
-			} else {
-				err = peer.SendStream(msgBytes, data)
+			select {
+			case err = <-done:
+			case <-time.After(replicateTimeout):
+				err = fmt.Errorf("timeout after %s", replicateTimeout)
 			}
+
 			if err != nil {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s failed: %v, storing hint", addr, err)
-				s.storeHint(addr, storageKey, data)
+				s.storeHint(addr, storageKey, int64(len(data)))
 				metrics.RecordReplication("hint")
 			} else {
 				log.Printf("REPLICATE_CHUNK: SendStream to %s OK for key=%s", addr, storageKey)
@@ -1607,6 +2047,9 @@ func (s *Server) replicateChunk(selfAddr, storageKey string, data []byte, target
 			}
 		}
 	}
+
+	// Quorum not met — data is stored locally, hints will retry later.
+	log.Printf("REPLICATE_CHUNK: quorum NOT met (%d/%d) for key=%s, continuing with local copy + hints", successes, w, storageKey)
 }
 
 // replicateManifest sends a ChunkManifest to every ring-responsible peer for key.
@@ -1660,6 +2103,13 @@ func (s *Server) replicateManifest(key, selfAddr string, manifest *chunker.Chunk
 // readRepair checks all responsible replicas for key and asynchronously
 // repairs any that are missing it by re-sending from local storage.
 func (s *Server) readRepair(key string) {
+	if isSwarmCacheKey(key) {
+		return // chunk keys managed by swarm/upload replication, not read-repair
+	}
+	// SeedMode files have no CAS entry for the file-level key — swarm handles distribution.
+	if manifest, ok := s.serverOpts.metaData.GetManifest(key); ok && manifest != nil && manifest.SeedMode {
+		return
+	}
 	if !s.Store.Has(key) {
 		return // we don't have it locally, can't repair
 	}
@@ -1686,7 +2136,7 @@ func (s *Server) readRepair(key string) {
 		probeKey := "__probe__" + key
 
 		s.mu.Lock()
-		s.pendingFile[probeKey] = make(chan io.Reader, 1)
+		s.pendingFile[probeKey] = make(chan []byte, 1)
 		s.mu.Unlock()
 
 		// Send a lightweight check — reuse MessageGetFile
@@ -1731,7 +2181,7 @@ func (s *Server) readRepair(key string) {
 				log.Printf("[readRepair] failed to read key=%s for repair: %v", key, err)
 				continue
 			}
-			s.storeHint(nodeAddr, key, data)
+			s.storeHint(nodeAddr, key, int64(len(data)))
 		}
 	}
 }
@@ -1809,7 +2259,7 @@ func normalizeAddr(addr string) string {
 	return addr
 }
 
-// DefaultPort is the well-known default port for Hermond nodes.
+// DefaultPort is the well-known default port for Hermod nodes.
 const DefaultPort = "3000"
 
 // NormalizeUserAddr ensures addr has a port. Bare IPs get DefaultPort appended.
@@ -1872,15 +2322,26 @@ func deriveHealthPort(listenAddr string) string {
 	return fmt.Sprintf("%s:%d", host, healthPort)
 }
 
+// isSwarmCacheKey returns true if key is a CAS-cached chunk that should be
+// excluded from background subsystem operations (anti-entropy, rebalancer,
+// read-repair). These chunk: keys are either already replicated during upload
+// (replicateChunk handles this) or cached from a swarm download (served
+// on-demand via handleGetChunkSwarm, never pushed by background subsystems).
+func isSwarmCacheKey(key string) bool {
+	return strings.HasPrefix(key, "chunk:")
+}
+
 // storeHint saves a hinted handoff entry for a key that could not be delivered.
-func (s *Server) storeHint(targetAddr, key string, data []byte) {
+// Data is NOT stored in the hint — only the key and size. Data lives in CAS and
+// is read on delivery, preventing multi-GB memory bloat from hint accumulation.
+func (s *Server) storeHint(targetAddr, key string, dataSize int64) {
 	if s.HandoffSvc == nil {
 		return
 	}
 	s.HandoffSvc.StoreHint(handoff.Hint{
 		Key:        key,
 		TargetAddr: targetAddr,
-		Data:       data,
+		DataSize:   dataSize,
 		CreatedAt:  time.Now(),
 	})
 }
@@ -2026,7 +2487,7 @@ func (s *Server) handleGetPublicCatalog(from string) error {
 
 // GetPublicCatalog fetches the public file catalog from a remote peer.
 func (s *Server) GetPublicCatalog(peerAddr string) ([]State.PublicFileEntry, error) {
-	ch := make(chan io.Reader, 1)
+	ch := make(chan []byte, 1)
 	catalogKey := peerAddr + "#catalog"
 
 	s.mu.Lock()
@@ -2044,11 +2505,7 @@ func (s *Server) GetPublicCatalog(peerAddr string) ([]State.PublicFileEntry, err
 	}
 
 	select {
-	case reader := <-ch:
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			return nil, err
-		}
+	case data := <-ch:
 		var entries []State.PublicFileEntry
 		if err := json.Unmarshal(data, &entries); err != nil {
 			return nil, fmt.Errorf("invalid catalog response: %w", err)
@@ -2098,6 +2555,594 @@ func (s *Server) handleDirectShare(from string, m *MessageDirectShare) error {
 	}
 	log.Printf("[direct-share] received %q from %s (%s)", m.Name, m.SenderAlias, from)
 	return nil
+}
+
+// ── Swarm message handlers ────────────────────────────────────────────
+
+// chunkServeSem limits concurrent outbound chunk sends. Without this,
+// N simultaneous GetChunkSwarm requests spawn N goroutines that all call
+// peer.SendStream (each writing 4 MiB). With N > ~30 the QUIC connection
+// receive window (128 MiB) fills up, OpenStreamSync blocks for 30s, and
+// the downloader times out waiting for responses. Capping at 16 matches
+// the receiver's MaxParallel (8) with room for pipeline overlap.
+var chunkServeSem = make(chan struct{}, 8)
+
+// handleGetChunkSwarm serves a chunk from the original file (seed in place)
+// or from CAS cache (secondary seeder).
+//
+// Original seeder path: read plaintext from file → compress → encrypt → send.
+// CAS-backed seeder path: read from CAS store (already encrypted) → send.
+func (s *Server) handleGetChunkSwarm(from string, peer peer2peer.Peer, msg *MessageGetChunkSwarm) error {
+	chunkServeSem <- struct{}{}        // acquire slot
+	defer func() { <-chunkServeSem }() // release slot
+
+	// Try CAS cache first (secondary seeder — already has encrypted bytes).
+	storageKey := chunker.ChunkStorageKey(msg.EncHash)
+	if s.Store.Has(storageKey) {
+		return s.handleGetMessage(from, peer, &MessageGetFile{Key: storageKey})
+	}
+
+	// Original seeder path: read from the original file and process on-demand.
+	if s.StateDB == nil {
+		return fmt.Errorf("SWARM_GET: no StateDB")
+	}
+	seedSrc := s.StateDB.GetSeedSource(msg.FileKey)
+	if seedSrc == nil {
+		return fmt.Errorf("SWARM_GET: no seed source for %s", msg.FileKey)
+	}
+	if seedSrc.OriginalPath == "" {
+		return fmt.Errorf("SWARM_GET: no original path for %s (CAS-only seeder with missing CAS data)", msg.FileKey)
+	}
+	if msg.ChunkIndex < 0 || msg.ChunkIndex >= seedSrc.TotalChunks {
+		return fmt.Errorf("SWARM_GET: chunk index %d out of range [0, %d)", msg.ChunkIndex, seedSrc.TotalChunks)
+	}
+
+	// Get the manifest to know compression/encryption state per chunk.
+	manifest, ok := s.serverOpts.metaData.GetManifest(msg.FileKey)
+	if !ok || manifest == nil {
+		return fmt.Errorf("SWARM_GET: manifest not found for %s", msg.FileKey)
+	}
+	if msg.ChunkIndex >= len(manifest.Chunks) {
+		return fmt.Errorf("SWARM_GET: chunk index %d beyond manifest (%d chunks)", msg.ChunkIndex, len(manifest.Chunks))
+	}
+	chunkMeta := manifest.Chunks[msg.ChunkIndex]
+
+	// Open file and seek to the chunk offset.
+	f, err := os.Open(seedSrc.OriginalPath)
+	if err != nil {
+		// File moved/deleted — remove seed source so we stop claiming we have it.
+		log.Printf("[swarm] original file gone for %s: %v — removing seed source", msg.FileKey, err)
+		_ = s.StateDB.RemoveSeedSource(msg.FileKey)
+		s.deregisterProvider(msg.FileKey)
+		return fmt.Errorf("SWARM_GET: original file: %w", err)
+	}
+	defer f.Close()
+
+	chunkSize := int64(seedSrc.ChunkSize)
+	offset := int64(msg.ChunkIndex) * chunkSize
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("SWARM_GET: seek: %w", err)
+	}
+
+	// Read exactly this chunk's raw bytes.
+	raw := make([]byte, chunkMeta.Size)
+	if _, err := io.ReadFull(f, raw); err != nil {
+		return fmt.Errorf("SWARM_GET: read chunk %d: %w", msg.ChunkIndex, err)
+	}
+
+	// Process: compress if needed, then encrypt if ECDH.
+	processed := raw
+	if chunkMeta.Compressed {
+		c, wc, compErr := compression.CompressChunkWithPool(raw, compression.LevelFastest, &compBufPool)
+		if compErr != nil {
+			return fmt.Errorf("SWARM_GET: compress chunk %d: %w", msg.ChunkIndex, compErr)
+		}
+		if wc {
+			processed = c
+		}
+	}
+
+	if manifest.Encrypted {
+		dek, err := s.getDEK(msg.FileKey, manifest)
+		if err != nil {
+			return fmt.Errorf("SWARM_GET: get DEK for %s: %w", msg.FileKey, err)
+		}
+		var encBuf bytes.Buffer
+		if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, dek, &encBufPool, uint64(msg.ChunkIndex)); err != nil {
+			return fmt.Errorf("SWARM_GET: encrypt chunk %d: %w", msg.ChunkIndex, err)
+		}
+		processed = encBuf.Bytes()
+	}
+
+	// Verify EncHash matches expected (sanity check for deterministic crypto).
+	hashRaw := sha256.Sum256(processed)
+	hashHex := hex.EncodeToString(hashRaw[:])
+	if hashHex != msg.EncHash {
+		log.Printf("[swarm] hash mismatch for %s chunk %d: got %s want %s",
+			msg.FileKey, msg.ChunkIndex, hashHex, msg.EncHash)
+	}
+
+	// Send as MessageLocalFile — reuses existing download pipeline on receiver side.
+	resp := &Message{
+		Payload: MessageLocalFile{
+			Key:  storageKey,
+			Size: int64(len(processed)),
+		},
+	}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(resp); err != nil {
+		return fmt.Errorf("handleGetChunkSwarm: encode response: %w", err)
+	}
+
+	return peer.SendStream(buf.Bytes(), processed)
+}
+
+// handleGetChunkSwarmBidi serves a chunk via bidirectional RPC — the response
+// is written back to the same stream the request arrived on (w).
+// Wire format: [1B status: 0x00=ok, 0x01=error][4B big-endian size][data or error msg]
+func (s *Server) handleGetChunkSwarmBidi(from string, msg *MessageGetChunkSwarm, w io.Writer, streamWg *sync.WaitGroup) {
+	defer streamWg.Done()
+
+	// Acquire semaphore with timeout — if all 8 slots are held by goroutines
+	// stuck on dead streams, new requests bail after 30s instead of blocking forever.
+	select {
+	case chunkServeSem <- struct{}{}:
+	case <-time.After(30 * time.Second):
+		log.Printf("[BIDI-SERVE] chunk %d for %s: sem timeout (all slots busy), dropping", msg.ChunkIndex, msg.FileKey)
+		hdr := make([]byte, 5)
+		hdr[0] = 0x01
+		errMsg := "server busy"
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(errMsg)))
+		w.Write(hdr)
+		w.Write([]byte(errMsg))
+		return
+	}
+	defer func() { <-chunkServeSem }()
+
+	// Write deadline AFTER acquiring semaphore so the full 60s is available
+	// for actual I/O. Prevents w.Write() from blocking forever when the
+	// downloader times out and closes its end of the stream.
+	type deadliner interface{ SetWriteDeadline(time.Time) error }
+	if dl, ok := w.(deadliner); ok {
+		dl.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	}
+
+	writeError := func(errMsg string) {
+		log.Printf("[BIDI-SERVE] chunk %d ERROR: %s", msg.ChunkIndex, errMsg)
+		hdr := make([]byte, 5)
+		hdr[0] = 0x01 // error status
+		binary.BigEndian.PutUint32(hdr[1:5], uint32(len(errMsg)))
+		w.Write(hdr)
+		w.Write([]byte(errMsg))
+	}
+
+	// Try CAS cache first (secondary seeder — already has encrypted bytes).
+	storageKey := chunker.ChunkStorageKey(msg.EncHash)
+	if s.Store.Has(storageKey) {
+		_, r, err := s.Store.ReadStream(storageKey)
+		if err == nil {
+			data, err := io.ReadAll(r)
+			r.Close()
+			if err == nil {
+				hdr := make([]byte, 5)
+				hdr[0] = 0x00 // success
+				binary.BigEndian.PutUint32(hdr[1:5], uint32(len(data)))
+				w.Write(hdr)
+				w.Write(data)
+				return
+			}
+		}
+	}
+
+	// Original seeder path: read from the original file and process on-demand.
+	if s.StateDB == nil {
+		writeError("no StateDB")
+		return
+	}
+	seedSrc := s.StateDB.GetSeedSource(msg.FileKey)
+	if seedSrc == nil {
+		writeError(fmt.Sprintf("no seed source for %s", msg.FileKey))
+		return
+	}
+	if seedSrc.OriginalPath == "" {
+		writeError("no original path (CAS-only seeder with missing CAS data)")
+		return
+	}
+	if msg.ChunkIndex < 0 || msg.ChunkIndex >= seedSrc.TotalChunks {
+		writeError(fmt.Sprintf("chunk index %d out of range [0, %d)", msg.ChunkIndex, seedSrc.TotalChunks))
+		return
+	}
+
+	manifest, ok := s.serverOpts.metaData.GetManifest(msg.FileKey)
+	if !ok || manifest == nil {
+		writeError(fmt.Sprintf("manifest not found for %s", msg.FileKey))
+		return
+	}
+	if msg.ChunkIndex >= len(manifest.Chunks) {
+		writeError(fmt.Sprintf("chunk index %d beyond manifest (%d chunks)", msg.ChunkIndex, len(manifest.Chunks)))
+		return
+	}
+	chunkMeta := manifest.Chunks[msg.ChunkIndex]
+
+	f, err := os.Open(seedSrc.OriginalPath)
+	if err != nil {
+		log.Printf("[BIDI-SERVE] original file gone for %s: %v — removing seed source", msg.FileKey, err)
+		_ = s.StateDB.RemoveSeedSource(msg.FileKey)
+		s.deregisterProvider(msg.FileKey)
+		writeError(fmt.Sprintf("original file: %v", err))
+		return
+	}
+	defer f.Close()
+
+	chunkSize := int64(seedSrc.ChunkSize)
+	offset := int64(msg.ChunkIndex) * chunkSize
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		writeError(fmt.Sprintf("seek: %v", err))
+		return
+	}
+
+	raw := make([]byte, chunkMeta.Size)
+	if _, err := io.ReadFull(f, raw); err != nil {
+		writeError(fmt.Sprintf("read chunk %d: %v", msg.ChunkIndex, err))
+		return
+	}
+
+	// Process: compress if needed, then encrypt if ECDH.
+	processed := raw
+	if chunkMeta.Compressed {
+		c, wc, compErr := compression.CompressChunkWithPool(raw, compression.LevelFastest, &compBufPool)
+		if compErr != nil {
+			writeError(fmt.Sprintf("compress chunk %d: %v", msg.ChunkIndex, compErr))
+			return
+		}
+		if wc {
+			processed = c
+		}
+	}
+
+	if manifest.Encrypted {
+		dek, err := s.getDEK(msg.FileKey, manifest)
+		if err != nil {
+			writeError(fmt.Sprintf("get DEK: %v", err))
+			return
+		}
+		var encBuf bytes.Buffer
+		if err := crypto.EncryptStreamWithDEKPool(bytes.NewReader(processed), &encBuf, dek, &encBufPool, uint64(msg.ChunkIndex)); err != nil {
+			writeError(fmt.Sprintf("encrypt chunk %d: %v", msg.ChunkIndex, err))
+			return
+		}
+		processed = encBuf.Bytes()
+	}
+
+	// Verify EncHash matches expected (sanity check for deterministic crypto).
+	hashRaw := sha256.Sum256(processed)
+	hashHex := hex.EncodeToString(hashRaw[:])
+	if hashHex != msg.EncHash {
+		log.Printf("[BIDI-SERVE] WARNING hash mismatch for %s chunk %d: got %s want %s",
+			msg.FileKey, msg.ChunkIndex, hashHex, msg.EncHash)
+	}
+
+	// Write success response: [0x00][4B size][data]
+	hdr := make([]byte, 5)
+	hdr[0] = 0x00
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(processed)))
+	w.Write(hdr)
+	w.Write(processed)
+}
+
+// getDEK retrieves the DEK for a seed-mode ECDH file, using a cache to avoid
+// repeated unwrapping. The DEK is unwrapped from the manifest's AccessList
+// using this node's X25519 private key.
+func (s *Server) getDEK(fileKey string, manifest *chunker.ChunkManifest) ([]byte, error) {
+	if v, ok := s.dekCache.Load(fileKey); ok {
+		return v.([]byte), nil
+	}
+
+	if len(s.x25519Priv) == 0 {
+		return nil, fmt.Errorf("no X25519 private key — cannot unwrap DEK")
+	}
+
+	selfPubHex := ""
+	if s.identityMeta != nil {
+		selfPubHex = s.identityMeta["x25519_pub"]
+	}
+	if selfPubHex == "" {
+		return nil, fmt.Errorf("no X25519 public key in identity metadata")
+	}
+
+	// Find our entry in the access list and unwrap the DEK.
+	for _, entry := range manifest.AccessList {
+		if entry.RecipientPubKey == selfPubHex {
+			dek, err := envelope.UnwrapDEK(s.x25519Priv, manifest.OwnerPubKey, entry.WrappedDEK)
+			if err != nil {
+				return nil, fmt.Errorf("unwrap DEK: %w", err)
+			}
+			s.dekCache.Store(fileKey, dek)
+			return dek, nil
+		}
+	}
+
+	return nil, fmt.Errorf("this node is not in the access list for %s", fileKey)
+}
+
+// fetchChunkSwarm sends a MessageGetChunkSwarm to peerAddr and waits for the
+// response on the pendingFile channel. The response arrives as MessageLocalFile
+// (same as hash-ring chunk fetches), so the existing handleLocalMessage path
+// stores it in CAS and delivers via pendingFile.
+func (s *Server) fetchChunkSwarm(ctx context.Context, fileKey string, chunkIndex int, encHash, peerAddr string) ([]byte, error) {
+	storageKey := chunker.ChunkStorageKey(encHash)
+
+	// Set up pending channel for the response.
+	s.mu.Lock()
+	ch, alreadyFetching := s.pendingFile[storageKey]
+	if !alreadyFetching {
+		ch = make(chan []byte, 1)
+		s.pendingFile[storageKey] = ch
+	}
+	s.mu.Unlock()
+
+	if alreadyFetching {
+		select {
+		case data := <-ch:
+			if data == nil {
+				return nil, fmt.Errorf("fetchChunkSwarm: nil data for %s", storageKey)
+			}
+			select {
+			case ch <- data:
+			default:
+			}
+			return data, nil
+		case <-ctx.Done():
+			return nil, fmt.Errorf("fetchChunkSwarm: timeout for %s (already fetching)", storageKey)
+		}
+	}
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingFile, storageKey)
+		s.mu.Unlock()
+	}()
+
+	msg := &Message{Payload: &MessageGetChunkSwarm{
+		FileKey:    fileKey,
+		ChunkIndex: chunkIndex,
+		EncHash:    encHash,
+	}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+		return nil, err
+	}
+
+	// Use data-plane peer when available (Two-Port), fallback to control peer.
+	peer, ok := s.getDataPeer(peerAddr)
+	if !ok {
+		return nil, fmt.Errorf("fetchChunkSwarm: peer %s not connected", peerAddr)
+	}
+	if err := peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("fetchChunkSwarm: send: %w", err)
+	}
+
+	select {
+	case data := <-ch:
+		if data == nil {
+			return nil, fmt.Errorf("fetchChunkSwarm: nil data for %s", storageKey)
+		}
+		return data, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("fetchChunkSwarm: timeout for %s", storageKey)
+	}
+}
+
+// fetchChunkSwarmBidi sends a GetChunkSwarm request via bidirectional RPC and
+// reads the response on the same stream. No pendingFile map, no second stream.
+// Falls back to fetchChunkSwarm if the peer doesn't support OpenBidiRPC.
+func (s *Server) fetchChunkSwarmBidi(ctx context.Context, fileKey string, chunkIndex int, encHash, peerAddr string) ([]byte, error) {
+	peer, ok := s.getDataPeer(peerAddr)
+	if !ok {
+		return nil, fmt.Errorf("fetchChunkSwarmBidi: peer %s not connected", peerAddr)
+	}
+
+	// Type-assert to bidi-capable peer.
+	type bidiRPCer interface {
+		OpenBidiRPC([]byte) (io.ReadCloser, error)
+	}
+	bidi, ok := peer.(bidiRPCer)
+	if !ok {
+		return s.fetchChunkSwarm(ctx, fileKey, chunkIndex, encHash, peerAddr) // fallback
+	}
+
+	// Encode request — gob-encoded Message, matching t.decoder.Decode() on receiver.
+	msg := &Message{Payload: &MessageGetChunkSwarm{FileKey: fileKey, ChunkIndex: chunkIndex, EncHash: encHash}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+		return nil, err
+	}
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		stream, err := bidi.OpenBidiRPC(buf.Bytes())
+		if err != nil {
+			ch <- result{nil, fmt.Errorf("fetchChunkSwarmBidi: open stream: %w", err)}
+			return
+		}
+		defer stream.Close()
+
+		// Read response: [1B status][4B size][data or error]
+		hdr := make([]byte, 5)
+		if _, err := io.ReadFull(stream, hdr); err != nil {
+			ch <- result{nil, fmt.Errorf("fetchChunkSwarmBidi: read header: %w", err)}
+			return
+		}
+		status := hdr[0]
+		size := binary.BigEndian.Uint32(hdr[1:5])
+
+		// Fork BEFORE allocating 4MB: error messages are tiny strings.
+		if status != 0 {
+			errData := make([]byte, size)
+			io.ReadFull(stream, errData)
+			ch <- result{nil, fmt.Errorf("fetchChunkSwarmBidi: remote error: %s", string(errData))}
+			return
+		}
+
+		// Success: allocate pooled buffer for chunk data.
+		data := getChunkBuf(int(size))
+		if _, err := io.ReadFull(stream, data); err != nil {
+			ch <- result{nil, fmt.Errorf("fetchChunkSwarmBidi: read data: %w", err)}
+			return
+		}
+		ch <- result{data, nil}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("fetchChunkSwarmBidi: timeout for chunk %d", chunkIndex)
+	}
+}
+
+// handleRegisterProvider stores a provider record from a seeder.
+func (s *Server) handleRegisterProvider(from string, msg *MessageRegisterProvider) error {
+	if s.StateDB == nil {
+		return nil
+	}
+	rec := swarm.ProviderRecord{
+		Addr:         msg.Provider,
+		ChunkCount:   msg.ChunkCount,
+		TotalChunks:  msg.TotalChunks,
+		RegisteredAt: time.Now().UnixNano(),
+	}
+	if err := s.StateDB.AddProvider(msg.FileKey, rec); err != nil {
+		log.Printf("SWARM_PROVIDER: failed to store provider %s for %s: %v", msg.Provider, msg.FileKey, err)
+		return err
+	}
+	log.Printf("SWARM_PROVIDER: registered %s as provider for %s (%d/%d chunks)", msg.Provider, msg.FileKey, msg.ChunkCount, msg.TotalChunks)
+	return nil
+}
+
+// handleGetProviders responds with the provider list for a file key.
+func (s *Server) handleGetProviders(from string, peer peer2peer.Peer, msg *MessageGetProviders) error {
+	var providers []ProviderInfo
+	if s.StateDB != nil {
+		for _, p := range s.StateDB.GetProviders(msg.FileKey) {
+			providers = append(providers, ProviderInfo{
+				Addr:        p.Addr,
+				ChunkCount:  p.ChunkCount,
+				TotalChunks: p.TotalChunks,
+			})
+		}
+	}
+	resp := &Message{Payload: &MessageProvidersResponse{
+		FileKey:   msg.FileKey,
+		Providers: providers,
+	}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(resp); err != nil {
+		return err
+	}
+	return peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+}
+
+// handleProvidersResponse delivers provider query results to a waiting caller.
+func (s *Server) handleProvidersResponse(from string, msg *MessageProvidersResponse) error {
+	pendingKey := "__providers__" + msg.FileKey
+	s.mu.Lock()
+	ch, ok := s.pendingFile[pendingKey]
+	s.mu.Unlock()
+	if ok {
+		// Encode as JSON so the receiver can unmarshal.
+		data, err := json.Marshal(msg.Providers)
+		if err != nil {
+			return err
+		}
+		select {
+		case ch <- data:
+		default:
+			log.Printf("SWARM_PROVIDER: late response for %s (receiver timed out)", msg.FileKey)
+		}
+	}
+	return nil
+}
+
+// getProviders queries hash ring nodes for the seeder list of a file key.
+// Returns provider records from the first responding node.
+func (s *Server) getProviders(ctx context.Context, fileKey string) []swarm.ProviderRecord {
+	// Check local first.
+	if s.StateDB != nil {
+		local := s.StateDB.GetProviders(fileKey)
+		if len(local) > 0 {
+			return local
+		}
+	}
+
+	targets := s.HashRing.GetNodes(fileKey, s.HashRing.ReplicationFactor())
+	selfAddr := s.effectiveSelfAddr()
+
+	pendingKey := "__providers__" + fileKey
+	ch := make(chan []byte, len(targets))
+	s.mu.Lock()
+	s.pendingFile[pendingKey] = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingFile, pendingKey)
+		s.mu.Unlock()
+	}()
+
+	getMsg := &Message{Payload: &MessageGetProviders{FileKey: fileKey}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(getMsg); err != nil {
+		return nil
+	}
+	msgBytes := buf.Bytes()
+
+	sent := 0
+	s.peerLock.RLock()
+	for _, addr := range targets {
+		if normalizeAddr(addr) == normalizeAddr(selfAddr) {
+			continue
+		}
+		peer, ok := s.peers[addr]
+		if !ok {
+			continue
+		}
+		if err := peer.SendMsg(peer2peer.IncomingMessage, msgBytes); err != nil {
+			continue
+		}
+		sent++
+	}
+	s.peerLock.RUnlock()
+
+	if sent == 0 {
+		return nil
+	}
+
+	// Wait for first response.
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	select {
+	case data := <-ch:
+		var providers []ProviderInfo
+		if err := json.Unmarshal(data, &providers); err != nil {
+			return nil
+		}
+		// Convert to swarm.ProviderRecord.
+		result := make([]swarm.ProviderRecord, len(providers))
+		for i, p := range providers {
+			result[i] = swarm.ProviderRecord{
+				Addr:        p.Addr,
+				ChunkCount:  p.ChunkCount,
+				TotalChunks: p.TotalChunks,
+			}
+		}
+		return result
+	case <-queryCtx.Done():
+		return nil
+	}
 }
 
 // AddAccessEntry appends a new AccessEntry to the manifest for the given key
@@ -2442,7 +3487,7 @@ func (s *Server) SearchFiles(query string) ([]SearchResult, error) {
 
 	// Set up response channel.
 	respKey := origin + "#search#" + requestID
-	ch := make(chan io.Reader, 64)
+	ch := make(chan []byte, 64)
 	s.mu.Lock()
 	s.pendingFile[respKey] = ch
 	s.mu.Unlock()
@@ -2484,11 +3529,7 @@ func (s *Server) SearchFiles(query string) ([]SearchResult, error) {
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
-		case reader := <-ch:
-			data, err := io.ReadAll(reader)
-			if err != nil {
-				continue
-			}
+		case data := <-ch:
 			var resp MessageSearchResponse
 			if json.Unmarshal(data, &resp) != nil {
 				continue
@@ -2586,7 +3627,7 @@ func (s *Server) handleSearchResponse(from string, msg *MessageSearchResponse) e
 
 	if ok {
 		data, _ := json.Marshal(msg)
-		ch <- bytes.NewReader(data)
+		ch <- data
 	}
 	return nil
 }
@@ -2636,8 +3677,15 @@ func (s *Server) GracefulShutdown() {
 	if s.MDNSAdvertiser != nil {
 		s.MDNSAdvertiser.Stop()
 	}
-	if s.BandwidthMgr != nil {
-		s.BandwidthMgr.Stop()
+	// Two-Port: close the data transport before closing control.
+	if s.dataTransport != nil {
+		s.dataTransport.Close()
+	}
+	if s.casWriteCh != nil {
+		close(s.casWriteCh)
+	}
+	if s.CacheMgr != nil {
+		s.CacheMgr.Stop()
 	}
 	if s.StateDB != nil {
 		s.StateDB.Close()
@@ -2782,18 +3830,28 @@ func NewServer(opts ServerOpts) *Server {
 		replFactor = hashring.DefaultReplicationFactor
 	}
 
+	bAddrs := make(map[string]struct{}, len(opts.bootstrapNodes))
+	for _, a := range opts.bootstrapNodes {
+		if norm := NormalizeUserAddr(a); norm != "" {
+			bAddrs[norm] = struct{}{}
+		}
+	}
+
 	return &Server{
 		peers:      map[string]peer2peer.Peer{},
+		dataPeers:  map[string]peer2peer.Peer{},
 		serverOpts: opts,
 		Store:      storage.NewStore(StoreOpts),
 		HashRing: hashring.New(&hashring.Config{
 			ReplicationFactor: replFactor,
 		}),
-		quitch:        make(chan struct{}),
-		pendingFile:   make(map[string]chan io.Reader),
-		pendingOffer:  make(map[string]chan []string),
-		dialingSet:    make(map[string]struct{}),
-		announceAdded: make(map[string]string),
+		quitch:         make(chan struct{}),
+		pendingFile:    make(map[string]chan []byte),
+		pendingOffer:   make(map[string]chan []string),
+		casWriteCh:     make(chan casWriteRequest, 32),
+		dialingSet:     make(map[string]struct{}),
+		announceAdded:  make(map[string]string),
+		bootstrapAddrs: bAddrs,
 	}
 }
 
@@ -2838,7 +3896,8 @@ func (s *Server) Start() error {
 		go s.discoverNAT()
 	}
 
-	// mDNS LAN auto-discovery: advertise this node so peers can find us.
+	// mDNS LAN auto-discovery: background scan + advertise.
+	go s.mdnsDiscoveryLoop()
 	if s.identityMeta != nil {
 		selfAddr := s.effectiveSelfAddr()
 		host, portStr, _ := net.SplitHostPort(selfAddr)
@@ -2853,6 +3912,16 @@ func (s *Server) Start() error {
 		}
 	}
 
+	// Two-Port: start the data transport BEFORE bootstrap so that DialDual
+	// can use it immediately when connecting to bootstrap peers.
+	if s.dataTransport != nil {
+		if err := s.dataTransport.ListenAndAccept(); err != nil {
+			return fmt.Errorf("data transport: %w", err)
+		}
+		log.Printf("[Run] Data transport listening on %s", s.dataTransport.Addr())
+		go s.dataLoop()
+	}
+
 	// Always attempt bootstrap — reconnects known peers from StateDB even
 	// without --peer flags. BootstrapNetwork handles empty bootstrap lists.
 	if err := s.BootstrapNetwork(); err != nil {
@@ -2860,6 +3929,7 @@ func (s *Server) Start() error {
 	}
 
 	go s.connectionManagerLoop()
+	go s.casWriteLoop()
 	go s.loop()
 	return nil
 }
@@ -2909,14 +3979,9 @@ func (s *Server) loop() {
 				continue
 			}
 
-			log.Printf("[loop] Decoded message: %+v\n", message)
 			log.Printf("[loop] Payload type after decoding: %T\n", message.Payload)
 
-			// Sprint E: wrap incoming stream with download rate limiter.
 			streamReader := RPC.StreamReader
-			if s.BandwidthMgr != nil && streamReader != nil {
-				streamReader = s.BandwidthMgr.WrapReader(streamReader)
-			}
 			if err := s.handleMessage(RPC.From.String(), RPC.Peer, &message, RPC.StreamWg, streamReader); err != nil {
 				log.Printf("[loop] Error handling message from %s: %v\n", RPC.From.String(), err)
 				continue
@@ -2924,6 +3989,75 @@ func (s *Server) loop() {
 
 		case <-s.quitch:
 			log.Println("[loop] Quit channel received, exiting loop")
+			return
+		}
+	}
+}
+
+// dataLoop is the dedicated RPC loop for the data-plane transport.
+// It only handles data messages (StoreFile, GetFile, LocalFile, GetChunkSwarm).
+// All other message types are logged and dropped — they should arrive on the
+// control transport instead.
+func (s *Server) dataLoop() {
+	defer func() {
+		s.dataTransport.Close()
+		log.Println("[dataLoop] Data transport closed")
+	}()
+
+	log.Println("[dataLoop] Starting data-plane loop...")
+
+	for {
+		select {
+		case RPC, ok := <-s.dataTransport.Consume():
+			if !ok {
+				log.Println("[dataLoop] Channel closed. Exiting.")
+				return
+			}
+			if RPC.From == nil || len(RPC.Payload) == 0 {
+				continue
+			}
+
+			var message Message
+			if err := gob.NewDecoder(bytes.NewReader(RPC.Payload)).Decode(&message); err != nil {
+				log.Printf("[dataLoop] decode error from %s: %v", RPC.From, err)
+				continue
+			}
+
+			from := RPC.From.String()
+			peer := RPC.Peer
+			streamReader := RPC.StreamReader
+
+			switch m := message.Payload.(type) {
+			case *MessageStoreFile:
+				go func() {
+					if err := s.handleStoreMessage(from, peer, m, RPC.StreamWg, streamReader); err != nil {
+						log.Printf("[dataLoop] StoreFile error from %s: %v", from, err)
+					}
+				}()
+			case *MessageGetFile:
+				go func() {
+					if err := s.handleGetMessage(from, peer, m); err != nil {
+						log.Printf("[dataLoop] GetFile error from %s: %v", from, err)
+					}
+				}()
+			case *MessageLocalFile:
+				go func() {
+					if err := s.handleLocalMessage(from, peer, m, RPC.StreamWg, streamReader); err != nil {
+						log.Printf("[dataLoop] LocalFile error from %s: %v", from, err)
+					}
+				}()
+			case *MessageGetChunkSwarm:
+				if RPC.StreamWriter != nil {
+					go s.handleGetChunkSwarmBidi(from, m, RPC.StreamWriter, RPC.StreamWg)
+				} else {
+					go s.handleGetChunkSwarm(from, peer, m)
+				}
+			default:
+				log.Printf("[dataLoop] unexpected message type %T from %s", message.Payload, from)
+			}
+
+		case <-s.quitch:
+			log.Println("[dataLoop] Quit channel received, exiting")
 			return
 		}
 	}
@@ -2939,7 +4073,6 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		// drain the next QUIC stream. Without this, concurrent chunk streams
 		// pile up in the QUIC connection receive window while the loop blocks
 		// reading one stream, causing a flow-control deadlock.
-		log.Printf("[handleMessage] Detected MessageStoreFile from %s — dispatching async\n", from)
 		go func() {
 			if err := s.handleStoreMessage(from, peer, m, streamWg, streamReader); err != nil {
 				log.Printf("[handleMessage] async StoreFile error from %s: %v\n", from, err)
@@ -2948,12 +4081,15 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return nil
 
 	case *MessageGetFile:
-		log.Printf("[handleMessage] Detected MessageGetFile from %s\n", from)
-		return s.handleGetMessage(from, peer, m)
+		go func() {
+			if err := s.handleGetMessage(from, peer, m); err != nil {
+				log.Printf("[handleMessage] async GetFile error from %s: %v\n", from, err)
+			}
+		}()
+		return nil
 
 	case *MessageLocalFile:
 		// Same async dispatch — this reads stream data from a peer.
-		log.Printf("[handleMessage] Detected MessageLocalFile from %s — dispatching async\n", from)
 		go func() {
 			if err := s.handleLocalMessage(from, peer, m, streamWg, streamReader); err != nil {
 				log.Printf("[handleMessage] async LocalFile error from %s: %v\n", from, err)
@@ -2962,7 +4098,12 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return nil
 
 	case *MessageHeartbeat:
-		return s.handleHeartbeat(from, peer, m)
+		go func(m *MessageHeartbeat) {
+			if err := s.handleHeartbeat(from, peer, m); err != nil {
+				log.Printf("[handleMessage] async heartbeat error from %s: %v", from, err)
+			}
+		}(m)
+		return nil
 
 	case *MessageHeartbeatAck:
 		// An ack is proof the peer is alive — record it so the failure
@@ -2979,47 +4120,50 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		return s.handleAnnounceAck(m)
 
 	case *MessageGossipDigest:
-		// Any message from a peer is proof it's alive.
-		if s.HeartbeatSvc != nil {
-			s.HeartbeatSvc.RecordHeartbeat(from)
-		}
-		if s.GossipSvc != nil {
-			s.GossipSvc.HandleDigest(from, &gossip.MessageGossipDigest{
-				From:    m.From,
-				Digests: m.Digests,
-			}, func(msg interface{}) error {
-				// Convert *gossip.MessageGossipResponse → *MessageGossipResponse
-				// (the registered gob type) before encoding.
-				var payload interface{}
-				if gr, ok := msg.(*gossip.MessageGossipResponse); ok {
-					payload = &MessageGossipResponse{
-						From:     gr.From,
-						Full:     gr.Full,
-						MyDigest: gr.MyDigest,
+		// Dispatch gossip digest processing to a goroutine so the RPC loop
+		// is immediately free to process the next message (e.g. chunk data).
+		go func(m *MessageGossipDigest) {
+			if s.HeartbeatSvc != nil {
+				s.HeartbeatSvc.RecordHeartbeat(from)
+			}
+			if s.GossipSvc != nil {
+				s.GossipSvc.HandleDigest(from, &gossip.MessageGossipDigest{
+					From:    m.From,
+					Digests: m.Digests,
+				}, func(msg interface{}) error {
+					var payload interface{}
+					if gr, ok := msg.(*gossip.MessageGossipResponse); ok {
+						payload = &MessageGossipResponse{
+							From:     gr.From,
+							Full:     gr.Full,
+							MyDigest: gr.MyDigest,
+						}
+					} else {
+						payload = msg
 					}
-				} else {
-					payload = msg
-				}
-				buf := new(bytes.Buffer)
-				if err := gob.NewEncoder(buf).Encode(&Message{Payload: payload}); err != nil {
-					return err
-				}
-				return peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
-			})
-		}
+					buf := new(bytes.Buffer)
+					if err := gob.NewEncoder(buf).Encode(&Message{Payload: payload}); err != nil {
+						return err
+					}
+					return peer.SendMsg(peer2peer.IncomingMessage, buf.Bytes())
+				})
+			}
+		}(m)
 		return nil
 
 	case *MessageGossipResponse:
-		if s.HeartbeatSvc != nil {
-			s.HeartbeatSvc.RecordHeartbeat(from)
-		}
-		if s.GossipSvc != nil {
-			s.GossipSvc.HandleResponse(from, &gossip.MessageGossipResponse{
-				From:     m.From,
-				Full:     m.Full,
-				MyDigest: m.MyDigest,
-			})
-		}
+		go func(m *MessageGossipResponse) {
+			if s.HeartbeatSvc != nil {
+				s.HeartbeatSvc.RecordHeartbeat(from)
+			}
+			if s.GossipSvc != nil {
+				s.GossipSvc.HandleResponse(from, &gossip.MessageGossipResponse{
+					From:     m.From,
+					Full:     m.Full,
+					MyDigest: m.MyDigest,
+				})
+			}
+		}(m)
 		return nil
 
 	case *MessageQuorumWrite:
@@ -3119,7 +4263,7 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 			payload := make([]byte, 1+len(m.ManifestJSON))
 			payload[0] = typeByte
 			copy(payload[1:], m.ManifestJSON)
-			ch <- bytes.NewReader(payload)
+			ch <- payload
 		}
 		return nil
 
@@ -3175,18 +4319,29 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 			if addr == "" {
 				addr = from
 			}
-
 			// Fingerprint-based blocklist check: even if the peer's address
 			// changed (DHCP, NAT), the identity fingerprint stays the same.
 			if fp := m.Metadata["fingerprint"]; fp != "" && s.StateDB != nil && s.StateDB.IsIgnoredFingerprint(fp) {
-				log.Printf("[identity] REJECT: peer %s fingerprint %s is blocklisted, disconnecting", addr, fp)
-				s.peerLock.Lock()
-				if p, ok := s.peers[from]; ok {
-					p.Close()
-					delete(s.peers, from)
+				// If this peer was explicitly requested via --peer flag,
+				// clear the blocklist instead of rejecting. The user's
+				// intent overrides any previous disconnect/block.
+				_, isBootstrap := s.bootstrapAddrs[addr]
+				if !isBootstrap {
+					_, isBootstrap = s.bootstrapAddrs[from]
 				}
-				s.peerLock.Unlock()
-				return nil
+				if isBootstrap {
+					_ = s.StateDB.RemoveIgnoredByFingerprint(fp)
+					log.Printf("[identity] Cleared blocklist for bootstrap peer %s (fp %s)", addr, fp)
+				} else {
+					log.Printf("[identity] REJECT: peer %s fingerprint %s is blocklisted, disconnecting", addr, fp)
+					s.peerLock.Lock()
+					if p, ok := s.peers[from]; ok {
+						p.Close()
+						delete(s.peers, from)
+					}
+					s.peerLock.Unlock()
+					return nil
+				}
 			}
 
 			// Ensure the node exists in cluster before setting metadata.
@@ -3220,7 +4375,7 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 		}
 		s.mu.Unlock()
 		if ok {
-			ch <- bytes.NewReader(m.CatalogJSON)
+			ch <- m.CatalogJSON
 		}
 		return nil
 
@@ -3235,6 +4390,23 @@ func (s *Server) handleMessage(from string, peer peer2peer.Peer, msg *Message, s
 
 	case *MessageDirectShare:
 		return s.handleDirectShare(from, m)
+
+	// ── Swarm architecture messages ───────────────────────────────
+	case *MessageGetChunkSwarm:
+		// Serve chunks concurrently — don't block the message loop while
+		// reading 4MB from disk and streaming over QUIC. This allows the
+		// seeder to handle multiple chunk requests in parallel.
+		go s.handleGetChunkSwarm(from, peer, m)
+		return nil
+
+	case *MessageRegisterProvider:
+		return s.handleRegisterProvider(from, m)
+
+	case *MessageGetProviders:
+		return s.handleGetProviders(from, peer, m)
+
+	case *MessageProvidersResponse:
+		return s.handleProvidersResponse(from, m)
 
 	default:
 		typeName := strings.TrimPrefix(reflect.TypeOf(msg.Payload).String(), "main.")
@@ -3337,9 +4509,10 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 	// Canonicalize loopback variants so the peers map key matches the ring key.
 	canonical = normalizeAddr(canonical)
 
-	if canonical == from {
-		return nil
-	}
+	// If canonical == from, no remap is needed (shared QUIC transport means
+	// the peer's source port is already its listen port). But we still need
+	// to ensure it's in the ring and cluster — fall through to registration.
+	needsRemap := canonical != from
 
 	// Reject self-connections: if the resolved canonical address has the same
 	// port as us and its host is one of our own local interfaces, it's a
@@ -3374,7 +4547,7 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 
 	s.peerLock.Lock()
 	p, ok := s.peers[from]
-	if ok && !p.Outbound() {
+	if ok && !p.Outbound() && needsRemap {
 		// Remap ephemeral entry → canonical listen address.
 		delete(s.peers, from)
 		s.peers[canonical] = p
@@ -3396,20 +4569,19 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 
 		if s.Cluster != nil {
 			s.Cluster.AddNode(canonical, nil)
-			// Do NOT bump the remote node's generation here. The node owns
-			// its own generation (unix-nano timestamp). Gossip heartbeats
-			// from the remote will naturally carry a generation higher than
-			// any stale Dead/Suspect state, and UpdateState will accept it.
 			// Migrate any identity metadata that was stored under the ephemeral
 			// address (if the identity message arrived before the announce).
-			if old, ok := s.Cluster.GetNode(from); ok {
-				if old.Metadata != nil && len(old.Metadata) > 0 {
-					s.Cluster.SetMetadata(canonical, old.Metadata)
+			// Only when from != canonical — with shared QUIC transport the source
+			// port equals the listen port, so from == canonical. Running the
+			// migration in that case would delete the node we just created.
+			if needsRemap {
+				if old, ok := s.Cluster.GetNode(from); ok {
+					if old.Metadata != nil && len(old.Metadata) > 0 {
+						s.Cluster.SetMetadata(canonical, old.Metadata)
+					}
+					s.Cluster.RemoveNode(from)
+					log.Printf("[handleAnnounce] migrated metadata from %s to %s", from, canonical)
 				}
-				// Remove the ephemeral cluster entry — it's an artifact
-				// of the identity message arriving before the announce.
-				s.Cluster.RemoveNode(from)
-				log.Printf("[handleAnnounce] migrated metadata from %s to %s (ephemeral entry removed)", from, canonical)
 			}
 		}
 		// Reset failure detector for the inbound peer so stale heartbeat
@@ -3457,42 +4629,86 @@ func (s *Server) handleAnnounce(from string, msg *MessageAnnounce) error {
 	return nil
 }
 
+// isVirtualInterface returns true for Docker, VM, and container bridge
+// interfaces that should be skipped during LAN IP resolution.
+func isVirtualInterface(name string) bool {
+	lower := strings.ToLower(name)
+	for _, prefix := range []string{
+		"docker", "veth", "br-",
+		"vmnet", "vmware", "virbr", "vnet",
+		"vboxnet",
+		"lxcbr", "lxdbr",
+		"flannel", "cni", "calico", "podman",
+		"tailscale", "wg",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveOutboundIP returns this machine's preferred outbound LAN IP.
-// Tier 1: UDP dial trick — lets the OS pick the right interface (no traffic sent).
-// Tier 2: Interface enumeration — works on air-gapped/offline LANs.
+// Tier 1: UDP dial trick — lets the OS routing table pick the right interface.
+// Tier 2: Scored interface enumeration — prefers WiFi/Ethernet over virtual
+//
+//	bridges (docker0, virbr0, veth*, etc.) for air-gapped campus LANs.
+//
 // Tier 3: 127.0.0.1 — absolute last resort (single-machine only).
 func resolveOutboundIP() string {
-	// Tier 1: UDP routing trick (works if any default route exists).
+	// Tier 1: UDP routing trick. The OS picks the interface that would route
+	// to 8.8.8.8. No packet is actually sent (UDP connect, not send).
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err == nil {
-		defer conn.Close()
-		return conn.LocalAddr().(*net.UDPAddr).IP.String()
+		ip := conn.LocalAddr().(*net.UDPAddr).IP.String()
+		conn.Close()
+		if ip != "" && ip != "0.0.0.0" {
+			return ip
+		}
 	}
 
-	// Tier 2: Iterate non-loopback interfaces (air-gapped campus LAN).
+	// Tier 2: Scored interface walk.
+	// Skips virtual interfaces and prefers RFC-1918 private IPs (LAN addresses).
 	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, i := range ifaces {
-			if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+	if err != nil {
+		return "127.0.0.1"
+	}
+
+	var fallback string
+	for _, i := range ifaces {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 || i.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		if isVirtualInterface(i.Name) {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 				continue
 			}
-			addrs, _ := i.Addrs()
-			for _, addr := range addrs {
-				var ip net.IP
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-				if ip == nil || ip.IsLoopback() {
-					continue
-				}
-				if ip4 := ip.To4(); ip4 != nil {
-					return ip4.String()
-				}
+			ip4 := ip.To4()
+			if ip4 == nil {
+				continue
+			}
+			// Prefer RFC-1918 private ranges (campus LAN / hotspot).
+			if ip4[0] == 10 || (ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) || (ip4[0] == 192 && ip4[1] == 168) {
+				return ip4.String()
+			}
+			if fallback == "" {
+				fallback = ip4.String()
 			}
 		}
+	}
+	if fallback != "" {
+		return fallback
 	}
 
 	// Tier 3: Last resort.
@@ -3533,6 +4749,58 @@ func (s *Server) SelfFingerprint() string {
 		return ""
 	}
 	return s.identityMeta["fingerprint"]
+}
+
+// GetLANPeers returns the cached mDNS-discovered LAN peers. The daemon
+// updates this list every 10 seconds in the background — callers never wait
+// for a live mDNS scan. This makes the IPC response instant (~0.1ms vs 3s).
+func (s *Server) GetLANPeers() []peermdns.DiscoveredPeer {
+	s.lanPeersMu.RLock()
+	defer s.lanPeersMu.RUnlock()
+	result := make([]peermdns.DiscoveredPeer, len(s.lanPeers))
+	copy(result, s.lanPeers)
+	return result
+}
+
+// mdnsDiscoveryLoop runs in the background and periodically scans the LAN via
+// mDNS. Results are cached so IPC handlers return instantly.
+func (s *Server) mdnsDiscoveryLoop() {
+	selfFP := s.SelfFingerprint()
+	selfAddr := s.SelfAddr()
+
+	scan := func() {
+		found, err := peermdns.Scan(5 * time.Second)
+		if err != nil {
+			return
+		}
+		var filtered []peermdns.DiscoveredPeer
+		for _, f := range found {
+			if selfFP != "" && f.Fingerprint == selfFP {
+				continue
+			}
+			if f.Addr == selfAddr {
+				continue
+			}
+			filtered = append(filtered, f)
+		}
+		s.lanPeersMu.Lock()
+		s.lanPeers = filtered
+		s.lanPeersMu.Unlock()
+	}
+
+	// Initial scan immediately on startup.
+	scan()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			scan()
+		case <-s.quitch:
+			return
+		}
+	}
 }
 
 // discoverNAT runs STUN discovery in the background. On success it sets the
@@ -3642,12 +4910,7 @@ func (s *Server) handleGetMessage(from string, peer peer2peer.Peer, msg *Message
 		return fmt.Errorf("HANDLE_GET: reading file data: %w", err)
 	}
 
-	// Sprint E: use throttled send for QUIC peers.
-	if qp, ok := peer.(*quicTransport.QUICPeer); ok && s.BandwidthMgr != nil {
-		err = qp.SendStreamThrottled(buf.Bytes(), fileData, s.BandwidthMgr.WrapWriter)
-	} else {
-		err = peer.SendStream(buf.Bytes(), fileData)
-	}
+	err = peer.SendStream(buf.Bytes(), fileData)
 	if err != nil {
 		log.Printf("[HANDLE_GET] Error sending message+stream to %s: %v\n", from, err)
 		return err
@@ -3706,47 +4969,107 @@ func (s *Server) handleLocalMessage(from string, peer peer2peer.Peer, msg *Messa
 	if streamReader == nil {
 		streamReader = peer.(io.Reader) // TCP fallback
 	}
-	n, err := s.Store.WriteStream(msg.Key, io.LimitReader(streamReader, msg.Size))
+
+	// Tell quic-go we're done reading — refund MAX_STREAMS quota immediately.
+	// Without this, the stream stays half-open (we read the data but never
+	// consumed EOF), exhausting the sender's MaxIncomingStreams sliding window.
+	type cancelReader interface{ CancelRead(uint64) }
+
+	// Check out a pooled buffer instead of allocating fresh. With MaxParallel=8
+	// goroutines each handling 4 MiB chunks, reusing buffers avoids GC thrashing
+	// that stutters the TUI. The buffer ownership transfers to the downloader
+	// worker via pendingFile; the worker calls PutChunkBuf after WriteAt.
+	data := getChunkBuf(int(msg.Size))
+	_, err := io.ReadFull(streamReader, data)
 	if err != nil {
-		log.Printf("HANDLE_LOCAL: Storage error from %s: %v", from, err)
+		log.Printf("[handleLocalMessage] read error from %s for %s: %v", from, msg.Key, err)
+		if cr, ok := streamReader.(cancelReader); ok {
+			cr.CancelRead(0)
+		}
+		if streamWg != nil {
+			streamWg.Done()
+		}
 		return err
 	}
-	log.Printf("HANDLE_LOCAL: Stored %d bytes from %s", n, from)
 
-	// Read the raw encrypted bytes back from the store.
-	// Callers (fetchChunkFromPeers / fetchChunkFromPeer) expect encrypted bytes
-	// and perform decryption themselves — do NOT decrypt here.
-	_, r, err := s.Store.ReadStream(msg.Key)
-	if err != nil {
-		log.Printf("HANDLE_LOCAL: Read error for %s: %v", msg.Key, err)
-		return err
-	}
-	defer r.Close()
-
-	log.Printf("HANDLE_LOCAL: Key = %s, ExpectedSize = %d, WrittenSize = %d", msg.Key, msg.Size, n)
-
-	var encBuf bytes.Buffer
-	if _, err = io.Copy(&encBuf, r); err != nil {
-		log.Printf("HANDLE_LOCAL: Copy error for %s: %v", msg.Key, err)
-		return err
+	if cr, ok := streamReader.(cancelReader); ok {
+		cr.CancelRead(0)
 	}
 
 	if streamWg != nil {
 		streamWg.Done()
 	}
-	log.Printf("HANDLE_LOCAL: Successfully retrieved '%s' from %s (bytes=%d)", msg.Key, from, encBuf.Len())
 
+	// Deliver immediately to waiting downloader goroutine — zero disk I/O on hot path.
 	s.mu.Lock()
 	ch, ok := s.pendingFile[msg.Key]
 	s.mu.Unlock()
 
 	if ok {
-		ch <- &encBuf
-	} else {
-		log.Printf("HANDLE_LOCAL: No waiting channel for key %s", msg.Key)
+		select {
+		case ch <- data:
+		default:
+		}
+	}
+
+	// Async CAS cache write for re-seeding (non-blocking).
+	// The chunk is already delivered; CAS write is best-effort for future serving.
+	// Use a COPY for the CAS write — the original pooled buffer is now owned by
+	// the downloader worker and must not be held hostage during slow disk writes.
+	select {
+	case s.casWriteCh <- casWriteRequest{key: msg.Key, data: append([]byte(nil), data...)}:
+	default:
 	}
 
 	return nil
+}
+
+// chunkBufPool recycles 4 MiB byte slices used by handleLocalMessage
+// and consumed by the downloader workers. Without this, MaxParallel=8
+// causes 8 × 4 MiB allocations per round-trip, thrashing the GC and
+// stuttering the TUI. Stores *[]byte to avoid interface boxing of large slices.
+var chunkBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 4<<20) // 4 MiB — matches default chunk size
+		return &b
+	},
+}
+
+// getChunkBuf checks out a buffer from the pool, sized to exactly n bytes.
+// If the pooled buffer is too small (rare — custom chunk size), allocates fresh.
+func getChunkBuf(n int) []byte {
+	bp := chunkBufPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) >= n {
+		return b[:n]
+	}
+	// Chunk larger than pool capacity — allocate fresh, let GC handle it.
+	return make([]byte, n)
+}
+
+// PutChunkBuf returns a buffer to the pool. Only buffers with capacity >= 4 MiB
+// are recycled; undersized or oversized buffers are left for GC.
+func PutChunkBuf(b []byte) {
+	if cap(b) >= 4<<20 {
+		b = b[:cap(b)]
+		chunkBufPool.Put(&b)
+	}
+}
+
+// casWriteRequest is a unit of work for the background CAS cache writer.
+type casWriteRequest struct {
+	key  string
+	data []byte
+}
+
+// casWriteLoop processes async CAS cache writes in the background.
+// Serializes disk writes to reduce seek contention. Started in Server.Start().
+func (s *Server) casWriteLoop() {
+	for req := range s.casWriteCh {
+		if _, err := s.Store.WriteStream(req.key, bytes.NewReader(req.data)); err != nil {
+			log.Printf("CAS_CACHE: write failed for %s: %v", req.key, err)
+		}
+	}
 }
 
 func (s *Server) Stop() {
@@ -3757,11 +5080,6 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 	addr := p.RemoteAddr().String()
 	self := s.serverOpts.transport.Addr()
 	log.Printf("[TRACE][OnPeerDisconnect] self=%s addr=%s outbound=%v ptr=%p", self, addr, p.Outbound(), p)
-
-	// Sprint E: stop RTT monitor for this peer.
-	if s.BandwidthMgr != nil {
-		s.BandwidthMgr.UnregisterPeer(addr)
-	}
 
 	s.peerLock.Lock()
 	// Only remove from map if the disconnecting peer is the SAME object
@@ -3852,6 +5170,78 @@ func (s *Server) OnPeerDisconnect(p peer2peer.Peer) {
 		log.Printf("[TRACE][OnPeerDisconnect] ground-truth Dead: self=%s addr=%s", self, addr)
 		s.Cluster.ForceLocalState(addr, membership.StateDead)
 	}
+}
+
+// OnDataPeer is called when a new peer connects on the data transport.
+// Data peers are stored separately — no ring/cluster/gossip interaction.
+func (s *Server) OnDataPeer(p peer2peer.Peer) error {
+	// Data transport peers are keyed by the CONTROL port address (N),
+	// derived from the data port (N+1) by subtracting 1.
+	addr := dataAddrToControlAddr(p.RemoteAddr().String())
+	log.Printf("[TRACE][OnDataPeer] addr=%s (data remote=%s) outbound=%v", addr, p.RemoteAddr(), p.Outbound())
+
+	s.dataPeerLock.Lock()
+	s.dataPeers[addr] = p
+	s.dataPeerLock.Unlock()
+
+	return nil
+}
+
+// OnDataPeerDisconnect cleans up when a data transport peer disconnects.
+func (s *Server) OnDataPeerDisconnect(p peer2peer.Peer) {
+	addr := dataAddrToControlAddr(p.RemoteAddr().String())
+	log.Printf("[TRACE][OnDataPeerDisconnect] addr=%s (data remote=%s)", addr, p.RemoteAddr())
+
+	s.dataPeerLock.Lock()
+	current, ok := s.dataPeers[addr]
+	if ok && current == p {
+		delete(s.dataPeers, addr)
+	}
+	s.dataPeerLock.Unlock()
+}
+
+// getDataPeer returns the data-plane peer for addr if available,
+// falling back to the control-plane peer for single-port backward compat.
+func (s *Server) getDataPeer(addr string) (peer2peer.Peer, bool) {
+	s.dataPeerLock.RLock()
+	dp, ok := s.dataPeers[addr]
+	s.dataPeerLock.RUnlock()
+	if ok {
+		return dp, true
+	}
+	// Fallback: single-port mode or data connection not yet established.
+	s.peerLock.RLock()
+	cp, ok := s.peers[addr]
+	s.peerLock.RUnlock()
+	return cp, ok
+}
+
+// dataAddrToControlAddr derives the control-port address (port N) from a
+// data-port address (port N+1). Used to key data peers by their control addr.
+func dataAddrToControlAddr(dataAddr string) string {
+	host, portStr, err := net.SplitHostPort(dataAddr)
+	if err != nil {
+		return dataAddr // can't parse — return as-is
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 1 {
+		return dataAddr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port-1))
+}
+
+// dialPeer dials a peer on the control transport, and also on the data
+// transport if Two-Port mode is active. Uses DialDual for atomic parallel dial.
+func (s *Server) dialPeer(addr string) error {
+	if s.dataTransport != nil {
+		// Both transports must be QUIC for DialDual.
+		ctrlQT, ctrlOK := s.serverOpts.transport.(*quicTransport.Transport)
+		dataQT, dataOK := s.dataTransport.(*quicTransport.Transport)
+		if ctrlOK && dataOK {
+			return quicTransport.DialDual(ctrlQT, dataQT, addr)
+		}
+	}
+	return s.dialPeer(addr)
 }
 
 // outboundPeerCount returns the number of outbound (real) peer connections.
@@ -3986,7 +5376,7 @@ func (s *Server) reconnectPass() {
 	for _, addr := range candidates {
 		go func(peerAddr string) {
 			log.Printf("[ConnMgr] attempting reconnect to %s", peerAddr)
-			if err := s.serverOpts.transport.Dial(peerAddr); err != nil {
+			if err := s.dialPeer(peerAddr); err != nil {
 				log.Printf("[ConnMgr] failed to reconnect %s: %v", peerAddr, err)
 				s.recordDialFailure(peerAddr)
 			} else {
@@ -4012,7 +5402,7 @@ func (s *Server) BootstrapNetwork() error {
 		go func(addr string) {
 			defer wg.Done()
 			log.Printf("[Bootstrap] Attempting to connect with remote: %s", addr)
-			if err := s.serverOpts.transport.Dial(addr); err != nil {
+			if err := s.dialPeer(addr); err != nil {
 				log.Printf("[Bootstrap] Failed to dial %s: %v", addr, err)
 			} else {
 				log.Printf("[Bootstrap] Successfully connected to %s", addr)
@@ -4043,7 +5433,7 @@ func (s *Server) BootstrapNetwork() error {
 				}
 				go func(peerAddr string) {
 					log.Printf("[Bootstrap] Reconnecting known peer: %s", peerAddr)
-					if err := s.serverOpts.transport.Dial(peerAddr); err != nil {
+					if err := s.dialPeer(peerAddr); err != nil {
 						log.Printf("[Bootstrap] Known peer %s offline: %v", peerAddr, err)
 					} else {
 						log.Printf("[Bootstrap] Reconnected to known peer: %s", peerAddr)
@@ -4068,12 +5458,6 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 		s.peerLock.Lock()
 		s.peers[addr] = p
 		s.peerLock.Unlock()
-		// Sprint E: register RTT monitor for adaptive throttling.
-		if s.BandwidthMgr != nil {
-			if src, ok := p.(ratelimit.RTTSource); ok {
-				s.BandwidthMgr.RegisterPeer(addr, src)
-			}
-		}
 		// SWIM Refutation: bump our own generation on any new connection
 		// so peers that previously marked us Dead will accept our heartbeats.
 		if s.Cluster != nil {
@@ -4158,13 +5542,6 @@ func (s *Server) OnPeer(p peer2peer.Peer) error {
 		s.HeartbeatSvc.RecordHeartbeat(addr)
 	}
 
-	// Sprint E: register RTT monitor for adaptive throttling.
-	if s.BandwidthMgr != nil {
-		if src, ok := p.(ratelimit.RTTSource); ok {
-			s.BandwidthMgr.RegisterPeer(addr, src)
-		}
-	}
-
 	// Sprint G: auto-persist outbound peers for reconnection on restart.
 	if s.StateDB != nil {
 		_ = s.StateDB.AddKnownPeer(addr)
@@ -4185,7 +5562,7 @@ func (s *Server) ConnectPeer(addr string) error {
 		_ = s.StateDB.RemoveIgnoredPeer(addr)
 		log.Printf("[ConnectPeer] removed %s from blocklist (manual reconnect)", addr)
 	}
-	if err := s.serverOpts.transport.Dial(addr); err != nil {
+	if err := s.dialPeer(addr); err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
 	if s.StateDB != nil {
@@ -4248,9 +5625,6 @@ func (s *Server) DisconnectPeer(addr string) error {
 		// Ground truth: we closed the connection. Mark Dead without
 		// stealing the remote node's generation clock.
 		s.Cluster.ForceLocalState(addr, membership.StateDead)
-	}
-	if s.BandwidthMgr != nil {
-		s.BandwidthMgr.UnregisterPeer(addr)
 	}
 	if s.StateDB != nil {
 		_ = s.StateDB.RemoveKnownPeer(addr)
@@ -4325,25 +5699,54 @@ func init() {
 	gob.Register(&MessageSearchRequest{})
 	gob.Register(&MessageSearchResponse{})
 	gob.Register(&MessageDirectShare{})
+	// Swarm architecture
+	gob.Register(&MessageGetChunkSwarm{})
+	gob.Register(&MessageRegisterProvider{})
+	gob.Register(&MessageGetProviders{})
+	gob.Register(&MessageProvidersResponse{})
 }
 
 // MakeServerOpts holds optional configuration for MakeServer.
 type MakeServerOpts struct {
 	IdentityMeta map[string]string // gossip metadata from identity (alias, fingerprint, keys)
+	X25519Priv   []byte            // X25519 private key for DEK unwrapping (swarm on-demand encryption)
 	DisableSTUN  bool              // skip STUN-based NAT traversal (default: false = STUN enabled)
-	MaxTransfers int               // concurrent transfer limit (0 = unlimited)
 	MaxPeers     int               // target active peer connections (0 = default 8, clamped to 100)
 	StateDBPath  string            // path to persistent state DB (empty = disabled)
+	CacheLimit   int64             // max CAS cache size in bytes (0 = default 50GB)
+	DataPort     string            // separate data-plane listen addr (e.g. ":3001"); empty = single-port mode
+	DataDir      string            // base directory for storage + metadata (empty = cwd)
+}
+
+// sanitizePathAddr replaces characters illegal in Windows file names (e.g. ':')
+// so that paths derived from listenAddr work on every OS.
+func sanitizePathAddr(addr string) string {
+	return strings.ReplaceAll(addr, ":", "_")
 }
 
 func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOpts, node ...string) *Server {
 	metaPath := "_metadata.db"
+	pathAddr := sanitizePathAddr(listenAddr)
 
-	// canonAddr is the normalized form of listenAddr (loopback variants → 127.0.0.1).
-	// Used for ring membership, gossip, heartbeat, quorum, and cluster identity so
-	// all subsystems agree on one canonical key. listenAddr (raw) is kept for file
-	// paths and transport init to avoid renaming existing directories.
+	// Root all runtime data under DataDir (e.g. ~/.hermod/) so the binary
+	// can be run from any working directory.
+	if makeOpts != nil && makeOpts.DataDir != "" {
+		pathAddr = filepath.Join(makeOpts.DataDir, pathAddr)
+	}
+
+	// canonAddr is the routable address used for ring membership, gossip,
+	// heartbeat, quorum, and cluster identity. When bound to ":3000" or
+	// "0.0.0.0:3000", we resolve the real LAN IP so subsystems don't get
+	// stuck on "127.0.0.1:3000" — which is unreachable from remote peers.
+	// effectiveSelfAddr() is not available yet (transport not started), so
+	// we replicate its logic here.
 	canonAddr := normalizeAddr(listenAddr)
+	if host, port, err := net.SplitHostPort(listenAddr); err == nil {
+		ip := net.ParseIP(host)
+		if host == "" || (ip != nil && ip.IsUnspecified()) {
+			canonAddr = net.JoinHostPort(resolveOutboundIP(), port)
+		}
+	}
 
 	// Sprint 5: initialise structured logging and Prometheus metrics.
 	// Skip if the caller already configured logging (e.g. daemon redirects
@@ -4392,9 +5795,30 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	// Sprint 8: use transport factory — defaults to QUIC, override with DFS_TRANSPORT=tcp.
 	// OnPeer/OnPeerDisconnect are forwarded via closures so the server pointer
 	// (set below) can be captured after construction.
+	// Resolve wildcard listen address to the real LAN IP BEFORE creating the
+	// transport. On multi-homed hosts (e.g. br0 + WiFi), binding to 0.0.0.0
+	// causes QUIC response packets to route out a different interface than
+	// where the request came in, breaking connection establishment.
+	transportAddr := listenAddr
+	if host, port, err := net.SplitHostPort(listenAddr); err == nil {
+		ip := net.ParseIP(host)
+		if host == "" || (ip != nil && ip.IsUnspecified()) {
+			resolved := resolveOutboundIP()
+			transportAddr = net.JoinHostPort(resolved, port)
+			log.Printf("[MakeServer] resolved wildcard %s → %s", listenAddr, transportAddr)
+		}
+	}
+
 	var sptr *Server
-	tr, err := factory.NewFromEnv(listenAddr, factory.Options{
+	// When a data port is configured, the main transport gets RoleControl
+	// so it uses tight QUIC windows and a small rpcCh buffer.
+	mainRole := quicTransport.RoleUnified
+	if makeOpts.DataPort != "" {
+		mainRole = quicTransport.RoleControl
+	}
+	tr, err := factory.NewFromEnv(transportAddr, factory.Options{
 		TLSConfig: tlsCfg,
+		QUICRole:  mainRole,
 		OnPeer: func(p peer2peer.Peer) error {
 			return sptr.OnPeer(p)
 		},
@@ -4405,9 +5829,36 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	if err != nil {
 		log.Fatalf("Failed to create transport: %v", err)
 	}
-	log.Printf("[MakeServer] transport: %s (protocol=%s)", listenAddr, factory.ProtocolFromEnv())
+	log.Printf("[MakeServer] transport: %s (protocol=%s, role=%d)", listenAddr, factory.ProtocolFromEnv(), mainRole)
 
-	metaStore, err := storage.NewBoltMetaStore(listenAddr + metaPath)
+	// Two-Port Architecture: create a separate data-plane transport on DataPort.
+	var dataTr peer2peer.Transport
+	if makeOpts.DataPort != "" && factory.ProtocolFromEnv() == factory.ProtocolQUIC {
+		// Resolve data transport address the same way as the control transport.
+		dataTransportAddr := makeOpts.DataPort
+		if host, port, err := net.SplitHostPort(makeOpts.DataPort); err == nil {
+			ip := net.ParseIP(host)
+			if host == "" || (ip != nil && ip.IsUnspecified()) {
+				dataTransportAddr = net.JoinHostPort(resolveOutboundIP(), port)
+			}
+		}
+		dataTr, err = factory.New(factory.ProtocolQUIC, dataTransportAddr, factory.Options{
+			TLSConfig: tlsCfg,
+			QUICRole:  quicTransport.RoleData,
+			OnPeer: func(p peer2peer.Peer) error {
+				return sptr.OnDataPeer(p)
+			},
+			OnPeerDisconnect: func(p peer2peer.Peer) {
+				sptr.OnDataPeerDisconnect(p)
+			},
+		})
+		if err != nil {
+			log.Fatalf("Failed to create data transport: %v", err)
+		}
+		log.Printf("[MakeServer] data transport: %s (role=Data)", dataTransportAddr)
+	}
+
+	metaStore, err := storage.NewBoltMetaStore(pathAddr + metaPath)
 	if err != nil {
 		log.Fatalf("Failed to open metadata store: %v", err)
 	}
@@ -4417,17 +5868,17 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 		transport:         tr,
 		metaData:          metaStore,
 		bootstrapNodes:    node,
-		storageRoot:       listenAddr + "_network",
+		storageRoot:       pathAddr + "_network",
 		ReplicationFactor: replicationFactor,
 	}
 
 	s := NewServer(opts)
 	sptr = s // wire closure so transport callbacks reach the server
 
-	// Sprint E: adaptive bandwidth management (always-on LEDBAT-lite).
-	s.BandwidthMgr = ratelimit.New(ratelimit.Config{
-		MaxTransfers: makeOpts.MaxTransfers,
-	})
+	// Two-Port: wire the data transport into the server.
+	if dataTr != nil {
+		s.dataTransport = dataTr
+	}
 
 	// Sprint F: persistent local state.
 	if makeOpts.StateDBPath != "" {
@@ -4437,6 +5888,58 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 		} else {
 			s.StateDB = sdb
 		}
+	}
+
+	// Swarm: CAS cache manager for LRU eviction of secondary seeder chunks.
+	if s.StateDB != nil {
+		evictFunc := func(fileKey string) error {
+			manifest, ok := s.serverOpts.metaData.GetManifest(fileKey)
+			if !ok {
+				return nil // no manifest = nothing to evict
+			}
+			var errs []error
+			for _, ci := range manifest.Chunks {
+				sk := chunker.ChunkStorageKey(ci.EncHash)
+				if s.Store.Has(sk) {
+					if err := s.Store.Remove(sk); err != nil {
+						errs = append(errs, err)
+					}
+				}
+			}
+			if len(errs) > 0 {
+				return fmt.Errorf("evict %s: %d chunk deletions failed", fileKey, len(errs))
+			}
+			return nil
+		}
+		s.CacheMgr = swarm.NewCacheManager(s.StateDB, makeOpts.CacheLimit, evictFunc)
+		go s.CacheMgr.RunEvictionLoop(5 * time.Minute)
+
+		// Background provider re-registration: every 10 minutes, re-register
+		// all local seed sources with hash ring nodes so provider records
+		// stay fresh across ring topology changes and TTL expiry.
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-s.CacheMgr.StopCh():
+					return
+				case <-ticker.C:
+					sources, err := s.StateDB.AllSeedSources()
+					if err != nil {
+						log.Printf("[WARN] provider re-registration: %v", err)
+						continue
+					}
+					for fileKey, src := range sources {
+						completed := swarm.CountBits(src.Bitfield)
+						s.registerProvider(fileKey, completed, src.TotalChunks)
+					}
+					if len(sources) > 0 {
+						log.Printf("PROVIDER_REREGISTER: refreshed %d provider records", len(sources))
+					}
+				}
+			}
+		}()
 	}
 
 	// Sprint G: active transfer queue + search dedup.
@@ -4497,31 +6000,42 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	)
 
 	// Sprint 2: wire HandoffService
-	hintDir := filepath.Join(listenAddr+"_network", ".hints")
-	hintStore, err := handoff.NewStore(hintDir, handoff.DefaultMaxHints, handoff.DefaultMaxAge)
+	hintDir := filepath.Join(pathAddr+"_network", ".hints")
+	hintStore, err := handoff.NewStore(hintDir, handoff.DefaultMaxHints, handoff.DefaultMaxAge, handoff.DefaultMaxDataSize)
 	if err != nil {
 		log.Printf("[MakeServer] failed to create hint store: %v (hinted handoff disabled)", err)
 	} else {
 		s.HandoffSvc = handoff.NewHandoffService(hintStore,
-			// deliver closure: resend a hint's data to its target
+			// deliver closure: read data from CAS and send to target.
+			// Block-waits during active uploads to avoid HoL blocking on the
+			// shared QUIC connection. We block (not skip) to preserve Attempts.
 			func(h handoff.Hint) error {
+				if s.activeUploads.Load() > 0 {
+					log.Printf("[handoff] upload active, deferring delivery of key=%s to %s", h.Key, h.TargetAddr)
+					for s.activeUploads.Load() > 0 {
+						time.Sleep(500 * time.Millisecond)
+					}
+				}
+				data, err := s.readFile(h.Key)
+				if err != nil {
+					return fmt.Errorf("handoff deliver: read CAS key %s: %w", h.Key, err)
+				}
 				msg := &Message{
 					Payload: &MessageStoreFile{
 						Key:  h.Key,
-						Size: int64(len(h.Data)),
+						Size: int64(len(data)),
 					},
 				}
 				buf := new(bytes.Buffer)
 				if err := gob.NewEncoder(buf).Encode(msg); err != nil {
 					return err
 				}
-				s.peerLock.RLock()
-				peer, ok := s.peers[h.TargetAddr]
-				s.peerLock.RUnlock()
+				// Use data-plane peer when available (Two-Port), fallback to control.
+				peer, ok := s.getDataPeer(h.TargetAddr)
 				if !ok {
 					return fmt.Errorf("handoff deliver: peer %s not connected", h.TargetAddr)
 				}
-				return peer.SendStream(buf.Bytes(), h.Data)
+				return peer.SendStream(buf.Bytes(), data)
 			},
 		)
 	}
@@ -4532,8 +6046,16 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 		s.HashRing,
 		opts.metaData,
 		s.readFile,
-		// sendFile closure: replicate a file to a target node
+		// sendFile closure: replicate a file to a target node.
+		// Block-waits during active uploads to avoid HoL blocking. We block
+		// (not error) because failed migrations aren't retried by the rebalancer.
 		func(targetAddr, key string, data []byte) error {
+			if s.activeUploads.Load() > 0 {
+				log.Printf("[rebalance] upload active, deferring migration of key=%s to %s", key, targetAddr)
+				for s.activeUploads.Load() > 0 {
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
 			msg := &Message{
 				Payload: &MessageStoreFile{
 					Key:  key,
@@ -4545,9 +6067,8 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 				return err
 			}
 
-			s.peerLock.RLock()
-			peer, ok := s.peers[targetAddr]
-			s.peerLock.RUnlock()
+			// Use data-plane peer when available (Two-Port), fallback to control.
+			peer, ok := s.getDataPeer(targetAddr)
 			if !ok {
 				return fmt.Errorf("rebalance: peer %s not connected", targetAddr)
 			}
@@ -4575,6 +6096,7 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 			}})
 		},
 	)
+	s.Rebalancer.SetShouldSkipKey(isSwarmCacheKey)
 
 	// Sprint 4: wire Quorum coordinator.
 	s.Quorum = quorum.New(
@@ -4622,11 +6144,20 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	s.AntiEntropy = merkle.NewAntiEntropyService(
 		canonAddr,
 		10*time.Minute,
-		// getKeys: all locally-stored file keys
+		// getKeys: all locally-stored file keys, excluding chunk: keys
+		// which are managed by their own replication paths (upload-time
+		// replicateChunk or swarm on-demand serving).
 		func() []string {
 			type keyer interface{ Keys() []string }
 			if k, ok := metaAsKeyer.(keyer); ok {
-				return k.Keys()
+				all := k.Keys()
+				filtered := make([]string, 0, len(all))
+				for _, key := range all {
+					if !isSwarmCacheKey(key) {
+						filtered = append(filtered, key)
+					}
+				}
+				return filtered
 			}
 			return nil
 		},
@@ -4649,20 +6180,35 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 				return fmt.Errorf("merkle sendMsg: unknown type %T", msg)
 			}
 		},
-		// onNeedKey: peer has a key we're missing — request it
+		// onNeedKey: peer has a key we're missing — request it.
+		// Yields during active uploads to avoid competing for QUIC bandwidth.
 		func(addr, key string) {
+			if isSwarmCacheKey(key) {
+				return // chunk keys handled by swarm/upload replication, not anti-entropy
+			}
+			if s.activeUploads.Load() > 0 {
+				return // yield: foreground upload has priority
+			}
 			log.Printf("[anti-entropy] requesting missing key %s from %s", key, addr)
 			_ = s.sendToAddr(addr, &Message{Payload: &MessageGetFile{Key: key}})
 		},
-		// onSendKey: we have a key the peer is missing — re-replicate it
+		// onSendKey: we have a key the peer is missing — re-replicate it.
+		// Yields entirely when uploads are active to avoid HoL blocking
+		// on the shared QUIC connection and rate limiter token bucket.
 		func(addr, key string) {
+			if isSwarmCacheKey(key) {
+				return // chunk keys handled by swarm/upload replication, not anti-entropy
+			}
+			if s.activeUploads.Load() > 0 {
+				return // yield: foreground upload has priority
+			}
 			log.Printf("[anti-entropy] replicating missing key %s to %s", key, addr)
 			data, err := s.readFile(key)
 			if err != nil {
 				log.Printf("[anti-entropy] failed to read %s: %v", key, err)
 				return
 			}
-			s.storeHint(addr, key, data)
+			s.storeHint(addr, key, int64(len(data)))
 		},
 	)
 
@@ -4672,26 +6218,69 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 	s.Downloader = downloader.New(
 		dmCfg,
 		s.Selector,
-		// fetch: get raw bytes for storageKey from peerAddr
-		func(storageKey, peerAddr string) ([]byte, error) {
-			return s.fetchChunkFromPeer(storageKey, peerAddr)
+		// fetch: swarm-aware — tries local CAS first, then swarm RPC, falls back to hash ring
+		func(ctx context.Context, fileKey string, chunkIndex int, storageKey, peerAddr string) ([]byte, error) {
+			// Local CAS check (secondary seeder cache).
+			if s.Store.Has(storageKey) {
+				_, r, err := s.Store.ReadStream(storageKey)
+				if err == nil {
+					defer r.Close()
+					return io.ReadAll(r)
+				}
+			}
+			// Try swarm chunk fetch via bidirectional RPC (single-stream request-response).
+			if fileKey != "" {
+				manifest, ok := s.serverOpts.metaData.GetManifest(fileKey)
+				if ok && manifest != nil && manifest.SeedMode && chunkIndex < len(manifest.Chunks) {
+					data, err := s.fetchChunkSwarmBidi(ctx, fileKey, chunkIndex, manifest.Chunks[chunkIndex].EncHash, peerAddr)
+					if err == nil {
+						// Async CAS cache for re-seeding.
+						select {
+						case s.casWriteCh <- casWriteRequest{key: storageKey, data: append([]byte(nil), data...)}:
+						default:
+						}
+					}
+					return data, err
+				}
+			}
+			// Fallback: legacy hash-ring fetch (MessageGetFile).
+			return s.fetchChunkFromPeer(ctx, storageKey, peerAddr)
 		},
 		// decrypt: decrypt chunk data using the caller-provided DEK
-		func(storageKey string, data []byte, dek []byte) ([]byte, error) {
+		func(storageKey string, chunkIndex int, data []byte, dek []byte) ([]byte, error) {
 			if dek == nil {
 				return data, nil // plaintext path — no decryption
 			}
 			var plain bytes.Buffer
-			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(data), &plain, dek); err != nil {
+			if err := crypto.DecryptStreamWithDEK(bytes.NewReader(data), &plain, dek, uint64(chunkIndex)); err != nil {
 				return nil, err
 			}
 			return plain.Bytes(), nil
 		},
-		// getPeers: ring-responsible nodes for this storageKey
-		func(storageKey string) []string {
+		// getPeers: swarm-aware — queries provider records, falls back to hash ring
+		func(fileKey string, chunkIndex int, storageKey string) []string {
+			// 1. Query provider records from hash ring nodes.
+			if fileKey != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				providers := s.getProviders(ctx, fileKey)
+				cancel()
+				if len(providers) > 0 {
+					addrs := make([]string, len(providers))
+					for i, p := range providers {
+						addrs[i] = p.Addr
+					}
+					return addrs
+				}
+				// 2. Fallback: manifest's OriginalSeeder field.
+				if manifest, ok := s.serverOpts.metaData.GetManifest(fileKey); ok && manifest != nil && manifest.OriginalSeeder != "" {
+					return []string{manifest.OriginalSeeder}
+				}
+			}
+			// 3. Fallback to hash ring (legacy CAS uploads).
 			return s.HashRing.GetNodes(storageKey, s.HashRing.ReplicationFactor())
 		},
 	)
+	s.Downloader.SetReleaseBuf(PutChunkBuf)
 
 	// Phase 3: wire NAT traversal (STUN-based public address discovery).
 	if makeOpts == nil || !makeOpts.DisableSTUN {
@@ -4724,6 +6313,9 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 		s.identityMeta = makeOpts.IdentityMeta
 		s.Cluster.SetMetadata(canonAddr, makeOpts.IdentityMeta)
 		selfFingerprint = makeOpts.IdentityMeta["fingerprint"]
+		if len(makeOpts.X25519Priv) > 0 {
+			s.x25519Priv = makeOpts.X25519Priv
+		}
 	}
 
 	gossipCfg := gossip.DefaultConfig()
@@ -4774,13 +6366,15 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 				return
 			}
 
-			// Blocklist check — manually disconnected peers stay disconnected.
-			if s.StateDB != nil && s.StateDB.IsIgnoredPeer(addr) {
+			// Blocklist check — manually disconnected peers stay disconnected
+			// (unless they are explicit --peer bootstrap targets).
+			_, isBootstrapPeer := s.bootstrapAddrs[addr]
+			if s.StateDB != nil && s.StateDB.IsIgnoredPeer(addr) && !isBootstrapPeer {
 				log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (ignored/blocklisted by addr)", self, addr)
 				return
 			}
 			// Fingerprint-based blocklist: catches peers that changed IP (DHCP).
-			if s.StateDB != nil && s.Cluster != nil {
+			if s.StateDB != nil && s.Cluster != nil && !isBootstrapPeer {
 				if node, ok := s.Cluster.GetNode(addr); ok && node.Metadata != nil {
 					if fp := node.Metadata["fingerprint"]; fp != "" && s.StateDB.IsIgnoredFingerprint(fp) {
 						log.Printf("[TRACE][onNewPeer] SKIP self=%s addr=%s (ignored/blocklisted by fingerprint %s)", self, addr, fp)
@@ -4817,7 +6411,7 @@ func MakeServer(listenAddr string, replicationFactor int, makeOpts *MakeServerOp
 			}()
 
 			log.Printf("[TRACE][onNewPeer] DIALLING self=%s -> addr=%s ring_size_before=%d", self, addr, s.HashRing.Size())
-			if err := s.serverOpts.transport.Dial(addr); err != nil {
+			if err := s.dialPeer(addr); err != nil {
 				log.Printf("[TRACE][onNewPeer] DIAL FAILED self=%s -> addr=%s err=%v", self, addr, err)
 			} else {
 				log.Printf("[TRACE][onNewPeer] DIAL OK self=%s -> addr=%s", self, addr)

@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,42 +29,55 @@ import (
 
 // Config controls the parallel download behaviour.
 type Config struct {
-	MaxParallel  int           // max concurrent chunk fetches (default 4)
-	ChunkTimeout time.Duration // per-chunk fetch timeout (default 30s)
-	MaxRetries   int           // retries per chunk on failure (default 3)
+	MaxParallel    int           // max concurrent chunk fetches for single-file downloads (default 4)
+	MaxParallelDir int           // max concurrent workers for directory downloads (default 8)
+	ChunkTimeout   time.Duration // per-chunk fetch timeout (default 60s)
+	MaxRetries     int           // retries per chunk on failure (default 3)
 }
 
 // DefaultConfig returns sensible defaults for a college LAN.
 func DefaultConfig() Config {
 	return Config{
-		MaxParallel:  4,
-		ChunkTimeout: 30 * time.Second,
-		MaxRetries:   3,
+		MaxParallel:    4,
+		MaxParallelDir: 4,
+		ChunkTimeout:   120 * time.Second,
+		MaxRetries:     3,
 	}
 }
 
-// FetchFunc fetches the raw encrypted bytes for storageKey from a specific peer.
-type FetchFunc func(storageKey string, peerAddr string) (encData []byte, err error)
+// FetchFunc fetches the raw encrypted bytes for a chunk from a specific peer.
+// fileKey and chunkIndex enable swarm-mode fetching (MessageGetChunkSwarm);
+// storageKey is the CAS key for hash-ring fallback. The context carries a
+// per-chunk timeout (Config.ChunkTimeout).
+type FetchFunc func(ctx context.Context, fileKey string, chunkIndex int, storageKey string, peerAddr string) (encData []byte, err error)
 
 // DecryptFunc decrypts encData using the provided DEK.
+// chunkIndex is the file-level chunk index, used as the AES-GCM nonce offset.
 // When dek is nil, returns encData as-is (plaintext path).
-type DecryptFunc func(storageKey string, encData []byte, dek []byte) (plaintext []byte, err error)
+type DecryptFunc func(storageKey string, chunkIndex int, encData []byte, dek []byte) (plaintext []byte, err error)
 
-// GetPeersFunc returns the ordered list of peer addresses responsible for
-// storing storageKey (from the consistent hash ring).
-type GetPeersFunc func(storageKey string) []string
+// GetPeersFunc returns the ordered list of peer addresses that can serve a
+// chunk. fileKey and chunkIndex enable provider-record lookups (swarm mode);
+// storageKey is the CAS key for hash-ring fallback.
+type GetPeersFunc func(fileKey string, chunkIndex int, storageKey string) []string
 
 // ProgressFunc is called after each chunk completes. index is 0-based,
 // total is the number of chunks in the manifest.
 type ProgressFunc func(index, total int)
 
+// ReleaseBufFunc is called to return a fetched chunk buffer to a pool.
+// If nil, buffers are left for GC. Called after decrypt (the encrypted
+// buffer is no longer needed once plaintext is produced).
+type ReleaseBufFunc func([]byte)
+
 // Manager downloads chunked files in parallel.
 type Manager struct {
-	cfg      Config
-	sel      *selector.Selector
-	fetch    FetchFunc
-	decrypt  DecryptFunc
-	getPeers GetPeersFunc
+	cfg        Config
+	sel        *selector.Selector
+	fetch      FetchFunc
+	decrypt    DecryptFunc
+	getPeers   GetPeersFunc
+	releaseBuf ReleaseBufFunc
 }
 
 // New creates a Manager. All function arguments are required.
@@ -77,8 +91,15 @@ func New(cfg Config, sel *selector.Selector, fetch FetchFunc, decrypt DecryptFun
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = DefaultConfig().MaxRetries
 	}
-	return &Manager{cfg: cfg, sel: sel, fetch: fetch, decrypt: decrypt, getPeers: getPeers}
+	if cfg.MaxParallelDir <= 0 {
+		cfg.MaxParallelDir = DefaultConfig().MaxParallelDir
+	}
+	return &Manager{cfg: cfg, sel: sel, fetch: fetch, decrypt: decrypt, getPeers: getPeers, releaseBuf: nil}
 }
+
+// SetReleaseBuf sets the buffer release callback. Called after decrypt to
+// return the encrypted-data buffer to a sync.Pool, preventing GC thrashing.
+func (m *Manager) SetReleaseBuf(fn ReleaseBufFunc) { m.releaseBuf = fn }
 
 // ---------------------------------------------------------------------------
 // Primary path: DownloadToFile (random-access, zero HoL blocking)
@@ -94,7 +115,7 @@ func New(cfg Config, sel *selector.Selector, fetch FetchFunc, decrypt DecryptFun
 //
 // Memory: MaxParallel * ChunkSize (e.g., 4 * 4 MiB = 16 MiB).
 // Concurrent WriteAt to different offsets on *os.File is safe on POSIX.
-func (m *Manager) DownloadToFile(ctx context.Context, manifest *chunker.ChunkManifest, dst io.WriterAt, progress ProgressFunc, dek []byte) error {
+func (m *Manager) DownloadToFile(ctx context.Context, fileKey string, manifest *chunker.ChunkManifest, dst io.WriterAt, progress ProgressFunc, dek []byte) error {
 	n := len(manifest.Chunks)
 	if n == 0 {
 		return nil
@@ -116,7 +137,7 @@ func (m *Manager) DownloadToFile(ctx context.Context, manifest *chunker.ChunkMan
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			plain, err := m.fetchAndVerifyChunk(ci, dek)
+			plain, err := m.fetchAndVerifyChunk(ctx, fileKey, ci, dek)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -170,6 +191,7 @@ type ChunkRecordFunc func(index int, hash string)
 // record it in the resume sidecar. onChunkDone may be nil.
 func (m *Manager) DownloadToFileResumable(
 	ctx context.Context,
+	fileKey string,
 	manifest *chunker.ChunkManifest,
 	dst io.WriterAt,
 	skipSet map[int]bool,
@@ -221,7 +243,7 @@ func (m *Manager) DownloadToFileResumable(
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			plain, err := m.fetchAndVerifyChunk(ci, dek)
+			plain, err := m.fetchAndVerifyChunk(ctx, fileKey, ci, dek)
 			if err != nil {
 				errs[idx] = err
 				return
@@ -273,7 +295,7 @@ func (m *Manager) DownloadToFileResumable(
 //
 // Per-chunk integrity is verified BEFORE placing in the window buffer.
 // Memory: MaxParallel * ChunkSize (e.g., 4 * 4 MiB = 16 MiB).
-func (m *Manager) DownloadToStream(manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc, dek []byte) error {
+func (m *Manager) DownloadToStream(ctx context.Context, fileKey string, manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc, dek []byte) error {
 	n := len(manifest.Chunks)
 	if n == 0 {
 		return nil
@@ -306,7 +328,7 @@ func (m *Manager) DownloadToStream(manifest *chunker.ChunkManifest, dst io.Write
 			sem <- struct{}{} // acquire worker slot
 			go func(i int, ci chunker.ChunkInfo) {
 				defer func() { <-sem }()
-				plain, err := m.fetchAndVerifyChunk(ci, dek)
+				plain, err := m.fetchAndVerifyChunk(ctx, fileKey, ci, dek)
 				results <- chunkResult{index: i, data: plain, err: err}
 			}(idx, manifest.Chunks[idx])
 
@@ -384,7 +406,7 @@ func (m *Manager) DownloadToStream(manifest *chunker.ChunkManifest, dst io.Write
 //
 // Deprecated: Use DownloadToFile for file output or DownloadToStream for pipes.
 // This method buffers all chunks in memory before writing.
-func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc, dek []byte) error {
+func (m *Manager) Download(ctx context.Context, fileKey string, manifest *chunker.ChunkManifest, dst io.Writer, progress ProgressFunc, dek []byte) error {
 	n := len(manifest.Chunks)
 	if n == 0 {
 		return nil
@@ -404,7 +426,7 @@ func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progr
 			defer wg.Done()
 			defer func() { <-sem }() // release slot
 
-			plain, err := m.fetchAndVerifyChunk(ci, dek)
+			plain, err := m.fetchAndVerifyChunk(ctx, fileKey, ci, dek)
 			if err != nil {
 				errs[idx] = err
 			} else {
@@ -444,9 +466,9 @@ func (m *Manager) Download(manifest *chunker.ChunkManifest, dst io.Writer, progr
 //
 // On integrity failure the peer is penalised via a large latency record in the
 // selector, effectively banning it for subsequent chunk picks.
-func (m *Manager) fetchAndVerifyChunk(info chunker.ChunkInfo, dek []byte) ([]byte, error) {
+func (m *Manager) fetchAndVerifyChunk(ctx context.Context, fileKey string, info chunker.ChunkInfo, dek []byte) ([]byte, error) {
 	storageKey := chunker.ChunkStorageKey(info.EncHash)
-	candidates := m.getPeers(storageKey)
+	candidates := m.getPeers(fileKey, info.Index, storageKey)
 
 	var lastErr error
 	tried := make(map[string]bool)
@@ -472,7 +494,10 @@ func (m *Manager) fetchAndVerifyChunk(info chunker.ChunkInfo, dek []byte) ([]byt
 		m.sel.BeginDownload(peer)
 		t0 := time.Now()
 
-		encData, err := m.fetch(storageKey, peer)
+		// Per-chunk timeout: context carries Config.ChunkTimeout (30s).
+		chunkCtx, cancel := context.WithTimeout(ctx, m.cfg.ChunkTimeout)
+		encData, err := m.fetch(chunkCtx, fileKey, info.Index, storageKey, peer)
+		cancel()
 		elapsed := time.Since(t0)
 
 		m.sel.EndDownload(peer)
@@ -484,8 +509,12 @@ func (m *Manager) fetchAndVerifyChunk(info chunker.ChunkInfo, dek []byte) ([]byt
 		}
 
 		// Decrypt (no-op when dek is nil).
-		plain, err := m.decrypt(storageKey, encData, dek)
+		plain, err := m.decrypt(storageKey, info.Index, encData, dek)
 		if err != nil {
+			// Release on error too — encData is useless now.
+			if m.releaseBuf != nil && dek != nil {
+				m.releaseBuf(encData)
+			}
 			lastErr = fmt.Errorf("decrypt from %s: %w", peer, err)
 			continue
 		}
@@ -494,9 +523,19 @@ func (m *Manager) fetchAndVerifyChunk(info chunker.ChunkInfo, dek []byte) ([]byt
 		if info.Compressed {
 			plain, err = compression.DecompressChunk(plain)
 			if err != nil {
+				if m.releaseBuf != nil && dek != nil {
+					m.releaseBuf(encData)
+				}
 				lastErr = fmt.Errorf("decompress from %s: %w", peer, err)
 				continue
 			}
+		}
+
+		// Return the encrypted buffer to the pool. After decrypt+decompress,
+		// plain is always a separate allocation from encData (either decrypt
+		// produced a new buffer, or decompress did). Safe to release.
+		if m.releaseBuf != nil && dek != nil {
+			m.releaseBuf(encData)
 		}
 
 		// ON-THE-FLY integrity check (DC++ TTH-style).
@@ -518,6 +557,220 @@ func (m *Manager) fetchAndVerifyChunk(info chunker.ChunkInfo, dek []byte) ([]byt
 	}
 	return nil, fmt.Errorf("no peers available for chunk idx=%d key=%s",
 		info.Index, storageKey)
+}
+
+// ---------------------------------------------------------------------------
+// Directory path: DownloadDirectory (global chunk work pool)
+// ---------------------------------------------------------------------------
+
+// FileContext tracks one file within a directory download. Multiple ChunkTasks
+// from the same file share the same FileContext pointer.
+type FileContext struct {
+	Index        int               // position in DirectoryManifest.Files
+	FileKey      string            // storage key for this file (swarm provider lookups)
+	RelativePath string            // for error reporting
+	ChunkSize    int               // nominal chunk size from manifest
+	Chunks       []chunker.ChunkInfo
+	Writer       io.WriterAt       // the opened .part file
+	SkipSet      map[int]bool      // chunks already verified on disk
+	OnChunkDone  ChunkRecordFunc   // callback → sidecar.RecordChunk
+	OnFinalize   func() error      // callback → merkle verify + close + rename
+	Cleanup      func()            // callback → close file handles on error
+
+	TotalChunks  int
+	Remaining    atomic.Int32      // decremented on each successful chunk
+
+	errors       []error
+	errorsMu     sync.Mutex
+	FinalizeOnce sync.Once
+	FinalizeErr  error
+}
+
+func (fc *FileContext) recordError(chunkIdx int, err error) {
+	fc.errorsMu.Lock()
+	if chunkIdx >= 0 && chunkIdx < len(fc.errors) {
+		fc.errors[chunkIdx] = err
+	}
+	fc.errorsMu.Unlock()
+}
+
+// InitErrors allocates the per-chunk error slots.
+func (fc *FileContext) InitErrors(n int) {
+	fc.errors = make([]error, n)
+}
+
+// chunkTask is a single unit of work in the global queue.
+type chunkTask struct {
+	file    *FileContext
+	info    chunker.ChunkInfo
+	attempt int
+}
+
+// DirDownloadResult reports per-file outcomes of a directory download.
+type DirDownloadResult struct {
+	Succeeded   int
+	Failed      int
+	FailedFiles []string
+}
+
+// DirProgressFunc reports global progress after each chunk completes.
+type DirProgressFunc func(filesCompleted, filesTotal, chunksCompleted, chunksTotal int)
+
+// DownloadDirectory downloads all files from a directory using a global chunk
+// work pool (BitTorrent-style). All chunks from all files are flattened into a
+// single queue, N workers pull concurrently, and failed chunks are retried in
+// subsequent rounds.
+//
+// files must be prepared by the caller (server layer) with Writer, SkipSet,
+// OnChunkDone, OnFinalize, and Cleanup callbacks wired up.
+func (m *Manager) DownloadDirectory(
+	ctx context.Context,
+	files []*FileContext,
+	workers int,
+	dek []byte,
+	progress DirProgressFunc,
+) *DirDownloadResult {
+	if workers <= 0 {
+		workers = m.cfg.MaxParallelDir
+	}
+
+	filesTotal := len(files)
+
+	// Count total chunks and already-done chunks across all files.
+	var totalChunks int
+	var alreadyDone int32
+	for _, fc := range files {
+		totalChunks += fc.TotalChunks
+		alreadyDone += int32(len(fc.SkipSet))
+	}
+
+	// Build initial task list: all chunks not in skip sets.
+	var taskList []chunkTask
+	for _, fc := range files {
+		for _, ci := range fc.Chunks {
+			if fc.SkipSet[ci.Index] {
+				continue
+			}
+			taskList = append(taskList, chunkTask{file: fc, info: ci, attempt: 0})
+		}
+	}
+
+	var chunksCompleted atomic.Int32
+	chunksCompleted.Store(alreadyDone)
+	var filesCompleted atomic.Int32
+
+	// Report initial progress (resumed chunks).
+	if progress != nil && alreadyDone > 0 {
+		progress(0, filesTotal, int(alreadyDone), totalChunks)
+	}
+
+	// Round-based retry: each round drains the queue completely, failed chunks
+	// are collected and retried in the next round. No deadlock risk.
+	for round := 0; round <= m.cfg.MaxRetries; round++ {
+		if len(taskList) == 0 || ctx.Err() != nil {
+			break
+		}
+
+		queue := make(chan chunkTask, len(taskList))
+		for _, t := range taskList {
+			queue <- t
+		}
+		close(queue)
+
+		var failedMu sync.Mutex
+		var failedTasks []chunkTask
+
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for task := range queue {
+					if ctx.Err() != nil {
+						return
+					}
+
+					plain, err := m.fetchAndVerifyChunk(ctx, task.file.FileKey, task.info, dek)
+					if err != nil {
+						task.file.recordError(task.info.Index, err)
+						failedMu.Lock()
+						failedTasks = append(failedTasks, chunkTask{
+							file:    task.file,
+							info:    task.info,
+							attempt: task.attempt + 1,
+						})
+						failedMu.Unlock()
+						continue
+					}
+
+					// Write to correct file at correct offset.
+					offset := int64(task.info.Index) * int64(task.file.ChunkSize)
+					if _, err := task.file.Writer.WriteAt(plain, offset); err != nil {
+						task.file.recordError(task.info.Index, err)
+						failedMu.Lock()
+						failedTasks = append(failedTasks, chunkTask{
+							file:    task.file,
+							info:    task.info,
+							attempt: task.attempt + 1,
+						})
+						failedMu.Unlock()
+						continue
+					}
+
+					// Clear any previous error for this chunk (it succeeded on retry).
+					task.file.recordError(task.info.Index, nil)
+
+					// Record in resume sidecar.
+					if task.file.OnChunkDone != nil {
+						task.file.OnChunkDone(task.info.Index, task.info.Hash)
+					}
+
+					// Check if this file is now complete.
+					remaining := task.file.Remaining.Add(-1)
+					done := chunksCompleted.Add(1)
+
+					if remaining == 0 {
+						task.file.FinalizeOnce.Do(func() {
+							if task.file.OnFinalize != nil {
+								task.file.FinalizeErr = task.file.OnFinalize()
+							}
+							if task.file.FinalizeErr == nil {
+								filesCompleted.Add(1)
+							}
+						})
+					}
+
+					if progress != nil {
+						progress(int(filesCompleted.Load()), filesTotal, int(done), totalChunks)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		taskList = failedTasks
+	}
+
+	// Collect results.
+	result := &DirDownloadResult{}
+	for _, fc := range files {
+		if fc.Remaining.Load() > 0 || fc.FinalizeErr != nil {
+			result.Failed++
+			result.FailedFiles = append(result.FailedFiles, fc.RelativePath)
+			if fc.FinalizeErr != nil {
+				log.Printf("DOWNLOAD_DIR: finalize failed for %s: %v", fc.RelativePath, fc.FinalizeErr)
+			}
+		} else {
+			result.Succeeded++
+		}
+	}
+
+	// Emit final progress so TUI shows 100%.
+	if progress != nil {
+		progress(int(filesCompleted.Load()), filesTotal, int(chunksCompleted.Load()), totalChunks)
+	}
+
+	return result
 }
 
 // Stats returns aggregate latency information for all known peers.

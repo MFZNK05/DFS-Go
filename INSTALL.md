@@ -1,6 +1,6 @@
-# Installing Hermond
+# Installing Hermod
 
-Hermond is available for **Linux**, **macOS**, and **Windows** on both `amd64` (x86_64) and `arm64` (Apple Silicon / ARM) architectures.
+Hermod is available for **Linux**, **macOS**, and **Windows** on both `amd64` (x86_64) and `arm64` (Apple Silicon / ARM) architectures.
 
 Choose the method that suits your platform:
 
@@ -32,7 +32,7 @@ wget -qO- https://raw.githubusercontent.com/MFZNK05/DFS-Go/main/install.sh | sh
 2. Fetches the latest release from GitHub
 3. Downloads the `.tar.gz` archive and `checksums.txt`
 4. Verifies the SHA-256 checksum
-5. Extracts the `hermond` binary
+5. Extracts the `hermod` binary
 6. Installs to `/usr/local/bin` (if writable) or `~/.local/bin` (fallback)
 
 ### After installation
@@ -59,7 +59,7 @@ source ~/.bashrc   # or source ~/.zshrc
 ### Verify
 
 ```sh
-hermond version
+hermod version
 ```
 
 ---
@@ -67,33 +67,33 @@ hermond version
 ## Method 2: Homebrew (macOS & Linux)
 
 ```sh
-brew install MFZNK05/hermond/hermond
+brew install MFZNK05/hermod/hermod
 ```
 
 Or in two steps:
 
 ```sh
-brew tap MFZNK05/hermond
-brew install hermond
+brew tap MFZNK05/hermod
+brew install hermod
 ```
 
 ### Upgrade
 
 ```sh
-brew upgrade hermond
+brew upgrade hermod
 ```
 
 ### Uninstall
 
 ```sh
-brew uninstall hermond
-brew untap MFZNK05/hermond
+brew uninstall hermod
+brew untap MFZNK05/hermod
 ```
 
 ### Verify
 
 ```sh
-hermond version
+hermod version
 ```
 
 ---
@@ -106,12 +106,12 @@ Download the appropriate archive from the [GitHub Releases page](https://github.
 
 | Platform | Architecture | Filename |
 |----------|-------------|----------|
-| Linux | x86_64 | `hermond_<version>_linux_amd64.tar.gz` |
-| Linux | ARM64 | `hermond_<version>_linux_arm64.tar.gz` |
-| macOS | Intel | `hermond_<version>_darwin_amd64.tar.gz` |
-| macOS | Apple Silicon | `hermond_<version>_darwin_arm64.tar.gz` |
-| Windows | x86_64 | `hermond_<version>_windows_amd64.zip` |
-| Windows | ARM64 | `hermond_<version>_windows_arm64.zip` |
+| Linux | x86_64 | `hermod_<version>_linux_amd64.tar.gz` |
+| Linux | ARM64 | `hermod_<version>_linux_arm64.tar.gz` |
+| macOS | Intel | `hermod_<version>_darwin_amd64.tar.gz` |
+| macOS | Apple Silicon | `hermod_<version>_darwin_arm64.tar.gz` |
+| Windows | x86_64 | `hermod_<version>_windows_amd64.zip` |
+| Windows | ARM64 | `hermod_<version>_windows_arm64.zip` |
 
 ---
 
@@ -119,21 +119,21 @@ Download the appropriate archive from the [GitHub Releases page](https://github.
 
 ```sh
 # Download (replace <version> with the actual version, e.g. 0.1.3)
-curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermond_<version>_linux_amd64.tar.gz
+curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermod_<version>_linux_amd64.tar.gz
 
 # Extract
-tar -xzf hermond_<version>_linux_amd64.tar.gz
+tar -xzf hermod_<version>_linux_amd64.tar.gz
 
 # Move to a directory in your PATH
-sudo mv hermond /usr/local/bin/
+sudo mv hermod /usr/local/bin/
 
 # Or without sudo:
 mkdir -p ~/.local/bin
-mv hermond ~/.local/bin/
+mv hermod ~/.local/bin/
 # Add ~/.local/bin to PATH if not already (see "After installation" above)
 
 # Verify
-hermond version
+hermod version
 ```
 
 ---
@@ -142,23 +142,23 @@ hermond version
 
 **Intel Mac:**
 ```sh
-curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermond_<version>_darwin_amd64.tar.gz
-tar -xzf hermond_<version>_darwin_amd64.tar.gz
-sudo mv hermond /usr/local/bin/
-hermond version
+curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermod_<version>_darwin_amd64.tar.gz
+tar -xzf hermod_<version>_darwin_amd64.tar.gz
+sudo mv hermod /usr/local/bin/
+hermod version
 ```
 
 **Apple Silicon (M1/M2/M3/M4):**
 ```sh
-curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermond_<version>_darwin_arm64.tar.gz
-tar -xzf hermond_<version>_darwin_arm64.tar.gz
-sudo mv hermond /usr/local/bin/
-hermond version
+curl -LO https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermod_<version>_darwin_arm64.tar.gz
+tar -xzf hermod_<version>_darwin_arm64.tar.gz
+sudo mv hermod /usr/local/bin/
+hermod version
 ```
 
 **macOS Gatekeeper note:** If macOS blocks the binary with "cannot be opened because the developer cannot be verified", run:
 ```sh
-xattr -d com.apple.quarantine /usr/local/bin/hermond
+xattr -d com.apple.quarantine /usr/local/bin/hermod
 ```
 
 ---
@@ -166,37 +166,37 @@ xattr -d com.apple.quarantine /usr/local/bin/hermond
 ### Windows
 
 1. Go to the [Releases page](https://github.com/MFZNK05/DFS-Go/releases/latest)
-2. Download `hermond_<version>_windows_amd64.zip` (or `arm64` for ARM devices)
+2. Download `hermod_<version>_windows_amd64.zip` (or `arm64` for ARM devices)
 3. Extract the `.zip` file (right-click > "Extract All" or use 7-Zip)
-4. Move `hermond.exe` to a permanent location, e.g.:
+4. Move `hermod.exe` to a permanent location, e.g.:
    ```
-   C:\Program Files\hermond\hermond.exe
+   C:\Program Files\hermod\hermod.exe
    ```
 5. Add the folder to your system PATH:
    - Press `Win + R`, type `sysdm.cpl`, press Enter
    - Go to **Advanced** tab > **Environment Variables**
    - Under **System variables**, find `Path`, click **Edit**
-   - Click **New** and add: `C:\Program Files\hermond`
+   - Click **New** and add: `C:\Program Files\hermod`
    - Click **OK** on all dialogs
 6. Open a **new** Command Prompt or PowerShell and verify:
    ```
-   hermond version
+   hermod version
    ```
 
 **PowerShell alternative** (no GUI needed):
 ```powershell
 # Download
-Invoke-WebRequest -Uri "https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermond_<version>_windows_amd64.zip" -OutFile hermond.zip
+Invoke-WebRequest -Uri "https://github.com/MFZNK05/DFS-Go/releases/download/v<version>/hermod_<version>_windows_amd64.zip" -OutFile hermod.zip
 
 # Extract
-Expand-Archive hermond.zip -DestinationPath "$env:LOCALAPPDATA\hermond"
+Expand-Archive hermod.zip -DestinationPath "$env:LOCALAPPDATA\hermod"
 
 # Add to PATH (current user, persistent)
 $p = [Environment]::GetEnvironmentVariable("Path", "User")
-[Environment]::SetEnvironmentVariable("Path", "$p;$env:LOCALAPPDATA\hermond", "User")
+[Environment]::SetEnvironmentVariable("Path", "$p;$env:LOCALAPPDATA\hermod", "User")
 
 # Restart your terminal, then:
-hermond version
+hermod version
 ```
 
 ---
@@ -207,18 +207,18 @@ Every release includes a `checksums.txt` file with SHA-256 hashes for all archiv
 
 **Linux:**
 ```sh
-sha256sum hermond_<version>_linux_amd64.tar.gz
+sha256sum hermod_<version>_linux_amd64.tar.gz
 # Compare output with the hash in checksums.txt
 ```
 
 **macOS:**
 ```sh
-shasum -a 256 hermond_<version>_darwin_arm64.tar.gz
+shasum -a 256 hermod_<version>_darwin_arm64.tar.gz
 ```
 
 **Windows (PowerShell):**
 ```powershell
-Get-FileHash hermond_<version>_windows_amd64.zip -Algorithm SHA256
+Get-FileHash hermod_<version>_windows_amd64.zip -Algorithm SHA256
 ```
 
 ---
@@ -227,16 +227,16 @@ Get-FileHash hermond_<version>_windows_amd64.zip -Algorithm SHA256
 
 **One-liner / manual install:**
 ```sh
-rm $(which hermond)
+rm $(which hermod)
 ```
 
 **Homebrew:**
 ```sh
-brew uninstall hermond
+brew uninstall hermod
 ```
 
 **Windows:**
-Delete `hermond.exe` and remove the folder from your PATH environment variable.
+Delete `hermod.exe` and remove the folder from your PATH environment variable.
 
 ---
 
@@ -244,8 +244,8 @@ Delete `hermond.exe` and remove the folder from your PATH environment variable.
 
 | Problem | Solution |
 |---------|----------|
-| `command not found: hermond` | The binary isn't in your PATH. Check where it was installed and add that directory to PATH. |
-| macOS "developer cannot be verified" | Run `xattr -d com.apple.quarantine /usr/local/bin/hermond` |
+| `command not found: hermod` | The binary isn't in your PATH. Check where it was installed and add that directory to PATH. |
+| macOS "developer cannot be verified" | Run `xattr -d com.apple.quarantine /usr/local/bin/hermod` |
 | Permission denied on `/usr/local/bin` | Use `sudo mv` or install to `~/.local/bin` instead |
-| Windows "not recognized as a command" | Open a **new** terminal after editing PATH. Verify the folder containing `hermond.exe` is in your PATH. |
+| Windows "not recognized as a command" | Open a **new** terminal after editing PATH. Verify the folder containing `hermod.exe` is in your PATH. |
 | Checksum mismatch | Re-download the archive. If it persists, report it as an issue. |

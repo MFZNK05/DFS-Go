@@ -2,6 +2,8 @@ package mdns
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -15,7 +17,7 @@ type DiscoveredPeer struct {
 	Addr        string `json:"addr"` // host:port
 }
 
-// Scan performs an mDNS query on the LAN for Hermond nodes.
+// Scan performs an mDNS query on the LAN for Hermod nodes.
 // Returns discovered peers within the given timeout.
 func Scan(timeout time.Duration) ([]DiscoveredPeer, error) {
 	ch := make(chan *hmdns.ServiceEntry, 16)
@@ -36,6 +38,7 @@ func Scan(timeout time.Duration) ([]DiscoveredPeer, error) {
 	params.Entries = ch
 	params.Timeout = timeout
 	params.DisableIPv6 = true
+	params.Logger = log.New(io.Discard, "", 0)
 
 	err := hmdns.Query(params)
 	close(ch)

@@ -9,7 +9,7 @@ import (
 
 // DefaultConfig returns a production-ready failure detection configuration.
 const (
-	DefaultHeartbeatInterval = 1 * time.Second
+	DefaultHeartbeatInterval = 5 * time.Second
 	DefaultSuspectThreshold  = 8.0
 	DefaultDeadTimeout       = 30 * time.Second
 	DefaultWindowSize        = 200

@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">Hermond</h1>
+  <h1 align="center">Hermod</h1>
   <p align="center">
     The Swift P2P Data Herald
     <br />
@@ -17,22 +17,22 @@
 
 ---
 
-## What is Hermond?
+## What is Hermod?
 
-**Hermond** is a high-performance, decentralized file-sharing system built for campus LANs. It turns every machine on the network into a peer that can store, share, and retrieve files — no central server needed.
+**Hermod** is a high-performance, decentralized file-sharing system built for campus LANs. It turns every machine on the network into a peer that can store, share, and retrieve files — no central server needed.
 
 Think of it as a modern take on DC++ — but with end-to-end encryption, automatic peer discovery, and a real terminal UI.
 
-### Why Hermond?
+### Why Hermod?
 
-Moving large files on a campus network shouldn't require cloud uploads, USB drives, or sketchy FTP servers. Hermond lets you share game folders, movies, datasets, and project archives directly between machines at the full speed of your local network.
+Moving large files on a campus network shouldn't require cloud uploads, USB drives, or sketchy FTP servers. Hermod lets you share game folders, movies, datasets, and project archives directly between machines at the full speed of your local network.
 
 **What sets it apart:**
 
 - **Encrypted Direct Send** — Push files directly to a specific person using ECDH (X25519) encryption. Only the intended recipient can decrypt the data. No server ever sees the plaintext.
 - **LAN-Speed Transfers** — Built on QUIC with adaptive bandwidth management. Multi-GB transfers run at the physical limits of your network without saturating it for everyone else.
 - **Zero-Config Discovery** — Nodes find each other via gossip protocol. No IP addresses to type, no config files to edit. Join the swarm and start sharing.
-- **Persistent & Resumable** — Close your laptop mid-transfer? Hermond remembers exactly which chunks were downloaded and picks up where it left off.
+- **Persistent & Resumable** — Close your laptop mid-transfer? Hermod remembers exactly which chunks were downloaded and picks up where it left off.
 
 ---
 
@@ -53,7 +53,7 @@ Moving large files on a campus network shouldn't require cloud uploads, USB driv
 
 ## Installation
 
-Hermond ships as a single, statically-linked binary. No runtime dependencies.
+Hermod ships as a single, statically-linked binary. No runtime dependencies.
 
 ### One-Liner (Linux & macOS)
 
@@ -64,7 +64,7 @@ curl -sSfL https://raw.githubusercontent.com/MFZNK05/DFS-Go/main/install.sh | sh
 ### Homebrew (macOS & Linux)
 
 ```sh
-brew install MFZNK05/hermond/hermond
+brew install MFZNK05/hermod/hermod
 ```
 
 ### Manual Download (All Platforms)
@@ -73,12 +73,12 @@ Download the archive for your platform from the [Releases page](https://github.c
 
 | Platform | Architecture | Archive |
 |----------|-------------|---------|
-| Linux | x86_64 | `hermond_<ver>_linux_amd64.tar.gz` |
-| Linux | ARM64 | `hermond_<ver>_linux_arm64.tar.gz` |
-| macOS | Intel | `hermond_<ver>_darwin_amd64.tar.gz` |
-| macOS | Apple Silicon | `hermond_<ver>_darwin_arm64.tar.gz` |
-| Windows | x86_64 | `hermond_<ver>_windows_amd64.zip` |
-| Windows | ARM64 | `hermond_<ver>_windows_arm64.zip` |
+| Linux | x86_64 | `hermod_<ver>_linux_amd64.tar.gz` |
+| Linux | ARM64 | `hermod_<ver>_linux_arm64.tar.gz` |
+| macOS | Intel | `hermod_<ver>_darwin_amd64.tar.gz` |
+| macOS | Apple Silicon | `hermod_<ver>_darwin_arm64.tar.gz` |
+| Windows | x86_64 | `hermod_<ver>_windows_amd64.zip` |
+| Windows | ARM64 | `hermod_<ver>_windows_arm64.zip` |
 
 Extract the binary, move it to a directory in your PATH, and you're done.
 
@@ -87,7 +87,7 @@ Extract the binary, move it to a directory in your PATH, and you're done.
 ### Verify
 
 ```sh
-hermond version
+hermod version
 ```
 
 ---
@@ -99,21 +99,21 @@ hermond version
 Every node needs a keypair for encryption and peer identification:
 
 ```sh
-hermond identity init --alias "alice"
+hermod identity init --alias "alice"
 ```
 
-### 2. Launch Hermond
+### 2. Launch Hermod
 
 Run without arguments to start the daemon and open the TUI:
 
 ```sh
-hermond --port :3000
+hermod --port :3000
 ```
 
 On another machine, join the first node:
 
 ```sh
-hermond --port :4000 --peer <alice-ip>:3000
+hermod --port :4000 --peer <alice-ip>:3000
 ```
 
 Nodes discover each other automatically from there — no need to manually connect every pair.
@@ -122,23 +122,23 @@ Nodes discover each other automatically from there — no need to manually conne
 
 ```sh
 # Upload a file (visible to the whole network)
-hermond upload --name "movie.mkv" --file ./movie.mkv --public
+hermod upload --name "movie.mkv" --file ./movie.mkv --public
 
 # Upload a directory
-hermond upload --name "game-folder" --dir ./Elden\ Ring/ --public
+hermod upload --name "game-folder" --dir ./Elden\ Ring/ --public
 
 # Encrypt and share with a specific person
-hermond upload --name "notes.pdf" --file ./notes.pdf --share-with bob
+hermod upload --name "notes.pdf" --file ./notes.pdf --share-with bob
 
 # Download from the network
-hermond download --name "movie.mkv" --output ./movie.mkv --from alice
+hermod download --name "movie.mkv" --output ./movie.mkv --from alice
 ```
 
 ---
 
 ## The TUI
 
-Launch the full-screen terminal dashboard with `hermond` (or `hermond tui` to connect to a running daemon).
+Launch the full-screen terminal dashboard with `hermod` (or `hermod tui` to connect to a running daemon).
 
 ### Network Tab
 
@@ -179,12 +179,12 @@ All commands support the `--node` flag (default `:3000`) to target a specific lo
 
 | Command | Description |
 |---------|-------------|
-| `hermond` | Start daemon + launch TUI |
-| `hermond upload --name <n> --file <f>` | Upload a file to the network |
-| `hermond upload --name <n> --dir <d>` | Upload a directory |
-| `hermond download --name <n> --output <o>` | Download a file or directory |
-| `hermond send <file-key> <peer>` | Direct-send a file to a specific peer |
-| `hermond search <query>` | Flood-search the network for files |
+| `hermod` | Start daemon + launch TUI |
+| `hermod upload --name <n> --file <f>` | Upload a file to the network |
+| `hermod upload --name <n> --dir <d>` | Upload a directory |
+| `hermod download --name <n> --output <o>` | Download a file or directory |
+| `hermod send <file-key> <peer>` | Direct-send a file to a specific peer |
+| `hermod search <query>` | Flood-search the network for files |
 
 ### Upload Flags
 
@@ -210,36 +210,36 @@ All commands support the `--node` flag (default `:3000`) to target a specific lo
 
 | Command | Description |
 |---------|-------------|
-| `hermond peers` | List connected peers |
-| `hermond browse <peer-addr>` | Browse a peer's public files |
-| `hermond status` | Show node status (uptime, peer count, files) |
-| `hermond connect <addr-or-alias>` | Manually connect to a peer |
+| `hermod peers` | List connected peers |
+| `hermod browse <peer-addr>` | Browse a peer's public files |
+| `hermod status` | Show node status (uptime, peer count, files) |
+| `hermod connect <addr-or-alias>` | Manually connect to a peer |
 
 ### Transfer Management
 
 | Command | Description |
 |---------|-------------|
-| `hermond transfers` | List all active transfers |
-| `hermond pause <id>` | Pause a transfer |
-| `hermond resume <id>` | Resume a paused transfer |
-| `hermond cancel <id>` | Cancel a transfer |
+| `hermod transfers` | List all active transfers |
+| `hermod pause <id>` | Pause a transfer |
+| `hermod resume <id>` | Resume a paused transfer |
+| `hermod cancel <id>` | Cancel a transfer |
 
 ### File Management
 
 | Command | Description |
 |---------|-------------|
-| `hermond list uploads` | Show upload history (`--public` / `--private` filters) |
-| `hermond list downloads` | Show download history |
-| `hermond list public` | Show public file catalog |
-| `hermond remove <name>` | Remove a file (propagates tombstone across cluster) |
+| `hermod list uploads` | Show upload history (`--public` / `--private` filters) |
+| `hermod list downloads` | Show download history |
+| `hermod list public` | Show public file catalog |
+| `hermod remove <name>` | Remove a file (propagates tombstone across cluster) |
 
 ### Identity
 
 | Command | Description |
 |---------|-------------|
-| `hermond identity init --alias <name>` | Generate a new Ed25519 + X25519 keypair |
-| `hermond identity show` | Display fingerprint, alias, and public keys |
-| `hermond version` | Print version, commit, and build date |
+| `hermod identity init --alias <name>` | Generate a new Ed25519 + X25519 keypair |
+| `hermod identity show` | Display fingerprint, alias, and public keys |
+| `hermod version` | Print version, commit, and build date |
 
 ---
 
@@ -248,7 +248,7 @@ All commands support the `--node` flag (default `:3000`) to target a specific lo
 ### Upload Flow
 
 ```
-hermond upload --name "report.pdf" --file ./report.pdf --public
+hermod upload --name "report.pdf" --file ./report.pdf --public
               |
               v
   1. File split into 4 MB chunks, each SHA-256 hashed
@@ -264,7 +264,7 @@ hermond upload --name "report.pdf" --file ./report.pdf --public
 ### Download Flow
 
 ```
-hermond download --name "report.pdf" --output ./out.pdf --from alice
+hermod download --name "report.pdf" --output ./out.pdf --from alice
               |
               v
   1. Fetch ChunkManifest from local store or peers
@@ -294,7 +294,7 @@ Node starts
 
 ```
 +-------------------------------------------------------------------+
-|                         Hermond Node                              |
+|                         Hermod Node                              |
 |                                                                   |
 |  +----------+    +-----------+    +---------------------------+   |
 |  | TUI      |--->| IPC       |--->|  Server (orchestrator)    |   |
@@ -329,7 +329,7 @@ Node starts
 
 ## Package Reference
 
-Hermond is organized into isolated sub-packages with no circular dependencies.
+Hermod is organized into isolated sub-packages with no circular dependencies.
 
 ### Core
 
@@ -412,7 +412,7 @@ Hermond is organized into isolated sub-packages with no circular dependencies.
 
 ### End-to-End Encryption (ECDH)
 
-When you use `--share-with`, Hermond performs a full Diffie-Hellman key exchange:
+When you use `--share-with`, Hermod performs a full Diffie-Hellman key exchange:
 
 1. A random **256-bit DEK** (Data Encryption Key) is generated per file
 2. The file is encrypted with **AES-256-GCM** in 4 MB streaming chunks
@@ -461,8 +461,8 @@ Each node has a unique cryptographic identity:
 ```sh
 git clone https://github.com/MFZNK05/DFS-Go.git
 cd DFS-Go
-go build -o hermond .
-./hermond version
+go build -o hermod .
+./hermod version
 ```
 
 ### Running Tests

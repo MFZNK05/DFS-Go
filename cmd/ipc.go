@@ -42,41 +42,14 @@ const (
 	opcodeListInbox          = ipc.OpListInbox
 	opcodeUnblockPeer        = ipc.OpUnblockPeer
 	opcodeScanLAN            = ipc.OpScanLAN
-	statusOK                 = ipc.StatusOK
-	statusError              = ipc.StatusError
-	statusProgress           = ipc.StatusProgress
+	opcodeSeedUpload     = ipc.OpSeedUpload
+	opcodeSeedECDHUpload = ipc.OpSeedECDHUpload
+	opcodeShutdown       = ipc.OpShutdown
+	statusOK             = ipc.StatusOK
+	statusError          = ipc.StatusError
 )
 
 // ── Plaintext upload (0x01) ──────────────────────────────────────────
-
-func writeUploadRequest(conn net.Conn, key string, fileSize int64, public bool) error {
-	keyBytes := []byte(key)
-	if len(keyBytes) > 0xFFFF {
-		return fmt.Errorf("key too long (max 65535 bytes)")
-	}
-	if _, err := conn.Write([]byte{opcodeUpload}); err != nil {
-		return err
-	}
-	var klen [2]byte
-	binary.BigEndian.PutUint16(klen[:], uint16(len(keyBytes)))
-	if _, err := conn.Write(klen[:]); err != nil {
-		return err
-	}
-	if _, err := conn.Write(keyBytes); err != nil {
-		return err
-	}
-	var sz [8]byte
-	binary.BigEndian.PutUint64(sz[:], uint64(fileSize))
-	if _, err := conn.Write(sz[:]); err != nil {
-		return err
-	}
-	pubByte := byte(0x00)
-	if public {
-		pubByte = 0x01
-	}
-	_, err := conn.Write([]byte{pubByte})
-	return err
-}
 
 func readUploadRequest(conn net.Conn) (key string, fileSize int64, public bool, err error) {
 	var klenBuf [2]byte
@@ -202,54 +175,6 @@ func readDownloadRequest(conn net.Conn) (key string, err error) {
 // ── ECDH Upload (0x03) ───────────────────────────────────────────────
 
 type ecdhUploadRequest = ipc.ECDHUploadRequest
-
-func writeECDHUploadRequest(conn net.Conn, req ecdhUploadRequest) error {
-	if _, err := conn.Write([]byte{opcodeECDHUpload}); err != nil {
-		return err
-	}
-	if err := writeString16(conn, req.StorageKey); err != nil {
-		return err
-	}
-	if len(req.DEK) != 32 {
-		return fmt.Errorf("DEK must be 32 bytes, got %d", len(req.DEK))
-	}
-	if _, err := conn.Write(req.DEK); err != nil {
-		return err
-	}
-	if err := writeString16(conn, req.OwnerPubKey); err != nil {
-		return err
-	}
-	if err := writeString16(conn, req.OwnerEdPubKey); err != nil {
-		return err
-	}
-	var count [2]byte
-	binary.BigEndian.PutUint16(count[:], uint16(len(req.AccessList)))
-	if _, err := conn.Write(count[:]); err != nil {
-		return err
-	}
-	for _, entry := range req.AccessList {
-		if err := writeString16(conn, entry.RecipientPubKey); err != nil {
-			return err
-		}
-		if err := writeString16(conn, entry.WrappedDEK); err != nil {
-			return err
-		}
-	}
-	if err := writeString16(conn, req.Signature); err != nil {
-		return err
-	}
-	var sz [8]byte
-	binary.BigEndian.PutUint64(sz[:], uint64(req.FileSize))
-	if _, err := conn.Write(sz[:]); err != nil {
-		return err
-	}
-	pubByte := byte(0x00)
-	if req.Public {
-		pubByte = 0x01
-	}
-	_, err := conn.Write([]byte{pubByte})
-	return err
-}
 
 func readECDHUploadRequest(conn net.Conn) (*ecdhUploadRequest, error) {
 	storageKey, err := readString16(conn)
@@ -817,6 +742,194 @@ func readECDHDirDownloadRequest(conn net.Conn) (key, outputDir string, dek []byt
 	return
 }
 
+// ── Seed In Place Upload (0x20) ─────────────────────────────────────
+// Wire: [0x20][2B keyLen][key][2B pathLen][path][8B fileSize][1B public]
+// CLI sends the file path — daemon opens it directly (no data over IPC).
+
+func writeSeedUploadRequest(conn net.Conn, key, filePath string, fileSize int64, public bool) error {
+	if _, err := conn.Write([]byte{opcodeSeedUpload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, key); err != nil {
+		return err
+	}
+	if err := writeString16(conn, filePath); err != nil {
+		return err
+	}
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(fileSize))
+	if _, err := conn.Write(sz[:]); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if public {
+		pubByte = 0x01
+	}
+	_, err := conn.Write([]byte{pubByte})
+	return err
+}
+
+func readSeedUploadRequest(conn net.Conn) (key, filePath string, fileSize int64, public bool, err error) {
+	key, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	filePath, err = readString16(conn)
+	if err != nil {
+		return
+	}
+	var szBuf [8]byte
+	if _, err = io.ReadFull(conn, szBuf[:]); err != nil {
+		return
+	}
+	fileSize = int64(binary.BigEndian.Uint64(szBuf[:]))
+	var pubBuf [1]byte
+	if _, err = io.ReadFull(conn, pubBuf[:]); err != nil {
+		return
+	}
+	public = pubBuf[0] == 0x01
+	return
+}
+
+// ── Seed In Place ECDH Upload (0x21) ────────────────────────────────
+// Wire: [0x21][2B keyLen][key][2B pathLen][path][8B fileSize][1B public]
+//       [32B DEK][2B ownerPubLen][ownerPub][2B ownerEdPubLen][ownerEdPub]
+//       [2B sigLen][sig][2B accessCount]
+//       for each: [2B recipPubLen][recipPub][2B wrappedDEKLen][wrappedDEK]
+
+type seedECDHUploadRequest struct {
+	Key           string
+	FilePath      string
+	FileSize      int64
+	DEK           []byte
+	OwnerPubKey   string
+	OwnerEdPubKey string
+	AccessList    []chunker.AccessEntry
+	Signature     string
+	Public        bool
+}
+
+func writeSeedECDHUploadRequest(conn net.Conn, req seedECDHUploadRequest) error {
+	if _, err := conn.Write([]byte{opcodeSeedECDHUpload}); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.Key); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.FilePath); err != nil {
+		return err
+	}
+	var sz [8]byte
+	binary.BigEndian.PutUint64(sz[:], uint64(req.FileSize))
+	if _, err := conn.Write(sz[:]); err != nil {
+		return err
+	}
+	pubByte := byte(0x00)
+	if req.Public {
+		pubByte = 0x01
+	}
+	if _, err := conn.Write([]byte{pubByte}); err != nil {
+		return err
+	}
+	// DEK (32 bytes)
+	if _, err := conn.Write(req.DEK); err != nil {
+		return err
+	}
+	// Owner keys + signature
+	if err := writeString16(conn, req.OwnerPubKey); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.OwnerEdPubKey); err != nil {
+		return err
+	}
+	if err := writeString16(conn, req.Signature); err != nil {
+		return err
+	}
+	// Access list
+	var acLen [2]byte
+	binary.BigEndian.PutUint16(acLen[:], uint16(len(req.AccessList)))
+	if _, err := conn.Write(acLen[:]); err != nil {
+		return err
+	}
+	for _, ae := range req.AccessList {
+		if err := writeString16(conn, ae.RecipientPubKey); err != nil {
+			return err
+		}
+		if err := writeString16(conn, ae.WrappedDEK); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readSeedECDHUploadRequest(conn net.Conn) (*seedECDHUploadRequest, error) {
+	key, err := readString16(conn)
+	if err != nil {
+		return nil, err
+	}
+	filePath, err := readString16(conn)
+	if err != nil {
+		return nil, err
+	}
+	var szBuf [8]byte
+	if _, err := io.ReadFull(conn, szBuf[:]); err != nil {
+		return nil, err
+	}
+	fileSize := int64(binary.BigEndian.Uint64(szBuf[:]))
+	var pubBuf [1]byte
+	if _, err := io.ReadFull(conn, pubBuf[:]); err != nil {
+		return nil, err
+	}
+	// DEK
+	dek := make([]byte, 32)
+	if _, err := io.ReadFull(conn, dek); err != nil {
+		return nil, err
+	}
+	ownerPub, err := readString16(conn)
+	if err != nil {
+		return nil, err
+	}
+	ownerEdPub, err := readString16(conn)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := readString16(conn)
+	if err != nil {
+		return nil, err
+	}
+	var acLenBuf [2]byte
+	if _, err := io.ReadFull(conn, acLenBuf[:]); err != nil {
+		return nil, err
+	}
+	acLen := binary.BigEndian.Uint16(acLenBuf[:])
+	accessList := make([]chunker.AccessEntry, acLen)
+	for i := range accessList {
+		rp, rpErr := readString16(conn)
+		if rpErr != nil {
+			return nil, rpErr
+		}
+		wd, wdErr := readString16(conn)
+		if wdErr != nil {
+			return nil, wdErr
+		}
+		accessList[i] = chunker.AccessEntry{
+			RecipientPubKey: rp,
+			WrappedDEK:      wd,
+		}
+	}
+	return &seedECDHUploadRequest{
+		Key:           key,
+		FilePath:      filePath,
+		FileSize:      fileSize,
+		DEK:           dek,
+		OwnerPubKey:   ownerPub,
+		OwnerEdPubKey: ownerEdPub,
+		AccessList:    accessList,
+		Signature:     sig,
+		Public:        pubBuf[0] == 0x01,
+	}, nil
+}
+
 // ── Transfer control opcodes ─────────────────────────────────────────
 
 func writeListTransfersRequest(conn net.Conn) error {
@@ -863,18 +976,3 @@ func writeSearchRequest(conn net.Conn, query string) error {
 	return writeString16(conn, query)
 }
 
-// ── Peer management (0x19, 0x1A) ────────────────────────────────────
-
-func writeConnectPeerRequest(conn net.Conn, addr string) error {
-	if _, err := conn.Write([]byte{opcodeConnectPeer}); err != nil {
-		return err
-	}
-	return writeString16(conn, addr)
-}
-
-func writeDisconnectPeerRequest(conn net.Conn, addr string) error {
-	if _, err := conn.Write([]byte{opcodeDisconnectPeer}); err != nil {
-		return err
-	}
-	return writeString16(conn, addr)
-}

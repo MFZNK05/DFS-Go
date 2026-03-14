@@ -11,7 +11,7 @@ var disconnectNode string
 var disconnectCmd = &cobra.Command{
 	Use:   "disconnect <addr-or-alias>",
 	Short: "Disconnect and blocklist a peer",
-	Long:  "Disconnects from a peer and adds it to the local blocklist so it won't reconnect automatically. Use 'hermond unblock' to reverse.",
+	Long:  "Disconnects from a peer and adds it to the local blocklist so it won't reconnect automatically. Use 'hermod unblock' to reverse.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		conn, err := ipcDial(socketPath(disconnectNode))

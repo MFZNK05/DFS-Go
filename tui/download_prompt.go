@@ -42,7 +42,7 @@ func (d *DownloadPrompt) Update(msg tea.KeyMsg) tea.Cmd {
 		d.Close()
 		return nil
 	case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
-		outDir := strings.TrimSpace(d.OutputDir)
+		outDir := strings.TrimSpace(sanitizeInput(d.OutputDir))
 		if outDir == "" {
 			outDir = "."
 		}
@@ -65,7 +65,7 @@ func (d *DownloadPrompt) Update(msg tea.KeyMsg) tea.Cmd {
 		}
 	default:
 		if msg.Paste && len(msg.Runes) > 0 {
-			pasted := strings.ReplaceAll(string(msg.Runes), "\n", "")
+			pasted := sanitizeInput(string(msg.Runes))
 			d.OutputDir += pasted
 		} else {
 			r := msg.String()

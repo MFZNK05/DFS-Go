@@ -3,6 +3,7 @@ package tabs
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Faizan2005/DFS-Go/ipc"
 	"github.com/Faizan2005/DFS-Go/tui/components"
@@ -48,12 +49,13 @@ type TransfersTab struct {
 
 func NewTransfersTab() *TransfersTab {
 	cols := []components.Column{
-		{Title: "Dir", Width: 4},
-		{Title: "Name", Width: 20},
-		{Title: "Status", Width: 10},
-		{Title: "Progress", Width: 14},
+		{Title: "Dir", Width: 3},
+		{Title: "Name", Width: 18},
+		{Title: "Status", Width: 8},
+		{Title: "Progress", Width: 16},
+		{Title: "Transferred", Width: 14},
 		{Title: "Speed", Width: 10},
-		{Title: "Size", Width: 10},
+		{Title: "ETA", Width: 8},
 	}
 	return &TransfersTab{
 		table: components.NewTable(cols, "No active transfers"),
@@ -80,8 +82,9 @@ func (t *TransfersTab) SetTransfers(transfers []ipc.TransferInfo) {
 			tr.Name,
 			statusLabel(tr.Status),
 			progressBar(tr.Completed, tr.Total, 10),
+			formatTransferred(tr.BytesDone, tr.Size),
 			formatSpeed(tr.Speed),
-			formatSize(tr.Size),
+			formatETA(tr.BytesDone, tr.Size, tr.Speed),
 		}
 	}
 	t.table.SetRows(rows)
@@ -199,6 +202,32 @@ func progressBar(completed, total, width int) string {
 	}
 	return progressFull.Render(strings.Repeat("█", filled)) +
 		progressEmpty.Render(strings.Repeat("░", width-filled))
+}
+
+func formatTransferred(bytesDone, totalSize int64) string {
+	if totalSize <= 0 {
+		return formatSize(bytesDone)
+	}
+	pct := int(float64(bytesDone) * 100 / float64(totalSize))
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%s/%s %d%%", formatSize(bytesDone), formatSize(totalSize), pct)
+}
+
+func formatETA(bytesDone, totalSize int64, speed float64) string {
+	if speed <= 0 || bytesDone >= totalSize {
+		return "-"
+	}
+	remaining := float64(totalSize-bytesDone) / speed
+	d := time.Duration(remaining * float64(time.Second))
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 func formatSpeed(bytesPerSec float64) string {

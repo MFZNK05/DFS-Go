@@ -1,7 +1,7 @@
 // Package identity manages per-node Ed25519 + X25519 keypairs for ECDH sharing.
 //
 // Each node generates an identity once with Generate and stores it at
-// ~/.hermond/identity.json. The Ed25519 key signs manifests (proves authorship),
+// ~/.hermod/identity.json. The Ed25519 key signs manifests (proves authorship),
 // the X25519 key is used for ECDH key agreement (wraps DEKs for recipients).
 //
 // Public keys are injected into gossip via GossipMetadata so other nodes can
@@ -31,10 +31,10 @@ type Identity struct {
 }
 
 // DefaultPath returns the identity file path.
-// If HERMOND_IDENTITY_PATH is set, it is used; otherwise ~/.hermond/identity.json.
+// If HERMOD_IDENTITY_PATH is set, it is used; otherwise ~/.hermod/identity.json.
 // Falls back to DFS_IDENTITY_PATH for backward compatibility.
 func DefaultPath() string {
-	if p := os.Getenv("HERMOND_IDENTITY_PATH"); p != "" {
+	if p := os.Getenv("HERMOD_IDENTITY_PATH"); p != "" {
 		return p
 	}
 	if p := os.Getenv("DFS_IDENTITY_PATH"); p != "" {
@@ -42,9 +42,9 @@ func DefaultPath() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(".", ".hermond", "identity.json")
+		return filepath.Join(".", ".hermod", "identity.json")
 	}
-	return filepath.Join(home, ".hermond", "identity.json")
+	return filepath.Join(home, ".hermod", "identity.json")
 }
 
 // Generate creates a new identity with the given alias.

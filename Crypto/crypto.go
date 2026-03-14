@@ -20,8 +20,12 @@ const ChunkSize = 4 * 1024 * 1024
 
 // EncryptStreamWithDEK encrypts data from src to dst using the provided DEK directly.
 // Same streaming format: [4B chunk size][12B nonce][ciphertext+tag].
-// Nonces are deterministic from chunk index. Does NOT wrap the key.
-func EncryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error {
+// nonceOffset is the file-level chunk index — it shifts the internal nonce counter
+// so that each file-level chunk gets a unique nonce even though each call typically
+// processes only one 4MB internal chunk. Without this, every call would start at
+// nonce=0, creating a two-time pad when the same DEK encrypts multiple chunks.
+// Nonces are deterministic: chunk N always gets nonce=nonceOffset+0, +1, etc.
+func EncryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte, nonceOffset uint64) error {
 	block, err := aes.NewCipher(dek)
 	if err != nil {
 		return err
@@ -34,7 +38,7 @@ func EncryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error {
 
 	nonceSize := gcm.NonceSize()
 	buffer := make([]byte, ChunkSize)
-	chunkIndex := uint64(0)
+	chunkIndex := nonceOffset
 
 	for {
 		n, readErr := io.ReadFull(src, buffer)
@@ -68,9 +72,10 @@ func EncryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error {
 
 // EncryptStreamWithDEKPool is like EncryptStreamWithDEK but borrows a slab
 // from pool for gcm.Seal output, eliminating per-chunk heap allocations.
-func EncryptStreamWithDEKPool(src io.Reader, dst io.Writer, dek []byte, pool *sync.Pool) error {
+// nonceOffset shifts the nonce counter — see EncryptStreamWithDEK for details.
+func EncryptStreamWithDEKPool(src io.Reader, dst io.Writer, dek []byte, pool *sync.Pool, nonceOffset uint64) error {
 	if pool == nil {
-		return EncryptStreamWithDEK(src, dst, dek)
+		return EncryptStreamWithDEK(src, dst, dek, nonceOffset)
 	}
 
 	block, err := aes.NewCipher(dek)
@@ -89,7 +94,7 @@ func EncryptStreamWithDEKPool(src io.Reader, dst io.Writer, dek []byte, pool *sy
 	pb := pool.Get().(*[]byte)
 	defer pool.Put(pb)
 
-	chunkIndex := uint64(0)
+	chunkIndex := nonceOffset
 	for {
 		n, readErr := io.ReadFull(src, readBuf)
 		if n > 0 {
@@ -122,7 +127,9 @@ func EncryptStreamWithDEKPool(src io.Reader, dst io.Writer, dek []byte, pool *sy
 }
 
 // DecryptStreamWithDEK decrypts data from src to dst using the raw DEK directly.
-func DecryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error {
+// nonceOffset must match the value used during encryption — the expected nonce
+// for the first internal chunk is nonceOffset, not 0.
+func DecryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte, nonceOffset uint64) error {
 	block, err := aes.NewCipher(dek)
 	if err != nil {
 		return err
@@ -134,7 +141,7 @@ func DecryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error {
 	}
 
 	nonceSize := gcm.NonceSize()
-	chunkIndex := uint64(0)
+	chunkIndex := nonceOffset
 
 	for {
 		var chunkSize uint32

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/Faizan2005/DFS-Go/Storage/swarm"
 )
 
 var (
@@ -25,6 +27,11 @@ var (
 	bucketIgnoredPeers    = []byte("ignored_peers")
 	bucketTransferHistory = []byte("transfer_history")
 	bucketOutbox          = []byte("outbox")
+
+	// Swarm architecture buckets.
+	bucketSeedSources = []byte("seed_sources") // fileKey → SeedSource JSON
+	bucketProviders   = []byte("providers")    // fileKey → []ProviderRecord JSON
+	bucketCacheUsage  = []byte("cache_usage")  // fileKey → swarm.CacheEntry JSON
 )
 
 // TombstoneEntry records a soft-deleted file for gossip propagation.
@@ -97,7 +104,7 @@ func Open(path string) (*StateDB, error) {
 
 	// Create buckets.
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketUploads, bucketDownloads, bucketPublicFiles, bucketConfig, bucketTombstones, bucketKnownPeers, bucketInbox, bucketIgnoredPeers, bucketTransferHistory, bucketOutbox} {
+		for _, b := range [][]byte{bucketUploads, bucketDownloads, bucketPublicFiles, bucketConfig, bucketTombstones, bucketKnownPeers, bucketInbox, bucketIgnoredPeers, bucketTransferHistory, bucketOutbox, bucketSeedSources, bucketProviders, bucketCacheUsage} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -407,6 +414,34 @@ func (s *StateDB) IsIgnoredPeer(addr string) bool {
 	return found
 }
 
+// RemoveIgnoredByFingerprint removes all blocklist entries whose fingerprint
+// matches the given value. This is needed when a bootstrap peer (--peer flag)
+// was previously blocklisted under a different address (DHCP reassignment).
+func (s *StateDB) RemoveIgnoredByFingerprint(fingerprint string) error {
+	if fingerprint == "" {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketIgnoredPeers)
+		var toDelete [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			var e IgnoredPeerEntry
+			if err := json.Unmarshal(v, &e); err == nil && e.Fingerprint == fingerprint {
+				toDelete = append(toDelete, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range toDelete {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // IsIgnoredFingerprint checks if any blocklist entry matches the given
 // identity fingerprint. This catches peers that changed their IP/port
 // (e.g. DHCP reassignment on campus WiFi) but kept the same identity.
@@ -629,6 +664,246 @@ func (s *StateDB) ListOutbox() ([]OutboxEntry, error) {
 		})
 	})
 	return entries, err
+}
+
+// ── Seed Sources (swarm architecture) ─────────────────────────────────
+
+// SetSeedSource stores or updates a seed source for a file key.
+func (s *StateDB) SetSeedSource(key string, src *swarm.SeedSource) error {
+	return s.put(bucketSeedSources, key, src)
+}
+
+// GetSeedSource returns the seed source for a file key, or nil if not found.
+func (s *StateDB) GetSeedSource(key string) *swarm.SeedSource {
+	var src swarm.SeedSource
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketSeedSources).Get([]byte(key))
+		if v == nil {
+			return fmt.Errorf("not found")
+		}
+		return json.Unmarshal(v, &src)
+	})
+	if err != nil {
+		return nil
+	}
+	return &src
+}
+
+// RemoveSeedSource removes a seed source entry.
+func (s *StateDB) RemoveSeedSource(key string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketSeedSources).Delete([]byte(key))
+	})
+}
+
+// AllSeedSources returns all seed source entries keyed by file key.
+func (s *StateDB) AllSeedSources() (map[string]*swarm.SeedSource, error) {
+	result := make(map[string]*swarm.SeedSource)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSeedSources)
+		return b.ForEach(func(k, v []byte) error {
+			var src swarm.SeedSource
+			if err := json.Unmarshal(v, &src); err != nil {
+				return err
+			}
+			result[string(k)] = &src
+			return nil
+		})
+	})
+	return result, err
+}
+
+// ── Provider Records (DHT-style seeder tracking) ─────────────────────
+
+// SetProviders stores the provider list for a file key.
+func (s *StateDB) SetProviders(fileKey string, providers []swarm.ProviderRecord) error {
+	return s.put(bucketProviders, fileKey, providers)
+}
+
+// GetProviders returns provider records for a file key.
+func (s *StateDB) GetProviders(fileKey string) []swarm.ProviderRecord {
+	var providers []swarm.ProviderRecord
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketProviders).Get([]byte(fileKey))
+		if v == nil {
+			return nil
+		}
+		return json.Unmarshal(v, &providers)
+	})
+	return providers
+}
+
+// AddProvider upserts a single provider record for a file key.
+// If a record with the same Addr exists, it is updated.
+func (s *StateDB) AddProvider(fileKey string, rec swarm.ProviderRecord) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketProviders)
+		var providers []swarm.ProviderRecord
+		if v := b.Get([]byte(fileKey)); v != nil {
+			_ = json.Unmarshal(v, &providers)
+		}
+		// Upsert: replace existing record for same addr.
+		found := false
+		for i, p := range providers {
+			if p.Addr == rec.Addr {
+				providers[i] = rec
+				found = true
+				break
+			}
+		}
+		if !found {
+			providers = append(providers, rec)
+		}
+		data, err := json.Marshal(providers)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(fileKey), data)
+	})
+}
+
+// RemoveProvider removes a provider by address from a file key's list.
+func (s *StateDB) RemoveProvider(fileKey, addr string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketProviders)
+		var providers []swarm.ProviderRecord
+		if v := b.Get([]byte(fileKey)); v != nil {
+			_ = json.Unmarshal(v, &providers)
+		}
+		filtered := providers[:0]
+		for _, p := range providers {
+			if p.Addr != addr {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) == 0 {
+			return b.Delete([]byte(fileKey))
+		}
+		data, err := json.Marshal(filtered)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(fileKey), data)
+	})
+}
+
+// ExpireProviders removes provider records older than the given TTL.
+func (s *StateDB) ExpireProviders(ttl time.Duration) error {
+	cutoff := time.Now().Add(-ttl).UnixNano()
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketProviders)
+		var toDelete [][]byte
+		err := b.ForEach(func(k, v []byte) error {
+			var providers []swarm.ProviderRecord
+			if err := json.Unmarshal(v, &providers); err != nil {
+				return nil // skip corrupt entries
+			}
+			filtered := providers[:0]
+			for _, p := range providers {
+				if p.RegisteredAt > cutoff {
+					filtered = append(filtered, p)
+				}
+			}
+			if len(filtered) == 0 {
+				toDelete = append(toDelete, append([]byte(nil), k...))
+			} else if len(filtered) < len(providers) {
+				data, err := json.Marshal(filtered)
+				if err != nil {
+					return nil
+				}
+				return b.Put(k, data)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, k := range toDelete {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ── Cache Usage (LRU eviction for CAS seeder cache) ──────────────────
+
+// SetCacheEntry stores or updates a cache usage entry.
+func (s *StateDB) SetCacheEntry(entry swarm.CacheEntry) error {
+	return s.put(bucketCacheUsage, entry.FileKey, entry)
+}
+
+// GetCacheEntry returns the cache entry for a file key, or nil.
+func (s *StateDB) GetCacheEntry(fileKey string) *swarm.CacheEntry {
+	var entry swarm.CacheEntry
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketCacheUsage).Get([]byte(fileKey))
+		if v == nil {
+			return fmt.Errorf("not found")
+		}
+		return json.Unmarshal(v, &entry)
+	})
+	if err != nil {
+		return nil
+	}
+	return &entry
+}
+
+// TouchCache updates the LastAccessed timestamp for a cache entry.
+func (s *StateDB) TouchCache(fileKey string) {
+	entry := s.GetCacheEntry(fileKey)
+	if entry == nil {
+		return
+	}
+	entry.LastAccessed = time.Now().UnixNano()
+	_ = s.SetCacheEntry(*entry)
+}
+
+// RemoveCacheEntry removes a cache usage entry.
+func (s *StateDB) RemoveCacheEntry(fileKey string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketCacheUsage).Delete([]byte(fileKey))
+	})
+}
+
+// ListCacheEntries returns all cache entries sorted by LastAccessed (oldest first).
+func (s *StateDB) ListCacheEntries() ([]swarm.CacheEntry, error) {
+	var entries []swarm.CacheEntry
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketCacheUsage)
+		return b.ForEach(func(k, v []byte) error {
+			var e swarm.CacheEntry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return err
+			}
+			entries = append(entries, e)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].LastAccessed < entries[j].LastAccessed
+	})
+	return entries, nil
+}
+
+// TotalCacheSize returns the sum of all cache entry sizes.
+func (s *StateDB) TotalCacheSize() int64 {
+	var total int64
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketCacheUsage)
+		return b.ForEach(func(k, v []byte) error {
+			var e swarm.CacheEntry
+			if err := json.Unmarshal(v, &e); err == nil {
+				total += e.Size
+			}
+			return nil
+		})
+	})
+	return total
 }
 
 // put is a helper that JSON-encodes val and stores it under key in the given bucket.

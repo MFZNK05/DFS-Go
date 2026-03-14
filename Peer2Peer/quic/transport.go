@@ -24,10 +24,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,11 @@ import (
 
 	peer2peer "github.com/Faizan2005/DFS-Go/Peer2Peer"
 )
+
+// streamOpenTimeout bounds how long we wait for a peer to grant a new QUIC
+// stream. On campus WiFi a stalled peer can block OpenStreamSync forever;
+// this ensures the caller gets an error and can retry or store a hint.
+const streamOpenTimeout = 30 * time.Second
 
 // QUICPeer wraps a QUIC *Conn and satisfies peer2peer.Peer.
 // It is intentionally minimal — no per-peer mutexes are needed because
@@ -55,10 +62,11 @@ func (p *QUICPeer) Outbound() bool       { return p.outbound }
 func (p *QUICPeer) Close() error         { return p.conn.CloseWithError(0, "peer closed") }
 func (p *QUICPeer) CloseStream()         {} // no-op: stream closed by handleStream's defer
 
-// SmoothedRTT returns the QUIC connection's smoothed RTT estimate.
-// Satisfies the ratelimit.RTTSource interface.
-func (p *QUICPeer) SmoothedRTT() time.Duration {
-	return p.conn.ConnectionStats().SmoothedRTT
+// openStream opens a new QUIC stream with a bounded timeout.
+func (p *QUICPeer) openStream() (*quic.Stream, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), streamOpenTimeout)
+	defer cancel()
+	return p.conn.OpenStreamSync(ctx)
 }
 
 // Read satisfies net.Conn but should not be used directly.
@@ -70,7 +78,7 @@ func (p *QUICPeer) Write(b []byte) (int, error) { return len(b), p.Send(b) }
 
 // Send writes raw bytes on a single QUIC stream.
 func (p *QUICPeer) Send(b []byte) error {
-	stream, err := p.conn.OpenStreamSync(context.Background())
+	stream, err := p.openStream()
 	if err != nil {
 		return err
 	}
@@ -83,7 +91,7 @@ func (p *QUICPeer) Send(b []byte) error {
 // Flattened into a single Write call so quic-go packs everything into one UDP
 // frame — prevents partial-read splits that break the length-prefixed decoder.
 func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
-	stream, err := p.conn.OpenStreamSync(context.Background())
+	stream, err := p.openStream()
 	if err != nil {
 		return err
 	}
@@ -98,23 +106,13 @@ func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
 }
 
 // SendStream sends [0x3][4-byte len][msgPayload][streamData] on one stream.
-// Delegates to SendStreamThrottled with no writer wrapper.
 func (p *QUICPeer) SendStream(msgPayload []byte, streamData []byte) error {
-	return p.SendStreamThrottled(msgPayload, streamData, nil)
-}
-
-// SendStreamThrottled sends a message+stream frame with optional bandwidth
-// throttling. The header (control byte + length + msgPayload) is sent at wire
-// speed. Stream data is written through wrapWriter (if non-nil) via
-// io.CopyBuffer with 32 KiB slices for smooth flow control.
-func (p *QUICPeer) SendStreamThrottled(msgPayload, streamData []byte, wrapWriter func(io.Writer) io.Writer) error {
-	stream, err := p.conn.OpenStreamSync(context.Background())
+	stream, err := p.openStream()
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
 
-	// Header at wire speed (tiny — control byte + length + msg).
 	hdr := make([]byte, 1+4+len(msgPayload))
 	hdr[0] = peer2peer.IncomingMessageWithStream
 	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(msgPayload)))
@@ -123,14 +121,27 @@ func (p *QUICPeer) SendStreamThrottled(msgPayload, streamData []byte, wrapWriter
 		return err
 	}
 
-	// Data through optional rate-limited writer (smooth 32 KiB slices).
-	var w io.Writer = stream
-	if wrapWriter != nil {
-		w = wrapWriter(stream)
-	}
 	buf := make([]byte, 32<<10) // 32 KiB copy buffer
-	_, err = io.CopyBuffer(w, bytes.NewReader(streamData), buf)
+	_, err = io.CopyBuffer(stream, bytes.NewReader(streamData), buf)
 	return err
+}
+
+// OpenBidiRPC opens a stream, writes [0x04][4B len][payload], and returns
+// the open stream for reading the response. Caller MUST close the stream.
+func (p *QUICPeer) OpenBidiRPC(payload []byte) (io.ReadCloser, error) {
+	stream, err := p.openStream()
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 1+4+len(payload))
+	buf[0] = peer2peer.IncomingBidiRPC
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(payload)))
+	copy(buf[5:], payload)
+	if _, err := stream.Write(buf); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	return stream, nil
 }
 
 // Deadline stubs — quic.Conn manages its own timeouts via MaxIdleTimeout.
@@ -140,19 +151,31 @@ func (p *QUICPeer) SetWriteDeadline(t time.Time) error { return nil }
 
 // ---------------------------------------------------------------------------
 
+// TransportRole identifies whether a transport carries control-plane traffic
+// (gossip, heartbeat, announce) or data-plane traffic (chunks, file transfers).
+type TransportRole int
+
+const (
+	RoleUnified TransportRole = iota // legacy single-port mode
+	RoleControl                      // gossip, heartbeat, announce, metadata
+	RoleData                         // chunk store/get, file transfers
+)
+
 type TransportOpts struct {
 	ListenAddr       string
 	TLSConfig        *tls.Config
 	OnPeer           func(peer2peer.Peer) error
 	OnPeerDisconnect func(peer2peer.Peer)
+	Role             TransportRole // default: RoleUnified
 }
 
 type Transport struct {
-	opts     TransportOpts
-	listener *quic.Listener
-	rpcCh    chan peer2peer.RPC
-	tlsCfg   *tls.Config
-	decoder  peer2peer.Decoder // DefaultDecoder: reads [4-byte len][payload]
+	opts       TransportOpts
+	listener   *quic.Listener
+	qTransport *quic.Transport // shared UDP socket for listener + dialer
+	rpcCh      chan peer2peer.RPC
+	tlsCfg     *tls.Config
+	decoder    peer2peer.Decoder // DefaultDecoder: reads [4-byte len][payload]
 
 	peerLock sync.RWMutex
 	peers    map[string]*QUICPeer
@@ -167,9 +190,14 @@ func New(opts TransportOpts) (*Transport, error) {
 			return nil, err
 		}
 	}
+	// Control transport uses a smaller channel — gossip/heartbeat is infrequent.
+	rpcChSize := 1024
+	if opts.Role == RoleControl {
+		rpcChSize = 64
+	}
 	return &Transport{
 		opts:    opts,
-		rpcCh:   make(chan peer2peer.RPC, 1024),
+		rpcCh:   make(chan peer2peer.RPC, rpcChSize),
 		tlsCfg:  tlsCfg,
 		decoder: peer2peer.DefaultDecoder{},
 		peers:   make(map[string]*QUICPeer),
@@ -178,27 +206,60 @@ func New(opts TransportOpts) (*Transport, error) {
 
 func (t *Transport) Addr() string                  { return t.opts.ListenAddr }
 func (t *Transport) Consume() <-chan peer2peer.RPC { return t.rpcCh }
+func (t *Transport) Role() TransportRole           { return t.opts.Role }
 
 func (t *Transport) ListenAndAccept() error {
+	alpn := alpnForRole(t.opts.Role)
 	cfg := t.tlsCfg.Clone()
-	cfg.NextProtos = []string{"dfs-quic"}
-	ln, err := quic.ListenAddr(t.opts.ListenAddr, cfg, dfsQUICConfig())
+	cfg.NextProtos = []string{alpn}
+
+	// Force IPv4 to prevent macOS IPv6 routing issues on mixed-OS LANs.
+	udpAddr, err := net.ResolveUDPAddr("udp4", t.opts.ListenAddr)
 	if err != nil {
+		return fmt.Errorf("resolve listen addr: %w", err)
+	}
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return fmt.Errorf("listen udp4: %w", err)
+	}
+
+	// Shared QUIC transport: listener AND dialer use the same UDP socket.
+	// Remote peers always see our listen port as the source — no ephemeral
+	// port confusion (fixes the "wrong port" issue on Windows/macOS).
+	t.qTransport = &quic.Transport{Conn: udpConn}
+
+	qCfg := quicConfigForRole(t.opts.Role)
+	ln, err := t.qTransport.Listen(cfg, qCfg)
+	if err != nil {
+		udpConn.Close()
 		return err
 	}
 	t.listener = ln
-	log.Printf("[QUIC] listening on %s", t.opts.ListenAddr)
+	log.Printf("[QUIC] listening on %s (udp4, role=%d, alpn=%s)", udpConn.LocalAddr(), t.opts.Role, alpn)
 	go t.acceptLoop()
 	return nil
 }
 
 func (t *Transport) Dial(addr string) error {
+	if t.qTransport == nil {
+		return fmt.Errorf("quic: transport not started, call ListenAndAccept before Dial")
+	}
+	alpn := alpnForRole(t.opts.Role)
 	cfg := t.tlsCfg.Clone()
 	cfg.InsecureSkipVerify = true
-	cfg.NextProtos = []string{"dfs-quic"}
+	cfg.NextProtos = []string{alpn}
+
+	// Resolve to IPv4 and dial through the shared transport so the remote
+	// sees our listening port, not a random ephemeral port.
+	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return fmt.Errorf("resolve dial addr %q: %w", addr, err)
+	}
+
+	qCfg := quicConfigForRole(t.opts.Role)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, addr, cfg, dfsQUICConfig())
+	conn, err := t.qTransport.Dial(ctx, udpAddr, cfg, qCfg)
 	if err != nil {
 		return err
 	}
@@ -210,7 +271,44 @@ func (t *Transport) Close() error {
 	if t.listener == nil {
 		return nil
 	}
-	return t.listener.Close()
+	err := t.listener.Close()
+	if t.qTransport != nil {
+		_ = t.qTransport.Close()
+	}
+	return err
+}
+
+// DialDual connects to a peer on both control and data ports atomically.
+// Both dials happen in parallel. If the data dial fails (peer is an old
+// single-port node), only the control connection is established.
+// addr is "host:N" (control port). Data port is "host:N+1".
+func DialDual(ctrlTransport, dataTransport *Transport, addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("dial dual: parse addr %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("dial dual: parse port %q: %w", portStr, err)
+	}
+	dataAddr := net.JoinHostPort(host, strconv.Itoa(port+1))
+
+	var wg sync.WaitGroup
+	var ctrlErr, dataErr error
+
+	wg.Add(2)
+	go func() { defer wg.Done(); ctrlErr = ctrlTransport.Dial(addr) }()
+	go func() { defer wg.Done(); dataErr = dataTransport.Dial(dataAddr) }()
+	wg.Wait()
+
+	if ctrlErr != nil {
+		return fmt.Errorf("control dial %s failed: %w", addr, ctrlErr)
+	}
+	if dataErr != nil {
+		log.Printf("[DUAL-DIAL] data dial to %s failed (peer may be single-port): %v", dataAddr, dataErr)
+		// Control connection is up — peer works in degraded single-port mode.
+	}
+	return nil
 }
 
 func (t *Transport) acceptLoop() {
@@ -231,6 +329,18 @@ func (t *Transport) handleConn(conn *quic.Conn, outbound bool) {
 	peer := newQUICPeer(conn, outbound)
 	remoteAddr := conn.RemoteAddr().String()
 
+	// Run the handshake BEFORE registering the peer. This prevents "ghost
+	// peers" where the TUI shows a peer count of 1 but no names — the QUIC
+	// socket existed but the application-level handshake never completed.
+	if t.opts.OnPeer != nil {
+		if err := t.opts.OnPeer(peer); err != nil {
+			log.Printf("[QUIC] OnPeer error %s: %v", remoteAddr, err)
+			conn.CloseWithError(0, "rejected")
+			return
+		}
+	}
+
+	// Handshake succeeded — register the peer.
 	t.peerLock.Lock()
 	t.peers[remoteAddr] = peer
 	t.peerLock.Unlock()
@@ -246,12 +356,6 @@ func (t *Transport) handleConn(conn *quic.Conn, outbound bool) {
 		log.Printf("[QUIC] peer disconnected: %s", remoteAddr)
 	}()
 
-	if t.opts.OnPeer != nil {
-		if err := t.opts.OnPeer(peer); err != nil {
-			log.Printf("[QUIC] OnPeer error %s: %v", remoteAddr, err)
-			return
-		}
-	}
 	log.Printf("[QUIC] peer connected: %s (outbound=%v)", remoteAddr, outbound)
 	t.acceptStreams(conn, peer)
 }
@@ -306,7 +410,7 @@ func (t *Transport) handleStream(stream *quic.Stream, from net.Addr, peer *QUICP
 		// remaining stream bytes via StreamReader for the handler to read.
 		var msg peer2peer.RPC
 		if err := t.decoder.Decode(stream, &msg); err != nil {
-			log.Printf("[QUIC] decode msg+stream from %s: %v", from, err)
+			log.Printf("[QUIC-STREAM] decode msg+stream from %s: %v", from, err)
 			return
 		}
 		msg.From = from
@@ -319,6 +423,27 @@ func (t *Transport) handleStream(stream *quic.Stream, from net.Addr, peer *QUICP
 		msg.StreamWg = &streamWg
 		t.rpcCh <- msg
 		streamWg.Wait()
+
+	case peer2peer.IncomingBidiRPC:
+		// Bidirectional RPC: framed request + response on the same stream.
+		// Decode the request, expose the stream for both reading and writing,
+		// then block until the handler signals completion.
+		var msg peer2peer.RPC
+		if err := t.decoder.Decode(stream, &msg); err != nil {
+			log.Printf("[QUIC-BIDI] decode from %s: %v", from, err)
+			return
+		}
+		msg.From = from
+		msg.Peer = peer
+		msg.Stream = true
+		msg.StreamReader = stream // handler reads remaining request data
+		msg.StreamWriter = stream // handler writes response back
+		var streamWg sync.WaitGroup
+		streamWg.Add(1)
+		msg.StreamWg = &streamWg
+		t.rpcCh <- msg
+		streamWg.Wait()
+		// stream closed by defer at top of handleStream
 
 	default:
 		// Regular message (0x1): decode framed payload only.
@@ -344,10 +469,64 @@ func dfsQUICConfig() *quic.Config {
 	return &quic.Config{
 		MaxIdleTimeout:                 30 * time.Second,
 		KeepAlivePeriod:                10 * time.Second,
+		MaxIncomingStreams:              10000,
+		MaxIncomingUniStreams:           10000,
 		InitialStreamReceiveWindow:     8 << 20,  // 8 MiB
 		MaxStreamReceiveWindow:         16 << 20, // 16 MiB
 		InitialConnectionReceiveWindow: 32 << 20, // 32 MiB
 		MaxConnectionReceiveWindow:     64 << 20, // 64 MiB
+	}
+}
+
+// controlQUICConfig returns a QUIC config tuned for the control plane.
+// Tiny windows: gossip/heartbeat messages are <1 KiB each.
+func controlQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:                 30 * time.Second,
+		KeepAlivePeriod:                10 * time.Second,
+		InitialStreamReceiveWindow:     256 << 10, // 256 KiB
+		MaxStreamReceiveWindow:         1 << 20,   // 1 MiB
+		InitialConnectionReceiveWindow: 1 << 20,   // 1 MiB
+		MaxConnectionReceiveWindow:     4 << 20,   // 4 MiB
+	}
+}
+
+// dataQUICConfig returns a QUIC config tuned for the data plane.
+// Large windows: 4 MiB chunks × 8 concurrent streams.
+func dataQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                15 * time.Second,
+		MaxIncomingStreams:              10000,
+		MaxIncomingUniStreams:           10000,
+		InitialStreamReceiveWindow:     8 << 20,   // 8 MiB
+		MaxStreamReceiveWindow:         16 << 20,  // 16 MiB
+		InitialConnectionReceiveWindow: 64 << 20,  // 64 MiB
+		MaxConnectionReceiveWindow:     128 << 20, // 128 MiB
+	}
+}
+
+// quicConfigForRole returns the QUIC config appropriate for the transport's role.
+func quicConfigForRole(role TransportRole) *quic.Config {
+	switch role {
+	case RoleControl:
+		return controlQUICConfig()
+	case RoleData:
+		return dataQUICConfig()
+	default:
+		return dfsQUICConfig()
+	}
+}
+
+// alpnForRole returns the ALPN protocol string for the transport's role.
+func alpnForRole(role TransportRole) string {
+	switch role {
+	case RoleControl:
+		return "dfs-ctrl"
+	case RoleData:
+		return "dfs-data"
+	default:
+		return "dfs-quic"
 	}
 }
 

@@ -8,11 +8,11 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "hermond",
-	Short: "Hermond – P2P File Sharing",
-	Long:  `Hermond is a peer-to-peer file sharing system for campus LAN. Run without arguments to start the node and launch the TUI.`,
+	Use:   "hermod",
+	Short: "Hermod – P2P File Sharing",
+	Long:  `Hermod is a peer-to-peer file sharing system for campus LAN. Run without arguments to start the node and launch the TUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runUnified()
+		return runUnified(cmd)
 	},
 }
 

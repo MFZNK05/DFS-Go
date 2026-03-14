@@ -33,6 +33,10 @@ type SendManifestFunc func(targetAddr, fileKey string, manifestJSON []byte) erro
 // Returns (nil, false) when the manifest is not held locally.
 type ReadManifestFunc func(fileKey string) (manifestJSON []byte, ok bool)
 
+// ShouldSkipKeyFunc returns true if a key should be skipped during migration.
+// Used to prevent rebalancing CAS data for SeedMode files (swarm handles payload).
+type ShouldSkipKeyFunc func(key string) bool
+
 // Rebalancer migrates data when the hash ring topology changes:
 //   - On node join:  keys the new node should own are copied to it.
 //   - On node leave: keys that now have fewer than N replicas are re-replicated.
@@ -44,6 +48,7 @@ type Rebalancer struct {
 	sendFile     SendFileFunc
 	readManifest ReadManifestFunc
 	sendManifest SendManifestFunc
+	shouldSkip   ShouldSkipKeyFunc
 
 	// MigrationDelay is the pause inserted between consecutive chunk migrations.
 	// Zero means no delay (full speed). Defaults to DefaultMigrationDelay.
@@ -79,6 +84,12 @@ func New(
 func (r *Rebalancer) SetManifestFuncs(read ReadManifestFunc, send SendManifestFunc) {
 	r.readManifest = read
 	r.sendManifest = send
+}
+
+// SetShouldSkipKey wires a filter that excludes keys from migration/rereplicate.
+// Used to prevent background rebalancing of chunk: keys (swarm handles payload).
+func (r *Rebalancer) SetShouldSkipKey(fn ShouldSkipKeyFunc) {
+	r.shouldSkip = fn
 }
 
 // OnNodeJoined triggers key migration when a new node has been added to the ring.
@@ -239,16 +250,28 @@ func (r *Rebalancer) rereplicate(deadAddr string) {
 	log.Printf("[rebalance] rereplicate after %s complete: %d keys re-sent", deadAddr, replicated)
 }
 
-// localKeys returns all file keys stored locally by iterating the metadata store.
-// This relies on MetaFile.Keys() which is added to storage.go in this sprint.
+// localKeys returns all file keys stored locally by iterating the metadata store,
+// excluding any keys that shouldSkip returns true for (e.g., chunk: keys that
+// are managed by swarm on-demand serving or upload-time replication).
 func (r *Rebalancer) localKeys() []string {
 	type keyer interface {
 		Keys() []string
 	}
-	if k, ok := r.meta.(keyer); ok {
-		return k.Keys()
+	k, ok := r.meta.(keyer)
+	if !ok {
+		return nil
 	}
-	return nil
+	all := k.Keys()
+	if r.shouldSkip == nil {
+		return all
+	}
+	filtered := make([]string, 0, len(all))
+	for _, key := range all {
+		if !r.shouldSkip(key) {
+			filtered = append(filtered, key)
+		}
+	}
+	return filtered
 }
 
 // contains reports whether slice s contains elem.

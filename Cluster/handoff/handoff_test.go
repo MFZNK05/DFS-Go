@@ -21,7 +21,7 @@ func tempDir(t *testing.T) string {
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := NewStore(tempDir(t), 10, time.Hour)
+	s, err := NewStore(tempDir(t), 10, time.Hour, 0)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -32,7 +32,7 @@ func newTestStore(t *testing.T) *Store {
 func TestAddAndRetrieveHint(t *testing.T) {
 	s := newTestStore(t)
 
-	h := Hint{Key: "file1", TargetAddr: "peer:3000", Data: []byte("encrypted"), CreatedAt: time.Now()}
+	h := Hint{Key: "file1", TargetAddr: "peer:3000", DataSize: 9, CreatedAt: time.Now()}
 	if err := s.AddHint(h); err != nil {
 		t.Fatalf("AddHint: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestAddAndRetrieveHint(t *testing.T) {
 
 // TestHintCapCausesEviction verifies oldest hint is dropped when cap is reached.
 func TestHintCapCausesEviction(t *testing.T) {
-	s, err := NewStore(tempDir(t), 3, time.Hour)
+	s, err := NewStore(tempDir(t), 3, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestHintCapCausesEviction(t *testing.T) {
 
 // TestExpiredHintsRemoved verifies PurgeExpired drops old hints.
 func TestExpiredHintsRemoved(t *testing.T) {
-	s, err := NewStore(tempDir(t), 100, 100*time.Millisecond)
+	s, err := NewStore(tempDir(t), 100, 100*time.Millisecond, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,15 +115,15 @@ func TestDeleteHint(t *testing.T) {
 func TestPersistAndReload(t *testing.T) {
 	dir := tempDir(t)
 
-	s1, err := NewStore(dir, 100, time.Hour)
+	s1, err := NewStore(dir, 100, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := "peer:3004"
-	_ = s1.AddHint(Hint{Key: "persistent", TargetAddr: addr, Data: []byte("data"), CreatedAt: time.Now()})
+	_ = s1.AddHint(Hint{Key: "persistent", TargetAddr: addr, DataSize: 4, CreatedAt: time.Now()})
 
 	// Reload from same dir.
-	s2, err := NewStore(dir, 100, time.Hour)
+	s2, err := NewStore(dir, 100, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestPersistAndReload(t *testing.T) {
 func TestDeliverOnReconnect(t *testing.T) {
 	s := newTestStore(t)
 	addr := "peer:3005"
-	_ = s.AddHint(Hint{Key: "deliver-me", TargetAddr: addr, CreatedAt: time.Now(), Data: []byte("payload")})
+	_ = s.AddHint(Hint{Key: "deliver-me", TargetAddr: addr, CreatedAt: time.Now(), DataSize: 7})
 
 	var delivered atomic.Int32
 	svc := NewHandoffService(s, func(h Hint) error {
@@ -166,7 +166,7 @@ func TestDeliverOnReconnect(t *testing.T) {
 func TestDeliverRetryOnFailure(t *testing.T) {
 	s := newTestStore(t)
 	addr := "peer:3006"
-	_ = s.AddHint(Hint{Key: "fail-me", TargetAddr: addr, CreatedAt: time.Now(), Data: []byte("x")})
+	_ = s.AddHint(Hint{Key: "fail-me", TargetAddr: addr, CreatedAt: time.Now(), DataSize: 1})
 
 	calls := 0
 	svc := NewHandoffService(s, func(h Hint) error {
@@ -207,7 +207,7 @@ func TestHintDiscardedAfterMaxAttempts(t *testing.T) {
 // TestHintFileCreated verifies a .hints.json file is written to disk.
 func TestHintFileCreated(t *testing.T) {
 	dir := tempDir(t)
-	s, _ := NewStore(dir, 10, time.Hour)
+	s, _ := NewStore(dir, 10, time.Hour, 0)
 
 	addr := "192.168.1.10:3000"
 	_ = s.AddHint(Hint{Key: "k", TargetAddr: addr, CreatedAt: time.Now()})

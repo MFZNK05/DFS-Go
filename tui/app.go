@@ -64,6 +64,8 @@ type RootModel struct {
 
 	pendingUpload   string // name of in-progress upload, "" if none
 	pendingDownload string // name of in-progress download, "" if none
+
+	lastTransfers []ipc.TransferInfo // cached for footer status line
 }
 
 // NewRootModel creates the root model.
@@ -191,6 +193,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = fmt.Sprintf("transfers: %v", msg.Err)
 		} else {
 			m.transfers.SetTransfers(msg.Transfers)
+			m.lastTransfers = msg.Transfers
 		}
 		return m, nil
 
@@ -283,15 +286,20 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case TickMsg:
 		var cmds []tea.Cmd
 		cmds = append(cmds, fetchStatus(m.client))
+		// Always fetch transfers so the footer status line stays current.
+		cmds = append(cmds, fetchTransfers(m.client))
 		switch m.activeTab {
 		case tabNetwork:
 			cmds = append(cmds, fetchPeers(m.client), fetchLANPeers(m.client))
-		case tabTransfers:
-			cmds = append(cmds, fetchTransfers(m.client))
 		case tabVault:
 			cmds = append(cmds, fetchUploads(m.client), fetchDownloads(m.client))
 		}
-		cmds = append(cmds, pollCmd(3*time.Second))
+		// Poll faster (1s) when a transfer is active so progress feels responsive.
+		interval := 3 * time.Second
+		if m.pendingUpload != "" || m.pendingDownload != "" {
+			interval = 1 * time.Second
+		}
+		cmds = append(cmds, pollCmd(interval))
 		return m, tea.Batch(cmds...)
 
 	case ErrorMsg:
@@ -432,13 +440,13 @@ func (m RootModel) View() string {
 
 	footer := components.RenderFooter(hints, m.width)
 
-	// Show pending operations above error/footer
+	// Show pending operations above error/footer with live progress
 	var statusLines []string
 	if m.pendingUpload != "" {
-		statusLines = append(statusLines, lipgloss.NewStyle().Foreground(ColorPaused).Render("  Uploading: "+m.pendingUpload+"..."))
+		statusLines = append(statusLines, m.transferStatusLine("upload", m.pendingUpload))
 	}
 	if m.pendingDownload != "" {
-		statusLines = append(statusLines, lipgloss.NewStyle().Foreground(ColorPaused).Render("  Downloading: "+m.pendingDownload+"..."))
+		statusLines = append(statusLines, m.transferStatusLine("download", m.pendingDownload))
 	}
 	if m.err != "" {
 		statusLines = append(statusLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4444")).Bold(true).Render("  "+m.err))
@@ -454,6 +462,79 @@ func (m RootModel) View() string {
 	paddedContent := lipgloss.NewStyle().Height(contentHeight).Render(content)
 
 	return strings.Join([]string{header, tabBar, paddedContent, footer}, "\n")
+}
+
+// transferStatusLine finds the matching active transfer and renders a status
+// line with chunk progress, percentage, and speed.
+func (m RootModel) transferStatusLine(dir, name string) string {
+	// Search the cached transfers for a matching active entry.
+	for _, tr := range m.lastTransfers {
+		if tr.Name == name && tr.Total > 0 {
+			pct := float64(tr.Completed) / float64(tr.Total) * 100
+			speed := ""
+			if tr.Speed > 0 {
+				const (
+					KB = 1024.0
+					MB = KB * 1024
+				)
+				switch {
+				case tr.Speed >= MB:
+					speed = fmt.Sprintf(" %.1f MB/s", tr.Speed/MB)
+				case tr.Speed >= KB:
+					speed = fmt.Sprintf(" %.0f KB/s", tr.Speed/KB)
+				default:
+					speed = fmt.Sprintf(" %.0f B/s", tr.Speed)
+				}
+			}
+			eta := ""
+			if tr.Speed > 0 && tr.BytesDone < tr.Size {
+				remaining := float64(tr.Size-tr.BytesDone) / tr.Speed
+				d := time.Duration(remaining * float64(time.Second))
+				if d < time.Minute {
+					eta = fmt.Sprintf(" ETA %ds", int(d.Seconds()))
+				} else if d < time.Hour {
+					eta = fmt.Sprintf(" ETA %dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+				} else {
+					eta = fmt.Sprintf(" ETA %dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+				}
+			}
+			label := "Uploading"
+			if dir == "download" {
+				label = "Downloading"
+			}
+			byteInfo := humanBytes(tr.BytesDone, tr.Size)
+			return lipgloss.NewStyle().Foreground(ColorPaused).Render(
+				fmt.Sprintf("  %s: %s | %s (%.0f%%)%s%s", label, name, byteInfo, pct, speed, eta))
+		}
+	}
+	// Fallback if transfer not found in cache yet.
+	label := "Uploading"
+	if dir == "download" {
+		label = "Downloading"
+	}
+	return lipgloss.NewStyle().Foreground(ColorPaused).Render("  " + label + ": " + name + "...")
+}
+
+func humanBytes(done, total int64) string {
+	const (
+		KB = 1024.0
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	format := func(b int64) string {
+		v := float64(b)
+		switch {
+		case v >= GB:
+			return fmt.Sprintf("%.1f GB", v/GB)
+		case v >= MB:
+			return fmt.Sprintf("%.1f MB", v/MB)
+		case v >= KB:
+			return fmt.Sprintf("%.1f KB", v/KB)
+		default:
+			return fmt.Sprintf("%d B", b)
+		}
+	}
+	return format(done) + "/" + format(total)
 }
 
 func (m RootModel) renderTabBar() string {

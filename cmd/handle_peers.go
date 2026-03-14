@@ -6,11 +6,9 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/Faizan2005/DFS-Go/Crypto/envelope"
 	"github.com/Faizan2005/DFS-Go/Crypto/identity"
-	peermdns "github.com/Faizan2005/DFS-Go/Peer2Peer/mdns"
 	server "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 	"github.com/Faizan2005/DFS-Go/ipc"
@@ -367,32 +365,18 @@ func handleListInbox(conn net.Conn, s *server.Server) {
 	writeJSONResponse(conn, entries)
 }
 
-// handleScanLAN performs an mDNS scan for Hermond peers on the local network.
+// handleScanLAN returns cached mDNS-discovered LAN peers. The daemon runs a
+// background mDNS scan loop (every 10s) so this handler returns instantly
+// (~0.1ms) instead of blocking 3 seconds on a live network scan.
 func handleScanLAN(conn net.Conn, s *server.Server) {
-	found, err := peermdns.Scan(3 * time.Second)
-	if err != nil {
-		writeJSONResponse(conn, []ipc.DiscoveredPeer{})
-		return
-	}
-	// Filter out self by fingerprint and address.
-	selfFP := s.SelfFingerprint()
-	selfAddr := s.SelfAddr()
-	var peers []ipc.DiscoveredPeer
-	for _, f := range found {
-		if selfFP != "" && f.Fingerprint == selfFP {
-			continue
-		}
-		if f.Addr == selfAddr {
-			continue
-		}
-		peers = append(peers, ipc.DiscoveredPeer{
+	found := s.GetLANPeers()
+	peers := make([]ipc.DiscoveredPeer, len(found))
+	for i, f := range found {
+		peers[i] = ipc.DiscoveredPeer{
 			Alias:       f.Alias,
 			Fingerprint: f.Fingerprint,
 			Addr:        f.Addr,
-		})
-	}
-	if peers == nil {
-		peers = []ipc.DiscoveredPeer{}
+		}
 	}
 	writeJSONResponse(conn, peers)
 }

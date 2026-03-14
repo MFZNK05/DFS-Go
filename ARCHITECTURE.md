@@ -1,6 +1,6 @@
-# Hermond — Architecture Deep Dive
+# Hermod — Architecture Deep Dive
 
-A comprehensive technical reference for engineers who want to understand how Hermond works under the hood. Every design decision, algorithm, and safety mechanism is documented here — even if you didn't build the project, you should be able to understand it fully after reading this.
+A comprehensive technical reference for engineers who want to understand how Hermod works under the hood. Every design decision, algorithm, and safety mechanism is documented here — even if you didn't build the project, you should be able to understand it fully after reading this.
 
 ---
 
@@ -36,6 +36,10 @@ A comprehensive technical reference for engineers who want to understand how Her
 - [Persistent State (BoltDB)](#persistent-state-boltdb)
 - [Transfer Management](#transfer-management)
 - [IPC Protocol](#ipc-protocol)
+- [mDNS LAN Auto-Discovery](#mdns-lan-auto-discovery-peer2peermdns)
+- [IP Resolution & Address Normalization](#ip-resolution--address-normalization-serverservergo)
+- [Cross-Platform Firewall Auto-Configuration](#cross-platform-firewall-auto-configuration-cmdfirewallgo)
+- [TUI Logging Safety](#tui-logging-safety-cmdunifiedgo)
 - [Performance Optimizations](#performance-optimizations)
 - [Package Map](#package-map)
 
@@ -43,11 +47,11 @@ A comprehensive technical reference for engineers who want to understand how Her
 
 ## System Overview
 
-Hermond is a peer-to-peer distributed file system. Every node is both a client and a server. There is no central coordinator — nodes discover each other via gossip, distribute files using consistent hashing, and replicate data to survive node failures.
+Hermod is a peer-to-peer distributed file system. Every node is both a client and a server. There is no central coordinator — nodes discover each other via gossip, distribute files using consistent hashing, and replicate data to survive node failures.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        Hermond Node                         │
+│                        Hermod Node                         │
 │                                                             │
 │  ┌─────────┐   ┌───────────┐   ┌────────────────────────┐  │
 │  │  TUI    │──>│  IPC      │──>│  Server (orchestrator)  │  │
@@ -63,6 +67,9 @@ Hermond is a peer-to-peer distributed file system. Every node is both a client a
 │                       │        │  └────────┘ └────────┘ │  │
 │                       │        │  ┌────────┐ ┌────────┐ │  │
 │                       │        │  │BW Mgr  │ │Selector│ │  │
+│                       │        │  └────────┘ └────────┘ │  │
+│                       │        │  ┌────────┐ ┌────────┐ │  │
+│                       │        │  │ mDNS   │ │Firewall│ │  │
 │                       │        │  └────────┘ └────────┘ │  │
 │                       │        └──────────┬─────────────┘  │
 │                       │                   │                 │
@@ -91,7 +98,7 @@ Hermond is a peer-to-peer distributed file system. Every node is both a client a
 
 ## Data Flow: Upload
 
-When a user runs `hermond upload --name "report.pdf" --file ./report.pdf --public`:
+When a user runs `hermod upload --name "report.pdf" --file ./report.pdf --public`:
 
 ```
 Step 1: CLI/TUI ──IPC──> Daemon
@@ -149,7 +156,7 @@ Step 8: State Persistence
 
 ## Data Flow: Download
 
-When a user runs `hermond download --name "report.pdf" --output ./out.pdf --from alice`:
+When a user runs `hermod download --name "report.pdf" --output ./out.pdf --from alice`:
 
 ```
 Step 1: Manifest Resolution
@@ -221,13 +228,13 @@ Step 8: Read Repair (background)
      - If so, send chunks to restore replication factor
 ```
 
-**Why this matters:** If you're downloading a 10 GB movie and chunk 2,491 out of 2,560 is corrupted, Hermond catches it immediately at step 4, bans the bad peer, and re-fetches just that one chunk from another peer. You don't download 10 GB, discover corruption at the end, and start over.
+**Why this matters:** If you're downloading a 10 GB movie and chunk 2,491 out of 2,560 is corrupted, Hermod catches it immediately at step 4, bans the bad peer, and re-fetches just that one chunk from another peer. You don't download 10 GB, discover corruption at the end, and start over.
 
 ---
 
 ## Transport Layer: Why QUIC
 
-Hermond uses QUIC (over UDP) instead of TCP for all peer-to-peer communication.
+Hermod uses QUIC (over UDP) instead of TCP for all peer-to-peer communication.
 
 ### The Head-of-Line Blocking Problem
 
@@ -261,11 +268,11 @@ Each logical message opens a new short-lived QUIC stream:
 
 ### Built-in TLS 1.3
 
-QUIC mandates TLS 1.3. Hermond generates a self-signed certificate on first run. All peer traffic is encrypted at the transport level, independent of application-layer ECDH encryption.
+QUIC mandates TLS 1.3. Hermod generates a self-signed certificate on first run. All peer traffic is encrypted at the transport level, independent of application-layer ECDH encryption.
 
 ### SmoothedRTT for Bandwidth Management
 
-QUIC maintains a kernel-level smoothed RTT estimate per connection. Hermond's bandwidth manager reads `connection.ConnectionStats().SmoothedRTT` every 2 seconds to drive adaptive throttling — no application-level RTT probing needed.
+QUIC maintains a kernel-level smoothed RTT estimate per connection. Hermod's bandwidth manager reads `connection.ConnectionStats().SmoothedRTT` every 2 seconds to drive adaptive throttling — no application-level RTT probing needed.
 
 ### SendStreamThrottled
 
@@ -375,7 +382,7 @@ Each FileEntry.ManifestKey → its own ChunkManifest (file-level chunks + Merkle
 
 ### Identity System
 
-Every Hermond node has a cryptographic identity:
+Every Hermod node has a cryptographic identity:
 
 | Key | Algorithm | Purpose |
 |-----|-----------|---------|
@@ -385,11 +392,11 @@ Every Hermond node has a cryptographic identity:
 **Fingerprint** = first 16 hex characters of SHA-256(Ed25519 public key).
 Used as namespace prefix for all files: `<fingerprint>/filename`. This prevents name collisions — two users can both upload "report.pdf" without conflict.
 
-Generated once with `hermond identity init --alias "alice"` and stored at `~/.hermond/identity.json` (or `$DFS_IDENTITY_PATH`).
+Generated once with `hermod identity init --alias "alice"` and stored at `~/.hermod/identity.json` (or `$DFS_IDENTITY_PATH`).
 
 ### ECDH Direct Encrypted Transfer
 
-This is Hermond's signature feature. When you upload with `--share-with bob`:
+This is Hermod's signature feature. When you upload with `--share-with bob`:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -455,7 +462,7 @@ Every ChunkManifest is signed with the uploader's Ed25519 key:
 
 ### Consistent Hashing
 
-Hermond uses a hash ring with **150 virtual nodes per physical node**.
+Hermod uses a hash ring with **150 virtual nodes per physical node**.
 
 ```
          ┌─────── Hash Ring ───────┐
@@ -535,7 +542,7 @@ If two updates arrive with the same generation but different states, the higher 
 
 ### Failure Detection (Phi Accrual)
 
-Instead of fixed timeouts, Hermond uses the **Phi Accrual Failure Detector** — an adaptive algorithm that adjusts to network conditions.
+Instead of fixed timeouts, Hermod uses the **Phi Accrual Failure Detector** — an adaptive algorithm that adjusts to network conditions.
 
 **How it works:**
 
@@ -571,7 +578,7 @@ To check if peer is alive:
 
 ### Quorum Reads & Writes
 
-Hermond implements tunable consistency via W-of-N write quorum and R-of-N read quorum.
+Hermod implements tunable consistency via W-of-N write quorum and R-of-N read quorum.
 
 **Default configuration:** W=2, R=2, N=3 → `W + R = 4 > N = 3` → guarantees read-after-write consistency.
 
@@ -669,7 +676,7 @@ When the hash ring topology changes, chunks may need to migrate.
 
 ## Bandwidth Management: LEDBAT-lite
 
-Hermond automatically manages bandwidth — no user configuration. The system monitors network congestion and backs off to keep the LAN smooth for everyone.
+Hermod automatically manages bandwidth — no user configuration. The system monitors network congestion and backs off to keep the LAN smooth for everyone.
 
 **Algorithm:**
 
@@ -701,7 +708,7 @@ The token bucket has a burst of 64 KiB. But `bytes.Reader.WriteTo` bypasses `io.
 
 ## Download Resume
 
-If a download is interrupted (network drop, laptop closed, process killed), Hermond resumes from where it left off.
+If a download is interrupted (network drop, laptop closed, process killed), Hermod resumes from where it left off.
 
 **On-disk state:**
 
@@ -743,7 +750,7 @@ If a download is interrupted (network drop, laptop closed, process killed), Herm
 
 ## Peer Selection (EWMA Latency)
 
-When downloading chunks from multiple peers, Hermond picks the best peer for each chunk using Exponentially Weighted Moving Average latency tracking.
+When downloading chunks from multiple peers, Hermod picks the best peer for each chunk using Exponentially Weighted Moving Average latency tracking.
 
 **EWMA formula:**
 ```
@@ -766,7 +773,7 @@ No explicit blocklist needed — just extremely low attractiveness in the scorin
 
 ## NAT Traversal & External Address Discovery
 
-Hermond works across network boundaries (Docker containers, NAT, different subnets) via two mechanisms:
+Hermod works across network boundaries (Docker containers, NAT, different subnets) via two mechanisms:
 
 ### STUN-Based NAT Traversal
 
@@ -815,7 +822,7 @@ All local state is persisted in BoltDB (embedded key-value store, single-file da
 | `outbox` | entry ID | Queued notifications for offline peers |
 | `transfer_history` | timestamp_id | Completed/failed transfer records |
 
-**Tombstone soft-delete:** `hermond remove <name>` doesn't immediately delete data. Instead, a tombstone record is created with `DeletedAt` timestamp and propagated via gossip. This ensures eventual consistency — all nodes eventually learn the file was deleted.
+**Tombstone soft-delete:** `hermod remove <name>` doesn't immediately delete data. Instead, a tombstone record is created with `DeletedAt` timestamp and propagated via gossip. This ensures eventual consistency — all nodes eventually learn the file was deleted.
 
 **Public catalog change detection:** `PublicCatalogSummary()` computes SHA-256 of sorted public keys (first 16 hex chars). Gossip metadata includes this hash. Peers compare hashes — if different, they request the full catalog. Avoids sending the full file list every gossip round.
 
@@ -934,7 +941,7 @@ Memory bounded at `MaxParallel × ChunkSize = 16 MiB` regardless of file size.
 ## Package Map
 
 ```
-hermond/
+hermod/
 ├── Server/
 │   ├── server.go              Core orchestrator (peer lifecycle, message dispatch)
 │   ├── downloader/            Parallel multi-source chunk fetcher
@@ -983,4 +990,1435 @@ hermond/
 
 ---
 
-*This document reflects the architecture as of v0.1.x. Last updated March 2026.*
+## Implementation Reference
+
+This section covers the concrete types, function signatures, and wiring that make the high-level design work. Reading this alongside the package map above gives you a complete picture — from algorithm to line of code.
+
+---
+
+### Core Server (`Server/server.go`)
+
+The `Server` struct is the root of the entire system. Every subsystem is a field on it.
+
+```go
+type Server struct {
+    // Transport
+    transport peer2peer.Transport   // QUIC transport (listens + dials)
+    peerLock  sync.RWMutex
+    peers     map[string]peer2peer.Peer  // addr → live connection
+
+    // Storage
+    Store     *storage.Store        // CAS storage engine + metadata
+    StateDB   *State.StateDB        // BoltDB persistent state (history, catalog)
+
+    // Cluster
+    HashRing     *hashring.HashRing          // consistent hashing (150 vnodes)
+    Cluster      *membership.ClusterState    // liveness + metadata per node
+    GossipSvc    *gossip.GossipService       // epidemic dissemination
+    HeartbeatSvc *heartbeat.Service          // sender + phi-accrual reaper
+    HandoffSvc   *handoff.Store             // hinted handoff queue
+    Rebalancer   *rebalance.Rebalancer       // migration on join/leave
+    Quorum       *quorum.Coordinator         // W-of-N write/read quorum
+    AntiEntropy  *merkle.AntiEntropyService  // background Merkle repair
+
+    // Downloads + Transfers
+    Downloader  *downloader.Manager   // parallel chunk fetcher
+    Selector    *selector.Selector    // EWMA latency-aware peer picker
+    TransferMgr *transfer.Manager     // pause/resume/cancel registry
+
+    // Networking
+    BandwidthMgr *ratelimit.BandwidthManager  // LEDBAT-lite adaptive throttle
+    NATService   *nat.Puncher                 // STUN external address discovery
+    MDNSAdvertiser *peermdns.Advertiser        // LAN DNS-SD advertisement
+
+    // Identity
+    identityMeta map[string]string  // {"alias", "fingerprint", "x25519_pub", "ed25519_pub"}
+    externalAddr string             // set after MessageAnnounceAck or STUN
+
+    // Misc
+    startedAt  time.Time
+    searchSeen sync.Map  // flood-search dedup (msgID → bool)
+}
+```
+
+**Server startup sequence** (`MakeServer` → `Start`):
+
+```
+MakeServer(opts MakeServerOpts) *Server
+  1. NewBoltMetaStore(...)      → persistent metadata (manifests, filemeta)
+  2. storage.NewStore(root, meta)
+  3. membership.New(selfAddr)   → ClusterState
+  4. hashring.New(cfg)          → adds selfAddr as first node
+  5. gossip.New(...)            → wires ClusterState, getPeers, sendMsg, onNewPeer
+  6. quorum.New(...)            → wires HashRing, sendMsg, local read/write
+  7. handoff.NewStore(dir, ...)
+  8. rebalance.New(...)
+  9. selector.New()
+  10. downloader.New(cfg, selector, fetchChunk, decryptChunk, getPeers)
+  11. transfer.NewManager()
+  12. ratelimit.New(cfg)        → BandwidthManager (always-on)
+  13. State.Open(dbPath)        → StateDB
+  14. merkle.NewAntiEntropyService(...)
+  15. nat.New(cfg)              (if !DisableSTUN)
+  16. peermdns.NewAdvertiser(...)
+
+Server.Start():
+  1. transport.ListenAndAccept() in goroutine
+  2. go discoverNAT()           → non-blocking STUN query
+  3. GossipSvc.Start()
+  4. HeartbeatSvc.Start()
+  5. AntiEntropy.Start()
+  6. HandoffSvc.StartPurgeLoop()
+  7. HealthSrv.Start()          (if enabled)
+  8. go rpcLoop()               → reads transport.Consume() channel
+```
+
+**Message dispatch** (`rpcLoop` → `handleMessage`):
+
+```go
+// Every inbound RPC is dispatched by first byte of payload (the "message type")
+// All message types are registered in init() via gob.Register(...)
+
+func (s *Server) handleMessage(rpc peer2peer.RPC) {
+    switch msg := decoded.(type) {
+    case *MessageAnnounce:       s.handleAnnounce(rpc.Peer, msg)
+    case *MessageAnnounceAck:    s.handleAnnounceAck(msg)
+    case *MessageStoreFile:      s.handleStoreFile(rpc.Peer, msg, rpc.StreamReader)
+    case *MessageGetFile:        s.handleGetFile(rpc.Peer, msg)
+    case *MessageLocalFile:      s.handleLocalFile(rpc.Peer, msg, rpc.StreamReader)
+    case *MessageStoreManifest:  s.handleStoreManifest(msg)
+    case *MessageGetManifest:    s.handleGetManifest(rpc.Peer, msg)
+    case *MessageManifestResponse: s.handleManifestResponse(msg)
+    case *MessageHeartbeat:      s.handleHeartbeat(rpc.Peer, msg)
+    case *MessageHeartbeatAck:   s.handleHeartbeatAck(msg)
+    case *MessageGossipDigest:   s.handleGossipDigest(rpc.Peer, msg)
+    case *MessageGossipResponse: s.handleGossipResponse(msg)
+    case *MessageQuorumWrite:    s.handleQuorumWrite(msg)
+    case *MessageQuorumRead:     s.handleQuorumRead(rpc.Peer, msg)
+    case *MessageQuorumWriteAck: s.Quorum.HandleWriteAck(...)
+    case *MessageQuorumReadResponse: s.Quorum.HandleReadResponse(...)
+    case *MessageIdentityMeta:   s.handleIdentityMeta(msg)
+    case *MessageLeaving:        s.handleLeaving(msg)
+    case *MessageMerkleSync:     s.handleMerkleSync(rpc.Peer, msg)
+    case *MessageMerkleDiffResponse: s.handleMerkleDiffResponse(rpc.Peer, msg)
+    }
+}
+```
+
+**Peer lifecycle** (connect → announce → gossip → disconnect):
+
+```
+Outbound dial (s.Connect(addr)):
+  transport.Dial(addr)
+  → OnPeer(peer) fires:
+      peers[addr] = peer
+      HashRing.AddNode(addr)
+      Cluster.AddNode(addr, nil)
+      BandwidthMgr.RegisterPeer(addr, peer)  // peer satisfies RTTSource
+      send MessageAnnounce{ListenAddr: effectiveSelfAddr()}
+      send MessageIdentityMeta{Meta: identityMeta}
+
+Inbound connection accepted:
+  → OnPeer(peer) same as above (minus announce — waits for remote to send it)
+
+MessageAnnounce arrives:
+  handleAnnounce(peer, msg):
+    remappedAddr = peer.RemoteAddr()  // what *we* see (canonical)
+    if remappedAddr != msg.ListenAddr:
+        // Docker/NAT: remap all state from ephemeral to canonical addr
+        migrateMetadata(msg.ListenAddr, remappedAddr)
+    HashRing.AddNode(remappedAddr)
+    Cluster.AddNode(remappedAddr, ...)
+    send MessageAnnounceAck{YourAddr: remappedAddr}
+
+MessageAnnounceAck arrives:
+  handleAnnounceAck(msg):
+    externalAddr = msg.YourAddr  // now we know our external addr
+    GossipSvc.SetSelfAddr(externalAddr)
+    Cluster.BumpSelfGeneration()  // gossip our new canonical address
+
+Disconnect (OnPeerDisconnect):
+    delete peers[addr]
+    HashRing.RemoveNode(addr)
+    Cluster.ForceLocalState(addr, StateDead)
+    BandwidthMgr.UnregisterPeer(addr)
+    Rebalancer.OnNodeLeft(addr)
+    HandoffSvc: replay hints for addr on reconnect
+```
+
+---
+
+### Storage Engine (`Storage/`)
+
+#### `Store` struct (`Storage/storage.go`)
+
+```go
+type Store struct {
+    structOpts StructOpts  // {Root string, Meta MetadataStore}
+}
+
+type StructOpts struct {
+    Root string           // filesystem root for CAS files
+    Meta MetadataStore    // manifests + filemeta (BoltDB-backed)
+}
+
+// Core operations
+func NewStore(root string, meta MetadataStore) *Store
+
+// Write a file (chunked, encrypted, CAS-stored)
+// Called by server replication handlers (not upload path directly)
+func (s *Store) StoreData(key string, r io.Reader, opts EncryptionMeta) error
+
+// Write + collect metadata (deferred write for batch directory uploads)
+func (s *Store) StoreDataCollectMeta(key string, r io.Reader, opts EncryptionMeta, deferMeta bool) (*StoredFileResult, error)
+
+// Write + progress callbacks (used in directory upload pipeline)
+func (s *Store) StoreDataWithProgress(key string, r io.Reader, opts EncryptionMeta, onChunk func(idx, total int)) error
+
+// CAS read: stream decrypted chunk from disk
+func (s *Store) GetData(key string, dek []byte) (io.ReadCloser, error)
+
+// Direct-to-disk write (resumable, Merkle-verified, atomic rename)
+func (s *Store) GetDataToFile(key string, outputPath string, dek []byte) error
+
+// Directory operations
+func (s *Store) StoreDirectory(dirPath, baseKey string, opts EncryptionMeta, onFile, onChunk func(int,int)) error
+func (s *Store) GetDirectory(dirKey, outputDir string, dek []byte) error
+
+// Metadata lookups
+func (s *Store) Has(key string) bool
+func (s *Store) GetManifest(key string) (*chunker.ChunkManifest, bool)
+func (s *Store) GetDirManifest(key string) (*dirmanifest.DirectoryManifest, bool)
+func (s *Store) Keys() []string  // all locally-held keys
+
+// CAS path derivation
+// SHA-256(ciphertext) → hex string → split into 5-char dirs
+// e.g. "816cc20437d8595b..." → root/816cc/20437/d8595/<md5>.dat
+func casPath(root, hexHash string) string
+```
+
+#### `EncryptionMeta` — upload configuration
+
+```go
+type EncryptionMeta struct {
+    Encrypt     bool
+    DEK         []byte                  // 32-byte AES-256 key (nil = generate)
+    OwnerPubKey string                  // hex X25519 pub
+    OwnerEdPub  string                  // hex Ed25519 pub
+    AccessList  []chunker.AccessEntry   // wrapped DEKs for recipients
+    Signature   string                  // Ed25519 sig over manifest
+    Public      bool
+}
+```
+
+#### `MetadataStore` interface + implementations
+
+```go
+type MetadataStore interface {
+    Get(key string) (FileMeta, bool)
+    Set(key string, meta FileMeta) error
+    GetManifest(key string) (*chunker.ChunkManifest, bool)
+    SetManifest(key string, manifest *chunker.ChunkManifest) error
+    GetDirManifest(key string) ([]byte, bool)
+    SetDirManifest(key string, data []byte) error
+    WithBatch(fn func(batch MetadataBatch) error) error
+    Keys() []string
+    Delete(key string) error
+}
+
+type MetadataBatch interface {
+    SetManifest(key string, manifest *chunker.ChunkManifest) error
+    SetDirManifest(key string, data []byte) error
+    Set(key string, meta FileMeta) error
+}
+
+// BoltMetaStore — bbolt-backed, production implementation
+// Buckets: "filemeta" (FileMeta JSON), "manifests" (ChunkManifest JSON),
+//          "dirmanifests" (DirectoryManifest JSON)
+// WithBatch() opens a single bolt.Tx, runs fn, commits once (1 fsync)
+type BoltMetaStore struct { db *bolt.DB }
+func NewBoltMetaStore(path string) (*BoltMetaStore, error)
+```
+
+#### Chunker (`Storage/chunker/`)
+
+```go
+// All chunk hashes are SHA-256 of plaintext (before compression + encryption)
+type ChunkInfo struct {
+    Index      int
+    Hash       string   // hex SHA-256 of plaintext chunk
+    Size       int64
+    EncHash    string   // hex SHA-256 of ciphertext (CAS path key)
+    Compressed bool
+}
+
+type ChunkManifest struct {
+    FileKey       string
+    TotalSize     int64
+    ChunkSize     int
+    Chunks        []ChunkInfo
+    MerkleRoot    string           // SHA-256 of Merkle tree over plaintext hashes
+    CreatedAt     int64
+    Encrypted     bool
+    OwnerPubKey   string           // hex X25519
+    OwnerEdPubKey string           // hex Ed25519
+    AccessList    []AccessEntry    // ECDH: one entry per recipient
+    Signature     string           // Ed25519 sig (hex)
+}
+
+type AccessEntry struct {
+    RecipientPubKey string  // hex X25519
+    WrappedDEK      string  // hex [12B nonce || ciphertext || 16B GCM tag]
+}
+
+// Streaming chunker — sends Chunk values over channel as it reads
+func ChunkReader(r io.Reader, chunkSize int) (<-chan Chunk, <-chan error)
+
+// Pool-aware variant (zero-alloc uploads)
+func ChunkReaderWithPool(r io.Reader, chunkSize int,
+    readPool *sync.Pool, dataPool ...*sync.Pool) (<-chan Chunk, <-chan error)
+
+// Merkle tree: leaves = SHA-256(plaintext chunk), parents = SHA-256(left||right)
+// Odd-count: last leaf duplicated (standard convention)
+func BuildMerkleRoot(chunks []ChunkInfo) string
+func VerifyMerkleRoot(chunks []ChunkInfo, expected string) error
+func BuildManifest(fileKey string, chunks []ChunkInfo, createdAt int64) *ChunkManifest
+func VerifyChunk(c Chunk) bool  // re-hash and compare
+```
+
+#### Compression (`Storage/compression/`)
+
+```go
+// Entry point — decides whether to compress before returning
+func ShouldCompress(data []byte) bool
+// Logic:
+//   len(data) < 1024                → false (framing overhead)
+//   magic bytes match JPEG/PNG/ZIP/gzip/zstd/MP4/MKV → false (already compressed)
+//   entropy := shannonEntropy(data[:min(4096, len(data))])
+//   entropy < 7.0  → true
+//   entropy >= 7.5 → false
+//   7.0–7.5: borderline, compress and check ratio
+
+func CompressChunk(data []byte, level Level) (out []byte, wasCompressed bool, err error)
+// Calls ShouldCompress; if yes, zstd-compresses; if result >= original, returns original
+
+func CompressChunkWithPool(data []byte, level Level, pool *sync.Pool) (out []byte, wasCompressed bool, err error)
+
+func DecompressChunk(data []byte) ([]byte, error)  // zstd decompress
+```
+
+#### Resume sidecar (`Storage/resume/`)
+
+```go
+// On-disk layout (append-only text file at <outputPath>.resume):
+// Line 1: JSON Header
+// Line N: chunk index (decimal)
+
+type Header struct {
+    StorageKey  string
+    TotalChunks int
+    TotalSize   int64
+    ChunkSize   int
+    MerkleRoot  string
+    CreatedAt   int64
+}
+
+func Create(outputPath, storageKey, merkleRoot string,
+    totalChunks int, totalSize int64, chunkSize int) (*Sidecar, error)
+
+func Open(outputPath string) (s *Sidecar, skipSet map[int]bool, err error)
+// Reads header, validates against manifest before trusting, builds skipSet
+// Fast-verify: for each index in skipSet, re-hash from .part file before trusting
+
+func (s *Sidecar) RecordChunk(index int) error  // single append syscall
+func (s *Sidecar) Close() error
+func (s *Sidecar) Delete() error                // called after atomic rename
+```
+
+#### Pending sidecar (`Storage/pending/`)
+
+```go
+// Tracks in-progress uploads; lives next to CAS files, keyed by storageKey
+
+type ChunkRecord struct {
+    Index      int
+    Hash       string   // plaintext hash
+    Size       int64
+    EncHash    string   // CAS key
+    Compressed bool
+}
+
+func Create(storageRoot string, h Header) (*Sidecar, error)
+func Load(storageRoot, storageKey string) (*LoadResult, error)
+// Returns completed set + ChunkInfos for already-uploaded chunks
+// Allows upload to skip re-encrypting+re-hashing completed chunks
+
+func (s *Sidecar) RecordChunk(cr ChunkRecord) error
+func (s *Sidecar) Finalize(merkleRoot string) error  // write root, close
+func (s *Sidecar) Delete() error
+```
+
+---
+
+### Cryptography (`Crypto/`)
+
+#### Identity (`Crypto/identity/`)
+
+```go
+type Identity struct {
+    Alias       string
+    Ed25519Priv []byte  // 64 bytes (seed + public)
+    Ed25519Pub  []byte  // 32 bytes
+    X25519Priv  []byte  // 32 bytes (Diffie-Hellman)
+    X25519Pub   []byte  // 32 bytes
+}
+
+func Generate(alias string) (*Identity, error)  // crypto/rand, stored to disk
+func Load(path string) (*Identity, error)        // reads ~/.hermod/identity.json
+func (id *Identity) Save(path string) error
+func (id *Identity) Fingerprint() string
+// hex(SHA-256(Ed25519Pub))[:16]
+// Used as namespace prefix: "<fingerprint>/filename"
+
+func (id *Identity) GossipMetadata() map[string]string
+// Returns: {"alias": ..., "fingerprint": ..., "x25519_pub": hex, "ed25519_pub": hex}
+// Spread via MessageIdentityMeta so peers can ECDH-share without out-of-band key exchange
+```
+
+#### Envelope (`Crypto/envelope/`)
+
+```go
+// ECDH key wrapping
+func WrapDEKForRecipient(
+    senderX25519Priv []byte,
+    recipientX25519PubHex string,
+    dek []byte,
+) (*chunker.AccessEntry, error)
+// 1. X25519(senderPriv, recipientPub) → sharedSecret (32 bytes)
+// 2. HKDF-SHA256(sharedSecret, salt="hermod-dek-wrap") → wrappingKey (32 bytes)
+// 3. AES-256-GCM(wrappingKey, dek) → [12B nonce || ciphertext || 16B tag]
+// 4. Returns AccessEntry{RecipientPubKey: hex(recipientPub), WrappedDEK: hex(...)}
+
+func UnwrapDEK(
+    recipientX25519Priv []byte,
+    senderX25519PubHex string,
+    wrappedDEKHex string,
+) ([]byte, error)
+// Reverse: ECDH symmetry → same sharedSecret → same wrappingKey → AES-GCM decrypt
+
+// Manifest signing
+func SignManifest(edPriv ed25519.PrivateKey, payload ManifestSigningPayload) (string, error)
+// payload = {AccessList, Encrypted, FileKey, OwnerPubKey} — JSON, alphabetically sorted keys
+// Sign SHA-256(JSON) with Ed25519 → hex signature
+
+func VerifyManifest(edPubHex string, payload ManifestSigningPayload, sigHex string) (bool, error)
+// Reconstruct canonical JSON → SHA-256 → Ed25519 verify
+```
+
+#### Streaming encryption (`Crypto/crypto.go`)
+
+```go
+const ChunkSize = 4 * 1024 * 1024  // 4 MiB, matches chunker
+
+// Wire format per chunk: [4B big-endian chunk_len][12B nonce][ciphertext][16B GCM tag]
+// Nonce = chunk_index encoded as 12-byte big-endian (deterministic, no state)
+
+func EncryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error
+func EncryptStreamWithDEKPool(src io.Reader, dst io.Writer, dek []byte, pool *sync.Pool) error
+func DecryptStreamWithDEK(src io.Reader, dst io.Writer, dek []byte) error
+```
+
+---
+
+### Peer-to-Peer Transport (`Peer2Peer/`)
+
+#### Core interfaces (`Peer2Peer/transport.go`)
+
+```go
+type Peer interface {
+    net.Conn
+    Send(b []byte) error                              // fire-and-forget (new stream per call)
+    SendMsg(controlByte byte, payload []byte) error   // [ctrl][4B len][payload]
+    SendStream(msgPayload, streamData []byte) error   // header unthrottled, data streamed
+    SendStreamThrottled(msgPayload, streamData []byte,
+        wrapWriter func(io.Writer) io.Writer) error   // same + rate-limit wrapper
+    CloseStream()
+    Outbound() bool
+    SmoothedRTT() time.Duration                       // RTTSource for BandwidthManager
+}
+
+type Transport interface {
+    Addr() string
+    ListenAndAccept() error
+    Consume() <-chan RPC  // inbound messages
+    Close() error
+    Dial(addr string) error
+}
+
+type RPC struct {
+    From         net.Addr
+    Peer         Peer
+    Payload      []byte
+    Stream       bool
+    StreamWg     *sync.WaitGroup
+    StreamReader io.Reader  // QUIC stream; holds data until StreamWg.Done()
+}
+```
+
+#### QUIC transport (`Peer2Peer/quic/transport.go`)
+
+```go
+type TransportOpts struct {
+    ListenAddr  string
+    TLSConfig   *tls.Config   // self-signed cert generated on first run
+    Decoder     peer2peer.Decoder
+}
+
+// QUICPeer wraps a quic.Conn; each Send/SendMsg opens a new short-lived stream
+type QUICPeer struct {
+    conn     *quic.Conn
+    outbound bool
+}
+
+func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
+    stream, _ := p.conn.OpenStreamSync(ctx)
+    defer stream.Close()
+    buf := make([]byte, 1+4+len(payload))
+    buf[0] = controlByte
+    binary.BigEndian.PutUint32(buf[1:5], uint32(len(payload)))
+    copy(buf[5:], payload)
+    _, err = stream.Write(buf)  // single write = atomic header
+    return err
+}
+
+// SendStreamThrottled: header at wire speed, data via io.CopyBuffer (32 KiB slices)
+// wrapWriter = BandwidthManager.WrapWriter(stream)
+func (p *QUICPeer) SendStreamThrottled(msgPayload, streamData []byte,
+    wrapWriter func(io.Writer) io.Writer) error
+
+// SmoothedRTT reads from QUIC's internal congestion controller
+func (p *QUICPeer) SmoothedRTT() time.Duration {
+    return p.conn.ConnectionStats().SmoothedRTT
+    // NOTE: ConnectionStats(), NOT ConnectionState() — common mistake
+}
+```
+
+#### NAT Traversal (`Peer2Peer/nat/`)
+
+```go
+type Puncher struct {
+    cfg        Config
+    publicAddr string  // cached after STUN discovery
+}
+
+// DiscoverPublicAddr sends RFC 5389 STUN Binding Request over UDP
+// Returns "ip:port" as seen by the STUN server
+func (p *Puncher) DiscoverPublicAddr() (string, error)
+
+// Non-blocking startup: if STUN fails, node falls back to LAN-only with warning
+// Server wires this as:
+func (s *Server) discoverNAT() {
+    addr, err := s.NATService.DiscoverPublicAddr()
+    if err != nil {
+        log.Warn().Err(err).Msg("STUN failed, LAN-only mode")
+        return
+    }
+    s.externalAddr = addr
+    s.GossipSvc.SetSelfAddr(addr)
+}
+```
+
+#### mDNS (`Peer2Peer/mdns/`)
+
+```go
+// Advertiser registers a DNS-SD "_hermod._udp" service on the LAN
+type Advertiser struct { server *zeroconf.Server }
+func NewAdvertiser(alias, fingerprint, listenAddr string) (*Advertiser, error)
+func (a *Advertiser) Stop()
+
+// Scanner does a one-shot DNS-SD lookup, returns discovered peers
+func Scan(timeout time.Duration) ([]DiscoveredPeer, error)
+// Used by IPC OpScanLAN to show user what nodes are on LAN without explicit --peer flag
+```
+
+---
+
+### Cluster Coordination (`Cluster/`)
+
+#### Membership (`Cluster/membership/`)
+
+```go
+type NodeState int32
+const (
+    StateAlive   NodeState = 0
+    StateSuspect NodeState = 1
+    StateDead    NodeState = 2
+    StateLeft    NodeState = 3
+)
+// Monotonic — higher value always wins at same generation
+
+type NodeInfo struct {
+    Addr        string
+    State       NodeState
+    Generation  uint64            // time.Now().UnixNano() on startup; bumped on state change
+    LastUpdated time.Time
+    Metadata    map[string]string // gossip key-value bag (alias, fingerprint, keys, public_addr)
+}
+
+// UpdateState applies only if generation > current (guards stale gossip)
+// Returns true if state was applied
+func (cs *ClusterState) UpdateState(addr string, state NodeState, gen uint64) bool
+
+// ForceLocalState: called on socket close (no generation check needed — we observed it)
+func (cs *ClusterState) ForceLocalState(addr string, state NodeState)
+
+// BumpSelfGeneration: SWIM refutation — call after being declared Dead
+func (cs *ClusterState) BumpSelfGeneration()
+// Sets generation = time.Now().UnixNano() (guaranteed > any stale record)
+
+// SetMetadata: does NOT bump generation (metadata independent of liveness)
+func (cs *ClusterState) SetMetadata(addr string, meta map[string]string)
+
+// Merge: apply gossip digest; return addrs where we need full NodeInfo
+func (cs *ClusterState) Merge(digests []GossipDigest) []string
+```
+
+#### Gossip (`Cluster/gossip/`)
+
+```go
+type GossipService struct {
+    cfg             Config           // FanOut=3, Interval=200ms
+    selfAddr        string           // guarded by RWMutex (changes after AnnounceAck)
+    selfFingerprint string           // fingerprint-based self-detection (Docker safe)
+    cluster         *membership.ClusterState
+    getPeers        func() []string
+    sendMsg         func(addr string, msg interface{}) error
+    onNewPeer       func(addr string)  // triggers s.Connect(addr) on new gossip address
+}
+
+// One gossip round (every 200ms):
+// 1. pick FanOut random peers from getPeers()
+// 2. send MessageGossipDigest{Digests: cluster.Digest()}
+// 3. receiver: Merge(digests) → collect needFull list
+// 4. receiver: send MessageGossipResponse{Nodes: fullEntries for needFull}
+// 5. HandleResponse: for each entry, UpdateState + SetMetadata
+//    if fingerprint != selfFingerprint: apply (Docker: multiple containers may share 127.0.0.1)
+//    if entry.Addr is unknown + Alive: call onNewPeer(addr) → auto-connect
+
+func (gs *GossipService) HandleDigest(peer peer2peer.Peer, digests []membership.GossipDigest)
+func (gs *GossipService) HandleResponse(entries []membership.NodeInfo)
+```
+
+#### Consistent Hashing (`Cluster/hashring/`)
+
+```go
+type HashRing struct {
+    mu           sync.RWMutex
+    sortedHashes []uint64             // sorted virtual node positions
+    hashToNode   map[uint64]string    // position → physical addr
+    nodeToHashes map[string][]uint64  // physical addr → its positions (for removal)
+    virtualNodes int                  // default 150
+    replFactor   int
+}
+
+// AddNode: creates 150 virtual nodes
+// key = "addr-0" through "addr-149" → SHA-256 → first 8 bytes as uint64 → sorted insert
+func (hr *HashRing) AddNode(addr string)
+
+// GetNodes: up to N distinct physical nodes for a key
+// 1. SHA-256(key) → uint64 position
+// 2. binary.Search(sortedHashes, position) → start index
+// 3. walk clockwise, collect distinct physical nodes until N found or ring exhausted
+func (hr *HashRing) GetNodes(key string, n int) []string
+```
+
+#### Quorum (`Cluster/quorum/`)
+
+```go
+// pendingWrites: sync.Map[key → chan WriteAck]
+// pendingReads:  sync.Map[key → chan ReadResponse]
+// Both use buffered channels (capacity = N) for lock-free concurrent operations
+
+// Write flow:
+// 1. create chan WriteAck (cap=N)
+// 2. store in pendingWrites[key]
+// 3. goroutine: write locally → send ack on chan
+// 4. goroutine each remote: send MessageQuorumWrite → remote sends MessageQuorumWriteAck
+//    HandleWriteAck routes ack to correct chan via pendingWrites
+// 5. Wait: read W acks from chan within Timeout (5s default)
+
+// Read flow:
+// 1. create chan ReadResponse (cap=N)
+// 2. send MessageQuorumRead to all N replicas
+// 3. HandleReadResponse routes to chan
+// 4. Collect R responses, pass to conflict.LWWResolver.Resolve()
+
+func (c *Coordinator) Write(key string, data []byte, clock vclock.VectorClock) error
+func (c *Coordinator) Read(key string) (vclock.VectorClock, error)
+func (c *Coordinator) HandleWriteAck(ack WriteAck)
+func (c *Coordinator) HandleReadResponse(resp ReadResponse)
+```
+
+#### Failure Detection (`Cluster/failure/`)
+
+```go
+// Per-peer ring buffer of inter-arrival intervals (max 200 samples)
+type peerWindow struct {
+    intervals []float64  // milliseconds
+    head      int
+    count     int
+    lastSeen  time.Time
+}
+
+// Phi calculation:
+// elapsed = now - lastSeen
+// mean, stddev = stats over intervals (stddev clamped: min 1ms, min 10% of mean)
+// y = (elapsed - mean) / (stddev * sqrt(2))
+// cdf = 0.5 * (1 + erf(y))
+// phi = -log10(1 - cdf)
+// phi=0: definitely alive; phi=8: suspect; phi=16: almost certainly dead
+
+func (d *PhiAccrualDetector) RecordHeartbeat(addr string, at time.Time)
+func (d *PhiAccrualDetector) Phi(addr string) float64
+// Zero samples → phi=0 (new node is not suspicious)
+
+// Heartbeat service: two goroutines
+// sender (every 1s):  send MessageHeartbeat to all peers
+// reaper (every 500ms): for each peer, compute phi
+//   phi >= SuspectThreshold (8.0) → UpdateState(addr, StateSuspect, gen)
+//   StateSuspect for > DeadTimeout (30s) → UpdateState(addr, StateDead, gen)
+```
+
+#### Hinted Handoff (`Cluster/handoff/`)
+
+```go
+// Hints stored as JSON files: <dir>/<targetAddr_escaped>/<key_hash>.json
+// Survives process restart
+
+type Hint struct {
+    Key        string
+    TargetAddr string
+    Data       []byte
+    CreatedAt  time.Time
+    Attempts   int
+}
+
+// AddHint: if len(hints[target]) >= maxHints (1000), drop oldest
+func (s *Store) AddHint(h Hint) error
+
+// Replay (called by OnPeerReconnect in server.go):
+func (s *Store) GetHints(targetAddr string) []Hint
+// Server iterates, retries delivery, calls DeleteHint on success
+// After MaxAttempts (5): give up, DeleteHint anyway
+// activeDeliveries sync.Map prevents concurrent replay for same target
+
+// Hourly purge removes hints older than maxAge (24h)
+func (s *Store) PurgeExpired()
+```
+
+#### Rebalancer (`Cluster/rebalance/`)
+
+```go
+// Called by server on topology changes (after announce / after disconnect)
+
+func (r *Rebalancer) OnNodeJoined(newAddr string)
+// For each locally-held key:
+//   if newAddr ∈ HashRing.GetNodes(key, RF):
+//     sendFile(newAddr, key, data)  (with MigrationDelay=50ms between sends)
+
+func (r *Rebalancer) OnNodeLeft(deadAddr string)
+// For each locally-held key:
+//   current replicas = HashRing.GetNodes(key, RF)  (ring already removed dead node)
+//   if len(current) < RF: send copies to fill up to RF
+
+// inProgress flag (atomic): only one rebalance at a time
+// Prevents storms when multiple nodes join/leave simultaneously
+```
+
+#### Peer Selection (`Cluster/selector/`)
+
+```go
+type peerState struct {
+    ewmaLatency     float64  // milliseconds, alpha=0.2
+    activeDownloads int32
+}
+
+// EWMA update: new = 0.2*sample + 0.8*old
+func (s *Selector) RecordLatency(addr string, d time.Duration)
+
+// Implicit bad peer banning:
+// On chunk verification failure: RecordLatency(peer, 10*time.Minute)
+// EWMA jumps to ~600,000ms → score astronomical → not selected for ~10 minutes
+
+func (s *Selector) BestPeer(candidates []string) (string, bool)
+// score(peer) = ewmaLatency * (1 + 0.5 * activeDownloads)
+// returns candidate with minimum score
+// ties broken by order in candidates slice
+```
+
+#### Vector Clocks & Conflict Resolution
+
+```go
+// Cluster/vclock/
+type VectorClock map[string]uint64  // nodeAddr → logical counter
+
+type Relation int
+const (
+    Before     Relation = iota  // vc < other (causally dominated)
+    After                       // vc > other (causally dominates)
+    Concurrent                  // neither dominates (conflict)
+    Equal
+)
+
+func (vc VectorClock) Increment(addr string) VectorClock  // returns new copy
+func (vc VectorClock) Merge(other VectorClock) VectorClock  // element-wise max
+func (vc VectorClock) Compare(other VectorClock) Relation
+
+// Cluster/conflict/
+type Version struct {
+    NodeAddr  string
+    Clock     vclock.VectorClock
+    Timestamp int64  // UnixNano for LWW tiebreak
+}
+
+type LWWResolver struct{}
+func (r *LWWResolver) Resolve(versions []Version) Version
+// Priority:
+//   1. If Clock(A) < Clock(B): B wins  (causal order is strongest)
+//   2. If concurrent: higher Timestamp wins  (LWW tiebreak)
+//   3. Exact tie: first element in slice wins
+```
+
+#### Anti-Entropy (`Cluster/merkle/`)
+
+```go
+// Background service: every 10 minutes, sync with each peer
+
+// Protocol per peer pair (A syncing with B):
+// 1. A builds Merkle tree over sorted locally-held keys
+// 2. A sends MessageMerkleSync{RootHash: tree.RootHash()}
+// 3. B compares with own root:
+//      same  → in sync, done (no further traffic)
+//      diff  → B sends MessageMerkleDiffResponse{Keys: b.Keys()}
+// 4. A computes diff:
+//      key in A not B → A.sendManifest + A.sendFile to B  (push repair)
+//      key in B not A → A requests file from B            (pull repair)
+
+func Build(keys []string) *Tree
+// Leaves = SHA-256(key) for each key in sorted order
+// Odd count: duplicate last leaf
+
+func (t *Tree) RootHash() [32]byte
+func (t *Tree) Diff(other *Tree) (onlyInSelf, onlyInOther []string)
+```
+
+---
+
+### Downloader (`Server/downloader/`)
+
+```go
+type Manager struct {
+    cfg      Config            // MaxParallel=4, ChunkTimeout=30s, MaxRetries=3
+    sel      *selector.Selector
+    fetch    FetchFunc         // calls server.fetchChunkFromPeer
+    decrypt  DecryptFunc       // calls Crypto.DecryptChunk
+    getPeers GetPeersFunc      // calls HashRing.GetNodes
+}
+
+// Direct-to-disk (random-access, zero HoL blocking)
+func (m *Manager) DownloadToFile(ctx context.Context,
+    manifest *chunker.ChunkManifest,
+    dst io.WriterAt,          // *os.File opened for the .part path
+    progress ProgressFunc,
+    dek []byte) error
+
+// Resumable variant (same as above + skip set + record callback)
+func (m *Manager) DownloadToFileResumable(ctx context.Context,
+    manifest *chunker.ChunkManifest,
+    dst io.WriterAt,
+    skipSet map[int]bool,     // pre-verified chunks from resume sidecar
+    progress ProgressFunc,
+    onChunkDone ChunkRecordFunc,  // called after each verified write → sidecar.RecordChunk
+    dek []byte) error
+
+// Both methods:
+// - spawn up to MaxParallel goroutines (semaphore via buffered chan)
+// - for each missing chunk:
+//     candidates = getPeers(manifest.FileKey)
+//     peer = sel.BestPeer(candidates)
+//     encData = fetch(manifest.Chunks[i].EncHash, peer)
+//     plaintext = decrypt(encData, dek)
+//     SHA-256(plaintext) == manifest.Chunks[i].Hash ? OK : ban peer, retry
+//     dst.WriteAt(plaintext, int64(i)*chunkSize)
+//     onChunkDone(i) [for resume]
+// - after all chunks: VerifyMerkleRoot(manifest.Chunks, manifest.MerkleRoot)
+
+// Streaming variant (sliding window, for IPC pipes)
+func (m *Manager) DownloadToStream(ctx context.Context,
+    manifest *chunker.ChunkManifest,
+    dst io.Writer,            // IPC conn or stdout
+    progress ProgressFunc,
+    dek []byte) error
+// Window of MaxParallel in-flight chunks
+// Out-of-order buffer: map[int][]byte
+// Flush consecutive chunks in order to dst
+// Backpressure: pause workers when window full
+```
+
+---
+
+### Transfer Manager (`Server/transfer/`)
+
+```go
+// trackedTransfer wraps TransferInfo with a mutex (Go vet: sync.Mutex not embedded in copyable type)
+type trackedTransfer struct {
+    TransferInfo               // embedded (safe to copy as snapshot)
+    cancel context.CancelFunc  // stops the download/upload goroutine
+    mu     sync.Mutex          // guards mutations to TransferInfo fields
+}
+
+type Manager struct {
+    mu        sync.RWMutex
+    transfers map[string]*trackedTransfer
+    counter   uint32  // atomic ID generator
+}
+
+// Register: creates entry + context; caller uses ctx to pass to downloader
+func (m *Manager) Register(dir Direction, key, name, filePath string,
+    size int64, isDir, encrypted, public bool) (id string, ctx context.Context, cancel context.CancelFunc)
+
+// Pause: cancel the context (stops goroutine), set Status=Paused
+// .part + .resume files remain on disk for later Resume
+func (m *Manager) Pause(id string) error
+
+// Resume: new context + cancel, re-spawn download goroutine
+// Downloader reads .resume sidecar, fast-verifies, continues
+func (m *Manager) Resume(id string) error
+
+// Cancel: cancel context + remove from registry (no resume possible)
+func (m *Manager) Cancel(id string) error
+```
+
+---
+
+### Bandwidth Manager (`Server/ratelimit/`)
+
+```go
+type BandwidthManager struct {
+    peersMu sync.RWMutex
+    peers   map[string]RTTSource    // addr → QUICPeer (for RTT reads)
+
+    uploadLimiter   *rate.Limiter   // golang.org/x/time/rate token bucket
+    downloadLimiter *rate.Limiter
+    // Initial: 50 MB/s, burst 64 KiB
+    // Floor:   1 MB/s, ceiling: 200 MB/s
+
+    adjTicker *time.Ticker  // fires every 2s
+    stopCh    chan struct{}
+
+    transferSem chan struct{}  // bounded by --max-transfers flag
+}
+
+// RTT adjustment loop (every 2s):
+// for each registered peer:
+//   rtt = peer.SmoothedRTT()
+//   if rtt < 5ms:  limit = min(limit*1.20, 200 MB/s)
+//   if rtt > 25ms: limit = max(limit*0.60,   1 MB/s)
+// upload and download limiters adjusted independently
+
+type RTTSource interface {
+    SmoothedRTT() time.Duration
+}
+
+// RateLimitedWriter: calls limiter.WaitN in burst-sized chunks
+// CRITICAL: must NOT call WaitN(len(p)) directly if len(p) > burst (deadlocks)
+// Instead: chunk p into burstSize pieces, WaitN(burstSize) per piece
+type rateLimitedWriter struct {
+    w         io.Writer
+    limiter   *rate.Limiter
+    burstSize int  // 64 KiB = limiter.Burst()
+}
+
+// Same pattern for rateLimitedReader
+type rateLimitedReader struct {
+    r         io.Reader
+    limiter   *rate.Limiter
+    burstSize int
+}
+
+func (bm *BandwidthManager) WrapWriter(w io.Writer) io.Writer
+func (bm *BandwidthManager) WrapReader(r io.Reader) io.Reader
+
+// Upload path wiring:
+// replicateChunk(peer, key, data):
+//   peer.SendStreamThrottled(header, data, bm.WrapWriter)
+// handleGetFile (serving a chunk):
+//   peer.SendStreamThrottled(header, data, bm.WrapWriter)
+
+// Download path wiring:
+// RPC loop for stream RPCs: wraps rpc.StreamReader with bm.WrapReader
+// → QUIC backpressure propagates to sender automatically
+```
+
+---
+
+### Persistent State (`State/state.go`)
+
+```go
+type StateDB struct {
+    db *bolt.DB
+}
+
+// BoltDB buckets:
+// "uploads"          → key=storageKey,    val=JSON UploadEntry
+// "downloads"        → key=storageKey,    val=JSON DownloadEntry
+// "public_files"     → key=storageKey,    val=JSON PublicFileEntry
+// "tombstones"       → key=storageKey,    val=JSON TombstoneEntry
+// "known_peers"      → key=addr,          val=JSON {Addr, Alias, Fingerprint}
+// "ignored_peers"    → key=addr/fp,       val=timestamp
+// "inbox"            → key=entryID,       val=JSON InboxEntry
+// "outbox"           → key=entryID,       val=JSON OutboxEntry
+// "transfer_history" → key=<ts>_<id>,     val=JSON TransferHistoryEntry
+// "config"           → key="node_alias",  val=alias string
+
+func Open(path string) (*StateDB, error)
+func (s *StateDB) RecordUpload(entry UploadEntry) error
+func (s *StateDB) ListUploads() ([]UploadEntry, error)
+func (s *StateDB) RecordDownload(entry DownloadEntry) error
+func (s *StateDB) ListDownloads() ([]DownloadEntry, error)
+func (s *StateDB) AddPublicFile(e PublicFileEntry) error
+func (s *StateDB) RemovePublicFile(key string) error
+func (s *StateDB) ListPublicFiles() ([]PublicFileEntry, error)
+func (s *StateDB) RecordTransfer(e TransferHistoryEntry) error
+
+// PublicCatalogSummary: for gossip change detection
+// returns (count, totalBytes, SHA-256(sorted keys)[:16 hex])
+// Peers compare hashes; if different, request full catalog via IPC OpBrowsePeer
+func (s *StateDB) PublicCatalogSummary() (count, size int64, hash string)
+
+func (s *StateDB) RecordTombstone(e TombstoneEntry) error
+func (s *StateDB) IsTombstoned(key string) (bool, int64)
+func (s *StateDB) SaveKnownPeer(addr, alias, fp string) error
+func (s *StateDB) LoadKnownPeers() ([]KnownPeer, error)  // used at startup for auto-reconnect
+func (s *StateDB) AddToInbox(e InboxEntry) error
+func (s *StateDB) ListInbox() ([]InboxEntry, error)
+```
+
+---
+
+### IPC Protocol (`ipc/` + `cmd/`)
+
+#### Wire format
+
+```
+Client → Daemon:
+  [1B opcode][payload bytes...]
+
+  For file uploads, payload = gob-encoded request struct + raw file bytes appended
+
+Daemon → Client responses:
+  Success:    [0x00][JSON or raw bytes]
+  Error:      [0x01][error message]
+  Progress:   [0x02][4B completed][4B total]               (file download)
+              [0x02][4B fileIdx][4B fileTotal]
+                    [4B chunkIdx][4B chunkTotal]           (directory)
+```
+
+#### Dispatcher (`cmd/handle_client.go`)
+
+```go
+func HandleClient(conn net.Conn, s *server.Server) {
+    opcode := readByte(conn)
+    switch opcode {
+    case ipc.OpUpload:             handleUpload(conn, s)
+    case ipc.OpDownload:           handleDownload(conn, s)
+    case ipc.OpECDHUpload:         handleECDHUpload(conn, s)
+    case ipc.OpECDHDownload:       handleECDHDownload(conn, s)
+    case ipc.OpGetManifest:        handleGetManifestInfo(conn, s)
+    case ipc.OpResolveAlias:       handleResolveAlias(conn, s)
+    case ipc.OpDownloadToFile:     handleDownloadToFile(conn, s)
+    case ipc.OpECDHDownloadToFile: handleECDHDownloadToFile(conn, s)
+    case ipc.OpDirUpload:          handleDirUpload(conn, s)
+    case ipc.OpDirDownload:        handleDirDownload(conn, s)
+    case ipc.OpECDHDirUpload:      handleECDHDirUpload(conn, s)
+    case ipc.OpECDHDirDownload:    handleECDHDirDownload(conn, s)
+    case ipc.OpListUploads:        handleListUploads(conn, s)
+    case ipc.OpListDownloads:      handleListDownloads(conn, s)
+    case ipc.OpBrowsePeer:         handleBrowsePeer(conn, s)
+    case ipc.OpListPeers:          handleListPeers(conn, s)
+    case ipc.OpNodeStatus:         handleNodeStatus(conn, s)
+    case ipc.OpListTransfers:      handleListTransfers(conn, s)
+    case ipc.OpCancelTransfer:     handleCancelTransfer(conn, s)
+    case ipc.OpPauseTransfer:      handlePauseTransfer(conn, s)
+    case ipc.OpResumeTransfer:     handleResumeTransfer(conn, s)
+    case ipc.OpRemoveFile:         handleRemoveFile(conn, s)
+    case ipc.OpSearch:             handleSearch(conn, s)
+    case ipc.OpScanLAN:            handleScanLAN(conn, s)
+    // ...
+    }
+}
+
+// All handlers that start transfers call acquireTransfer first
+func acquireTransfer(conn net.Conn, s *server.Server) (release func(), ok bool) {
+    if err := s.BandwidthMgr.AcquireTransfer(ctx); err != nil {
+        writeError(conn, "max transfers reached")
+        return nil, false
+    }
+    return s.BandwidthMgr.ReleaseTransfer, true
+}
+```
+
+#### Upload flow (`cmd/handle_upload.go`)
+
+```go
+// Plaintext upload (OpUpload):
+// 1. Read gob-encoded UploadRequest{Key, Size, Public} from conn
+// 2. Read file bytes from conn (Size bytes)
+// 3. id, ctx, cancel = TransferMgr.Register(Upload, key, ...)
+// 4. s.Store.StoreDataWithProgress(key, bytes.Reader, EncryptionMeta{}, onChunk)
+//    onChunk → writeProgress(conn, done, total)
+// 5. HashRing.GetNodes(key, RF) → replicas
+// 6. for each remote replica:
+//      s.replicateChunk(replica, key, chunkData)  // QUIC MessageStoreFile
+// 7. TransferMgr.SetStatus(id, Completed, "")
+// 8. StateDB.RecordUpload(...)
+// 9. if public: StateDB.AddPublicFile(...)
+
+// ECDH upload (OpECDHUpload):
+// Same flow but:
+// 3b. Decode ECDHUploadRequest (DEK, AccessList, OwnerPubKey, Signature, ...)
+// 4b. EncryptionMeta{Encrypt: true, DEK: req.DEK, AccessList: req.AccessList, ...}
+//     passed to StoreDataWithProgress
+
+// Directory upload (OpDirUpload / OpECDHDirUpload):
+// Two-phase (Sprint D.1 optimization):
+// Phase 1: for each file in directory:
+//   StoreDataCollectMeta(key, fileReader, opts, deferMeta=true) → StoredFileResult
+// Phase 2: meta.WithBatch(func(batch) {
+//   for each result: batch.SetManifest(key, result.Manifest)
+//   batch.SetDirManifest(dirKey, dirManifestJSON)
+// }) → single fsync for all metadata
+```
+
+#### Download flow (`cmd/handle_download.go`)
+
+```go
+// Download-to-file (OpDownloadToFile):
+// 1. Read DownloadRequest{Key, OutputPath, Alias} from conn
+// 2. Resolve alias → fingerprint (LookupAlias)
+// 3. fullKey = fingerprint + "/" + key
+// 4. manifest = s.Store.GetManifest(fullKey) OR fetchManifestFromPeers(fullKey)
+// 5. id, ctx, _ = TransferMgr.Register(Download, fullKey, ...)
+// 6. Check for .resume sidecar:
+//      sidecar, skipSet, _ = resume.Open(outputPath)
+//      fast-verify skipSet against manifest
+// 7. Open .part file (os.OpenFile with O_RDWR|O_CREATE)
+// 8. Downloader.DownloadToFileResumable(ctx, manifest, partFile, skipSet,
+//      onProgress, sidecar.RecordChunk, dek)
+//    → per-chunk: verify SHA-256, ban bad peer, write to offset
+//    → after all: VerifyMerkleRoot
+// 9. sidecar.Delete()
+//    os.Rename(outputPath+".part", outputPath)  // atomic
+// 10. TransferMgr.SetStatus(id, Completed, "")
+//     StateDB.RecordDownload(...)
+```
+
+#### Manifest resolution (`handleGetManifestInfo`)
+
+```go
+// Unified stat: checks directory first, then file
+// Returns 3-byte header: [statusByte][encryptedByte][isDirectoryByte]
+func handleGetManifestInfo(conn net.Conn, s *server.Server) {
+    key := readString(conn)
+    // 1. Try local dirmanifest
+    if dm, ok := s.Store.GetDirManifest(key); ok {
+        writeHeader(conn, OK, dm.Encrypted, true)
+        writeJSON(conn, dm)
+        return
+    }
+    // 2. Try local chunk manifest
+    if cm, ok := s.Store.GetManifest(key); ok {
+        writeHeader(conn, OK, cm.Encrypted, false)
+        writeJSON(conn, cm)
+        return
+    }
+    // 3. Fetch from peers (MessageGetManifest → MessageManifestResponse)
+    // Peer does same dual-check, responds with IsDirectory flag
+    resp := s.fetchMetadataFromPeers(key)
+    writeHeader(conn, OK, resp.Encrypted, resp.IsDirectory)
+    writeJSON(conn, resp.Payload)
+}
+```
+
+---
+
+### Observability (`Observability/`)
+
+```go
+// health/
+type HealthServer struct {
+    httpServer *http.Server
+}
+// GET /health  → JSON {status, nodeAddr, peerCount, ringSize, uptime}
+// GET /metrics → Prometheus text format
+// GET /debug/pprof/* → pprof endpoints
+
+// metrics/ — Prometheus counters and histograms wired throughout server
+var (
+    uploadsTotal     prometheus.Counter
+    downloadsTotal   prometheus.Counter
+    bytesUploaded    prometheus.Counter
+    bytesDownloaded  prometheus.Counter
+    activePeers      prometheus.Gauge
+    transferDuration prometheus.Histogram
+    quorumWriteTime  prometheus.Histogram
+)
+
+// tracing/ — OpenTelemetry spans exported via OTLP to Jaeger
+// Key spans: upload, download, gossip round, rebalance, quorum write
+
+// logging/ — Zerolog structured logging
+// All logs include: "component", "peer", "key", "duration" fields
+// TUI captures log output via io.Pipe for in-app display
+```
+
+---
+
+### mDNS LAN Auto-Discovery (`Peer2Peer/mdns/`)
+
+Hermod uses multicast DNS (mDNS) for AirDrop-style zero-config peer discovery on the local network. When a node starts, it advertises itself; when the TUI opens, it scans for other nodes.
+
+#### Advertiser (`Peer2Peer/mdns/advertiser.go`)
+
+```go
+const ServiceTag = "_hermod._udp"
+
+type Advertiser struct {
+    server *hmdns.Server
+}
+
+// NewAdvertiser broadcasts this node's presence on the LAN.
+// host must be a routable IP (from resolveOutboundIP, NOT 0.0.0.0).
+func NewAdvertiser(host, alias, fingerprint string, port int) (*Advertiser, error) {
+    ip := net.ParseIP(host)
+    txt := []string{
+        "alias=" + alias,
+        "fp=" + fingerprint,
+        "port=" + strconv.Itoa(port),
+    }
+    svc, _ := hmdns.NewMDNSService(alias, ServiceTag, "", "", port, []net.IP{ip}, txt)
+    server, _ := hmdns.NewServer(&hmdns.Config{Zone: svc})
+    return &Advertiser{server: server}, nil
+}
+```
+
+The advertiser is started in `Server.Start()` after the transport binds, using the identity alias and fingerprint from `MakeServerOpts.IdentityMeta`. It is stopped in `GracefulShutdown()`.
+
+#### Scanner (`Peer2Peer/mdns/scanner.go`)
+
+```go
+type DiscoveredPeer struct {
+    Alias       string
+    Fingerprint string
+    Addr        string // "ip:port"
+}
+
+func Scan(timeout time.Duration) ([]DiscoveredPeer, error) {
+    // Queries _hermod._udp via mDNS multicast (224.0.0.251).
+    // Parses TXT records for alias, fingerprint, port.
+    // Prefers IPv4 addresses over IPv6.
+    // Returns all discovered Hermod nodes on the LAN.
+}
+```
+
+#### Self-Filtering (`cmd/handle_peers.go`)
+
+The IPC handler `handleScanLAN` filters out the scanning node itself by comparing both fingerprint and address:
+
+```go
+func handleScanLAN(conn net.Conn, s *server.Server) {
+    found, _ := peermdns.Scan(3 * time.Second)
+    selfFP := s.SelfFingerprint()
+    selfAddr := s.SelfAddr()
+    var peers []ipc.DiscoveredPeer
+    for _, f := range found {
+        if selfFP != "" && f.Fingerprint == selfFP { continue } // skip self
+        if f.Addr == selfAddr { continue }                       // skip self
+        peers = append(peers, ...)
+    }
+    writeJSONResponse(conn, peers)
+}
+```
+
+#### TUI Integration
+
+The TUI Network tab merges connected peers with discovered (unconnected) peers into a single table. Discovered peers show state "LAN" and pressing Enter triggers a connect action instead of browse:
+
+```go
+func (n *NetworkTab) rebuildPeerTable() {
+    // 1. Add connected peers (state = "Alive"/"Dead"/etc)
+    // 2. Deduplicate by fingerprint + address
+    // 3. Append discovered peers with state "LAN"
+}
+
+// Enter key dispatch:
+//   idx < len(connected)  → NetworkBrowseMsg (browse files)
+//   idx >= len(connected) → NetworkConnectMsg (dial the peer)
+```
+
+IPC opcode: `0x1F` (`OpScanLAN`). Shared type: `ipc.DiscoveredPeer`.
+
+---
+
+### IP Resolution & Address Normalization (`Server/server.go`)
+
+#### `resolveOutboundIP()` — 3-tier LAN IP discovery
+
+Returns this machine's routable LAN IP. Critical for mDNS advertisement and peer announcements — advertising `0.0.0.0` or `docker0`'s `172.17.0.1` causes remote peers to receive an unreachable address.
+
+```go
+func resolveOutboundIP() string {
+    // Tier 1: UDP routing trick — net.Dial("udp", "8.8.8.8:80")
+    //   OS picks the interface that would route to 8.8.8.8.
+    //   No packet sent (UDP connect only). Works on any LAN with internet.
+
+    // Tier 2: Scored interface enumeration (air-gapped campus LAN)
+    //   Skips virtual interfaces: docker*, veth*, virbr*, vmnet*, br-*,
+    //     utun*, tun*, tap*, vbox*, hyperv*, lxcbr*, flannel*, cni*,
+    //     calico*, podman*, tailscale*, wg*
+    //   Skips: loopback, link-local, point-to-point
+    //   Prefers RFC-1918 private IPs (10.x, 172.16-31.x, 192.168.x)
+    //   Falls back to any non-virtual IPv4 address
+
+    // Tier 3: "127.0.0.1" — absolute last resort (single-machine only)
+}
+```
+
+**Why scored enumeration matters:** On a Linux host running Docker, `net.Interfaces()` returns `docker0` (172.17.0.1) before `wlan0` (192.168.x.x). Without filtering, the node advertises a Docker-internal IP that no remote peer can reach.
+
+#### `effectiveSelfAddr()` — externally-visible address
+
+```go
+func (s *Server) effectiveSelfAddr() string {
+    // Priority order:
+    // 1. External address (from AnnounceAck or STUN) — works behind NAT
+    // 2. resolveOutboundIP() — when bound to ":3000" or "0.0.0.0:3000"
+    // 3. normalizeAddr() — when bound to a specific IP
+}
+```
+
+#### `NormalizeUserAddr()` — bare IP default port
+
+Ensures user-provided addresses always have a port. Bare IPs (`192.168.1.5`) get the default port (`:3000`) appended. Applied at all user-input boundaries: `--peer` flag, TUI connect, CLI connect.
+
+```go
+const DefaultPort = "3000"
+
+func NormalizeUserAddr(addr string) string {
+    if _, _, err := net.SplitHostPort(addr); err == nil {
+        return addr // already has port
+    }
+    if ip := net.ParseIP(addr); ip != nil {
+        return net.JoinHostPort(addr, DefaultPort) // "192.168.1.5" → "192.168.1.5:3000"
+    }
+    return addr // hostname or alias — return as-is for LookupAlias
+}
+```
+
+---
+
+### Cross-Platform Firewall Auto-Configuration (`cmd/firewall*.go`)
+
+On first startup, Hermod automatically configures the OS firewall to allow inbound UDP traffic on its listening port. This is critical for cross-platform connectivity — Windows and macOS block inbound UDP by default.
+
+#### Architecture
+
+```go
+// cmd/firewall.go — shared logic (all platforms)
+const firewallFlagFile = ".firewall-configured"
+// Flag file at ~/.hermod/.firewall-configured prevents re-prompting.
+
+// cmd/firewall_windows.go
+func ensureFirewallRule(port int) error {
+    // 1. Check if rule already exists: netsh show rule name=Hermod
+    // 2. Try direct netsh add rule (if already admin)
+    // 3. Fall back to ShellExecuteW("runas", "netsh", ...) for UAC prompt
+    //    → Standard Windows UAC dialog appears, user clicks "Yes" once
+    // Rule: inbound UDP on port, program-scoped to hermod.exe
+}
+
+// cmd/firewall_linux.go
+func ensureFirewallRule(port int) error {
+    // Tries in order: ufw → firewall-cmd → iptables
+    // Uses sudo -n (non-interactive) if not root
+    // No GUI dependency (pkexec removed — doesn't work on headless/SSH)
+}
+
+// cmd/firewall_darwin.go
+func ensureFirewallRule(port int) error {
+    // Uses socketfilterfw via osascript "with administrator privileges"
+    // macOS shows native admin password prompt
+    // Adds + unblocks the hermod binary in Application Firewall
+}
+```
+
+Called from `StartDaemonAsync()` in `cmd/daemon.go` before the server starts. Failure is non-fatal (logged as warning) — on networks without firewalls, it silently succeeds.
+
+---
+
+### TUI Logging Safety (`cmd/unified.go`)
+
+The TUI uses bubbletea which takes exclusive control of stdout for terminal rendering (alt-screen mode). Any writes to stdout corrupt the display.
+
+```go
+// SAFE: redirect Go's standard logger to a file
+log.SetOutput(logFile) // captures log.Printf from third-party packages
+
+// SAFE: bubbletea's own debug capture
+tea.LogToFile(filepath.Join(homeDir, ".hermod", "tui-debug.log"), "debug")
+
+// DANGEROUS (removed): os.Stdout = logFile
+// This redirected bubbletea's own terminal output to the log file,
+// causing a blank screen with a blinking cursor.
+```
+
+The server's `MakeServer()` conditionally initializes logging only if no logger exists yet:
+
+```go
+if logging.Global == nil {
+    logging.Init("server", logging.LevelInfo)
+}
+```
+
+This prevents the daemon (started from the TUI process) from resetting the global logger to stdout after the TUI has already captured it.
+
+---
+
+### Critical Wiring Summary
+
+The table below shows which struct field on `Server` wires to which subsystem call for the most common operations.
+
+| Operation | Server field used | Key call |
+|-----------|-------------------|----------|
+| Store chunk locally | `Store` | `Store.StoreData(key, r, opts)` |
+| Find replica nodes | `HashRing` | `HashRing.GetNodes(key, RF)` |
+| Send chunk to peer | `peers[addr]` | `peer.SendStreamThrottled(hdr, data, bm.WrapWriter)` |
+| Throttle transfer | `BandwidthMgr` | `BandwidthMgr.WrapWriter(stream)` |
+| Pick best peer | `Selector` | `Selector.BestPeer(candidates)` |
+| Download chunks | `Downloader` | `Downloader.DownloadToFileResumable(...)` |
+| Verify chunk integrity | (inline in downloader) | `sha256(plaintext) == manifest.Chunks[i].Hash` |
+| Write quorum | `Quorum` | `Quorum.Write(key, data, clock)` |
+| Detect node failure | `HeartbeatSvc` | `PhiAccrualDetector.Phi(addr) >= 8.0` |
+| Buffer unreachable write | `HandoffSvc` | `HandoffSvc.AddHint(hint)` |
+| Repair divergence | `AntiEntropy` | `AntiEntropyService` runs every 10 min |
+| Migrate on join | `Rebalancer` | `Rebalancer.OnNodeJoined(addr)` |
+| Spread membership | `GossipSvc` | `GossipService` every 200ms |
+| Persist history | `StateDB` | `StateDB.RecordUpload/Download(...)` |
+| ECDH wrap key | (in upload handler) | `envelope.WrapDEKForRecipient(...)` |
+| ECDH unwrap key | (in download handler) | `envelope.UnwrapDEK(...)` |
+| Resume download | (in handle_download) | `resume.Open(path)` → `skipSet` → `DownloadToFileResumable` |
+| Pause/cancel | `TransferMgr` | `TransferMgr.Pause/Cancel(id)` → context cancel |
+
+---
+
+*Implementation reference reflects codebase as of v0.2.x. Last updated March 2026.*

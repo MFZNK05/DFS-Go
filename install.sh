@@ -1,11 +1,11 @@
 #!/bin/sh
-# Hermond installer — detects OS/arch, downloads latest release, installs binary.
+# Hermod installer — detects OS/arch, downloads latest release, installs binary.
 # Usage: curl -sSfL https://raw.githubusercontent.com/MFZNK05/DFS-Go/main/install.sh | sh
 
 set -e
 
 REPO="MFZNK05/DFS-Go"
-BINARY="hermond"
+BINARY="hermod"
 
 # --- helpers ----------------------------------------------------------------
 

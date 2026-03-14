@@ -1,17 +1,19 @@
-// Package mdns provides mDNS-based LAN auto-discovery for Hermond nodes.
+// Package mdns provides mDNS-based LAN auto-discovery for Hermod nodes.
 // When a node starts, it advertises itself via mDNS so other nodes on the
 // same WiFi/LAN can discover it without typing IP addresses.
 package mdns
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"strconv"
 
 	hmdns "github.com/hashicorp/mdns"
 )
 
-const ServiceTag = "_hermond._udp"
+const ServiceTag = "_hermod._udp"
 
 // Advertiser broadcasts this node's presence on the LAN via mDNS.
 type Advertiser struct {
@@ -46,7 +48,9 @@ func NewAdvertiser(host, alias, fingerprint string, port int) (*Advertiser, erro
 		return nil, fmt.Errorf("mdns: new service: %w", err)
 	}
 
-	server, err := hmdns.NewServer(&hmdns.Config{Zone: svc})
+	// Suppress hashicorp/mdns IPv6 log spam on networks without IPv6 multicast.
+	silentLogger := log.New(io.Discard, "", 0)
+	server, err := hmdns.NewServer(&hmdns.Config{Zone: svc, Logger: silentLogger})
 	if err != nil {
 		return nil, fmt.Errorf("mdns: start server: %w", err)
 	}

@@ -18,7 +18,7 @@ func ipcDial(path string) (net.Conn, error) {
 }
 
 func platformSocketPath(port string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("hermond-%s.sock", port))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("hermod-%s.sock", port))
 }
 
 func cleanupSocket(path string) {

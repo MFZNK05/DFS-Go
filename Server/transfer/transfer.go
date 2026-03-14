@@ -81,8 +81,10 @@ type TransferInfo struct {
 // trackedTransfer wraps TransferInfo with internal synchronization and cancel.
 type trackedTransfer struct {
 	TransferInfo
-	cancel context.CancelFunc
-	mu     sync.Mutex
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	lastBytes int64     // bytes at last progress update
+	lastTime  time.Time // wall-clock at last progress update
 }
 
 // Manager is a thread-safe in-memory registry of active transfers.
@@ -145,6 +147,9 @@ func (m *Manager) SetStatus(id string, status Status, errMsg string) {
 }
 
 // UpdateProgress updates chunk progress and speed for a transfer.
+// Speed is calculated as an EWMA (exponentially weighted moving average) of
+// recent throughput so that the display reacts quickly to speed changes
+// instead of showing a lifetime average that barely moves after 30 minutes.
 func (m *Manager) UpdateProgress(id string, completed, total int, bytesDone int64) {
 	m.mu.RLock()
 	t, ok := m.transfers[id]
@@ -156,10 +161,33 @@ func (m *Manager) UpdateProgress(id string, completed, total int, bytesDone int6
 	t.Completed = completed
 	t.Total = total
 	t.BytesDone = bytesDone
-	elapsed := time.Since(t.StartedAt).Seconds()
-	if elapsed > 0 && bytesDone > 0 {
-		t.Speed = float64(bytesDone) / elapsed
+
+	now := time.Now()
+	if t.lastTime.IsZero() {
+		// First update — seed with lifetime average so speed is non-zero immediately.
+		t.lastTime = t.StartedAt
+		t.lastBytes = 0
+		dt := now.Sub(t.lastTime).Seconds()
+		if dt > 0 && bytesDone > 0 {
+			t.Speed = float64(bytesDone) / dt
+		}
+		t.lastBytes = bytesDone
+		t.lastTime = now
+	} else {
+		dt := now.Sub(t.lastTime).Seconds()
+		if dt > 0.5 { // only recalculate when ≥500ms has passed
+			instantSpeed := float64(bytesDone-t.lastBytes) / dt
+			const alpha = 0.3 // smoothing factor — higher = more reactive
+			if t.Speed <= 0 {
+				t.Speed = instantSpeed
+			} else {
+				t.Speed = alpha*instantSpeed + (1-alpha)*t.Speed
+			}
+			t.lastBytes = bytesDone
+			t.lastTime = now
+		}
 	}
+
 	t.mu.Unlock()
 }
 

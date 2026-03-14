@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"os"
+
 	"github.com/Faizan2005/DFS-Go/Cluster/membership"
 	server "github.com/Faizan2005/DFS-Go/Server"
 	"github.com/Faizan2005/DFS-Go/Server/transfer"
@@ -17,20 +18,6 @@ import (
 	"github.com/Faizan2005/DFS-Go/Storage/chunker"
 	"github.com/Faizan2005/DFS-Go/ipc"
 )
-
-// acquireTransfer attempts to acquire a transfer slot from the bandwidth
-// manager's semaphore. Returns a release function (call via defer) and true
-// on success. On failure, writes an error to conn and returns false.
-func acquireTransfer(conn net.Conn, s *server.Server) (release func(), ok bool) {
-	if s.BandwidthMgr == nil {
-		return func() {}, true
-	}
-	if err := s.BandwidthMgr.AcquireTransfer(context.Background()); err != nil {
-		writeStatus(conn, statusError, "server busy: "+err.Error())
-		return nil, false
-	}
-	return s.BandwidthMgr.ReleaseTransfer, true
-}
 
 // recordUploadState records an upload in the StateDB (if available).
 func recordUploadState(s *server.Server, key, path string, size int64, encrypted, public, isDir bool) {
@@ -209,6 +196,12 @@ func HandleClient(conn net.Conn, s *server.Server) {
 		handleUnblockPeer(conn, s)
 	case opcodeScanLAN:
 		handleScanLAN(conn, s)
+	case opcodeSeedUpload:
+		handleSeedUpload(conn, s)
+	case opcodeSeedECDHUpload:
+		handleSeedECDHUpload(conn, s)
+	case opcodeShutdown:
+		handleShutdown(conn, s)
 	default:
 		log.Printf("IPC: unknown opcode 0x%02x", opcode[0])
 	}
@@ -216,11 +209,7 @@ func HandleClient(conn net.Conn, s *server.Server) {
 
 // handleUpload handles plaintext (no encryption) uploads.
 func handleUpload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, fileSize, public, err := readUploadRequest(conn)
 	if err != nil {
@@ -259,11 +248,7 @@ func handleUpload(conn net.Conn, s *server.Server) {
 
 // handleECDHUpload handles ECDH-encrypted uploads.
 func handleECDHUpload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	req, err := readECDHUploadRequest(conn)
 	if err != nil {
@@ -309,11 +294,7 @@ func handleECDHUpload(conn net.Conn, s *server.Server) {
 
 // handleDownload handles plaintext (no encryption) downloads.
 func handleDownload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, err := readDownloadRequest(conn)
 	if err != nil {
@@ -343,11 +324,7 @@ func handleDownload(conn net.Conn, s *server.Server) {
 // handleECDHDownload handles encrypted downloads with a client-provided DEK.
 // Wire format is identical to the old CSE download: [2B name-len][name][2B dek-len][dek].
 func handleECDHDownload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	name, dek, err := readECDHDownloadRequest(conn)
 	if err != nil {
@@ -378,11 +355,7 @@ func handleECDHDownload(conn net.Conn, s *server.Server) {
 // The daemon writes directly to the specified file path using random-access I/O.
 // Progress updates are sent back over the IPC socket.
 func handleDownloadToFile(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, filePath, err := readDownloadToFileRequest(conn)
 	if err != nil {
@@ -417,11 +390,7 @@ func handleDownloadToFile(conn net.Conn, s *server.Server) {
 
 // handleECDHDownloadToFile handles encrypted direct-to-disk downloads (opcode 0x08).
 func handleECDHDownloadToFile(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, filePath, dek, err := readECDHDownloadToFileRequest(conn)
 	if err != nil {
@@ -511,11 +480,7 @@ func handleResolveAlias(conn net.Conn, s *server.Server) {
 
 // handleDirUpload handles plaintext directory uploads (opcode 0x09).
 func handleDirUpload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, dirPath, public, err := readDirUploadRequest(conn)
 	if err != nil {
@@ -553,11 +518,7 @@ func handleDirUpload(conn net.Conn, s *server.Server) {
 
 // handleDirDownload handles plaintext directory downloads (opcode 0x0A).
 func handleDirDownload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, outputDir, err := readDirDownloadRequest(conn)
 	if err != nil {
@@ -578,7 +539,8 @@ func handleDirDownload(conn net.Conn, s *server.Server) {
 		writeDirProgressUpdate(conn, fileIdx, fileTotal, chunkIdx, chunkTotal)
 	}
 
-	if err := s.GetDirectory(ctx, key, outputDir, nil, progress); err != nil {
+	report, err := s.GetDirectory(ctx, key, outputDir, nil, progress)
+	if err != nil {
 		log.Println("IPC dir-download: GetDirectory:", err)
 		writeStatus(conn, statusError, err.Error())
 		return
@@ -591,16 +553,17 @@ func handleDirDownload(conn net.Conn, s *server.Server) {
 	s.TransferMgr.SetSize(tid, dirSize)
 	recordDownloadState(s, key, outputDir, dirSize, false, true)
 
+	if report.Failed > 0 {
+		writeStatus(conn, statusError, fmt.Sprintf("downloaded %d/%d files. %d failed: %v",
+			report.Succeeded, report.Succeeded+report.Failed, report.Failed, report.FailedFiles))
+		return
+	}
 	writeStatus(conn, statusOK, fmt.Sprintf("downloaded directory to %s", outputDir))
 }
 
 // handleECDHDirUpload handles encrypted directory uploads (opcode 0x0B).
 func handleECDHDirUpload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	req, err := readECDHDirUploadRequest(conn)
 	if err != nil {
@@ -646,11 +609,7 @@ func handleECDHDirUpload(conn net.Conn, s *server.Server) {
 
 // handleECDHDirDownload handles encrypted directory downloads (opcode 0x0C).
 func handleECDHDirDownload(conn net.Conn, s *server.Server) {
-	release, ok := acquireTransfer(conn, s)
-	if !ok {
-		return
-	}
-	defer release()
+
 
 	key, outputDir, dek, err := readECDHDirDownloadRequest(conn)
 	if err != nil {
@@ -672,7 +631,8 @@ func handleECDHDirDownload(conn net.Conn, s *server.Server) {
 		writeDirProgressUpdate(conn, fileIdx, fileTotal, chunkIdx, chunkTotal)
 	}
 
-	if err := s.GetDirectory(ctx, key, outputDir, dek, progress); err != nil {
+	report, err := s.GetDirectory(ctx, key, outputDir, dek, progress)
+	if err != nil {
 		log.Println("IPC ECDH dir-download: GetDirectory:", err)
 		writeStatus(conn, statusError, err.Error())
 		return
@@ -685,6 +645,11 @@ func handleECDHDirDownload(conn net.Conn, s *server.Server) {
 	s.TransferMgr.SetSize(tid, dirSize)
 	recordDownloadState(s, key, outputDir, dirSize, true, true)
 
+	if report.Failed > 0 {
+		writeStatus(conn, statusError, fmt.Sprintf("downloaded %d/%d files. %d failed: %v",
+			report.Succeeded, report.Succeeded+report.Failed, report.Failed, report.FailedFiles))
+		return
+	}
 	writeStatus(conn, statusOK, fmt.Sprintf("downloaded encrypted directory to %s", outputDir))
 }
 
@@ -843,7 +808,12 @@ func handleResumeTransfer(conn net.Conn, s *server.Server) {
 			}
 		case transfer.Download:
 			if info.IsDir {
-				opErr = s.GetDirectory(ctx, info.Key, info.OutputDir, info.DEK, nil)
+				report, dirErr := s.GetDirectory(ctx, info.Key, info.OutputDir, info.DEK, nil)
+				if dirErr != nil {
+					opErr = dirErr
+				} else if report.Failed > 0 {
+					opErr = fmt.Errorf("downloaded %d/%d files, %d failed", report.Succeeded, report.Succeeded+report.Failed, report.Failed)
+				}
 			} else {
 				opErr = s.GetDataToFile(ctx, info.Key, info.FilePath, info.DEK, func(completed, total int) {
 					s.TransferMgr.UpdateProgress(id, completed, total, int64(completed)*4<<20)
@@ -1036,4 +1006,93 @@ func handleNodeStatus(conn net.Conn, s *server.Server) {
 		}
 	}
 	writeJSONResponse(conn, info)
+}
+
+// ── Seed In Place Upload Handlers ─────────────────────────────────────
+
+// handleSeedUpload handles plaintext seed-in-place uploads.
+// The CLI sends the file path — the daemon opens it directly (no data over IPC).
+func handleSeedUpload(conn net.Conn, s *server.Server) {
+
+
+	key, filePath, fileSize, public, err := readSeedUploadRequest(conn)
+	if err != nil {
+		log.Println("IPC seed upload: read header:", err)
+		writeStatus(conn, statusError, "bad request: "+err.Error())
+		return
+	}
+
+	tid, ctx, cancel := s.TransferMgr.Register(transfer.Upload, key, extractName(key), filePath, fileSize, false, false, public)
+	defer cancel()
+	defer completeAndRecordTransfer(s, tid)
+	s.TransferMgr.SetStatus(tid, transfer.Active, "")
+	writeTransferID(conn, tid)
+
+	progress := func(completed, total int) {
+		s.TransferMgr.UpdateProgress(tid, completed, total, int64(completed)*4<<20)
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.SeedInPlace(ctx, key, filePath, nil, fileSize, progress); err != nil {
+		log.Println("IPC seed upload: SeedInPlace:", err)
+		writeStatus(conn, statusError, err.Error())
+		return
+	}
+
+	recordUploadState(s, key, filePath, fileSize, false, public, false)
+	writeStatus(conn, statusOK, fmt.Sprintf("seeded %q (zero-copy, %d bytes indexed)", key, fileSize))
+}
+
+// handleSeedECDHUpload handles ECDH-encrypted seed-in-place uploads.
+func handleSeedECDHUpload(conn net.Conn, s *server.Server) {
+
+
+	req, err := readSeedECDHUploadRequest(conn)
+	if err != nil {
+		log.Println("IPC seed ECDH upload: read header:", err)
+		writeStatus(conn, statusError, "bad request: "+err.Error())
+		return
+	}
+
+	tid, ctx, cancel := s.TransferMgr.Register(transfer.Upload, req.Key, extractName(req.Key), req.FilePath, req.FileSize, false, true, req.Public)
+	defer cancel()
+	defer completeAndRecordTransfer(s, tid)
+	s.TransferMgr.SetStatus(tid, transfer.Active, "")
+	writeTransferID(conn, tid)
+
+	enc := &server.EncryptionMeta{
+		DEK:           req.DEK,
+		OwnerPubKey:   req.OwnerPubKey,
+		OwnerEdPubKey: req.OwnerEdPubKey,
+		AccessList:    req.AccessList,
+		Signature:     req.Signature,
+	}
+
+	progress := func(completed, total int) {
+		s.TransferMgr.UpdateProgress(tid, completed, total, int64(completed)*4<<20)
+		writeProgressUpdate(conn, completed, total)
+	}
+
+	if err := s.SeedInPlace(ctx, req.Key, req.FilePath, enc, req.FileSize, progress); err != nil {
+		log.Println("IPC seed ECDH upload: SeedInPlace:", err)
+		writeStatus(conn, statusError, err.Error())
+		return
+	}
+
+	recordUploadState(s, req.Key, req.FilePath, req.FileSize, true, req.Public, false)
+	writeStatus(conn, statusOK, fmt.Sprintf("seeded (ECDH) %q (zero-copy, %d bytes indexed)", req.Key, req.FileSize))
+}
+
+// handleShutdown handles the OpShutdown IPC command.
+// Responds OK, then triggers graceful shutdown and exits the daemon process.
+func handleShutdown(conn net.Conn, s *server.Server) {
+	writeStatus(conn, statusOK, "shutting down")
+	conn.Close()
+	log.Println("IPC: shutdown requested — stopping daemon")
+
+	// Call the registered shutdown function (set by StartDaemonAsync).
+	if fn := getDaemonStopFunc(); fn != nil {
+		fn()
+	}
+	os.Exit(0)
 }

@@ -3,8 +3,8 @@ package cmd
 import "strings"
 
 // socketPath returns the IPC address for a given node port string.
-// On Unix: /tmp/hermond-3000.sock (Unix domain socket)
-// On Windows: \\.\pipe\hermond-3000 (named pipe)
+// On Unix: /tmp/hermod-3000.sock (Unix domain socket)
+// On Windows: \\.\pipe\hermod-3000 (named pipe)
 func socketPath(port string) string {
 	// strip everything up to and including the last ':'
 	p := port

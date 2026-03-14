@@ -81,8 +81,8 @@ func (u *UploadModal) Update(msg tea.KeyMsg) tea.Cmd {
 func (u *UploadModal) submit() tea.Cmd {
 	u.ErrMsg = ""
 
-	name := strings.TrimSpace(u.Name)
-	path := strings.TrimSpace(u.FilePath)
+	name := strings.TrimSpace(sanitizeInput(u.Name))
+	path := strings.TrimSpace(sanitizeInput(u.FilePath))
 
 	if name == "" {
 		u.ErrMsg = "Name is required"
@@ -94,6 +94,7 @@ func (u *UploadModal) submit() tea.Cmd {
 	}
 
 	path = expandHome(path)
+	path = filepath.Clean(path)
 
 	// Check if path exists
 	info, err := os.Stat(path)
@@ -103,6 +104,16 @@ func (u *UploadModal) submit() tea.Cmd {
 	}
 
 	isDir := info.IsDir()
+
+	// Auto-append the source file's extension to the name if the user
+	// didn't include one. This ensures cross-platform downloads retain the
+	// correct file type (Windows/macOS rely on extensions).
+	if !isDir && filepath.Ext(name) == "" {
+		if ext := filepath.Ext(path); ext != "" {
+			name += ext
+		}
+	}
+
 	shareWith := strings.TrimSpace(u.ShareWith)
 	public := u.Public
 
@@ -192,7 +203,7 @@ func handleTextInput(current string, msg tea.KeyMsg) string {
 	default:
 		// Handle pasted text (bracketed paste delivers all runes at once).
 		if msg.Paste && len(msg.Runes) > 0 {
-			pasted := strings.ReplaceAll(string(msg.Runes), "\n", "")
+			pasted := sanitizeInput(string(msg.Runes))
 			return current + pasted
 		}
 		r := msg.String()
@@ -201,4 +212,21 @@ func handleTextInput(current string, msg tea.KeyMsg) string {
 		}
 	}
 	return current
+}
+
+// sanitizeInput strips control characters and invisible Unicode that cause
+// os.Stat "invalid argument" errors (common with Windows clipboard paste).
+func sanitizeInput(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 && r != '\t' { // strip \r \n \x00 etc.
+			return -1
+		}
+		if r == 0x7F { // DEL
+			return -1
+		}
+		if r == 0xFEFF { // BOM
+			return -1
+		}
+		return r
+	}, s)
 }

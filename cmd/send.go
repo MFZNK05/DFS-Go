@@ -12,7 +12,7 @@ var sendNode string
 var sendCmd = &cobra.Command{
 	Use:   "send <file-key> <peer-addr-or-alias>",
 	Short: "Send a file directly to a peer",
-	Long:  "Sends a direct-share notification for one of your uploaded files to a specific peer. The file must already be uploaded (visible in 'hermond list uploads').",
+	Long:  "Sends a direct-share notification for one of your uploaded files to a specific peer. The file must already be uploaded (visible in 'hermod list uploads').",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fileKey, peer := args[0], args[1]

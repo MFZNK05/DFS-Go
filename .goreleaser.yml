@@ -1,6 +1,6 @@
 version: 2
 
-project_name: hermond
+project_name: hermod
 
 builds:
   - env:
@@ -12,7 +12,7 @@ builds:
     goarch:
       - amd64
       - arm64
-    binary: hermond
+    binary: hermod
     ldflags:
       - -s -w
       - -X github.com/Faizan2005/DFS-Go/cmd.version={{.Version}}
@@ -26,7 +26,7 @@ archives:
       - goos: windows
         formats:
           - zip
-    name_template: "hermond_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "hermod_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - INSTALL.txt
       - USAGE.txt
@@ -38,12 +38,12 @@ checksum:
 brews:
   - repository:
       owner: MFZNK05
-      name: homebrew-hermond
+      name: homebrew-hermod
     homepage: "https://github.com/MFZNK05/DFS-Go"
-    description: "Hermond – P2P File Sharing for Campus Networks"
+    description: "Hermod – P2P File Sharing for Campus Networks"
     license: "MIT"
     install: |
-      bin.install "hermond"
+      bin.install "hermod"
 
 changelog:
   sort: asc

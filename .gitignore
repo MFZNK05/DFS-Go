@@ -6,7 +6,7 @@
 
 # Binary outputs
 bin/
-hermond
+hermod
 dfs
 *.exe
 

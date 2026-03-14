@@ -1,44 +1,44 @@
 ================================================================================
-                        HERMOND - COMMAND REFERENCE
+                        HERMOD - COMMAND REFERENCE
 ================================================================================
 
 All commands support --node <":port"> to target a specific local daemon
 (default: :3000).
 
 
-STARTING HERMOND
+STARTING HERMOD
 -----------------
 
-  hermond                              Start daemon + launch TUI
-  hermond --port :3000                 Start on a specific port
-  hermond --port :4000 --peer :3000    Join an existing node
-  hermond --no-stun                    Disable NAT traversal (LAN-only)
-  hermond tui --node :3000             Attach TUI to a running daemon
+  hermod                              Start daemon + launch TUI
+  hermod --port :3000                 Start on a specific port
+  hermod --port :4000 --peer :3000    Join an existing node
+  hermod --no-stun                    Disable NAT traversal (LAN-only)
+  hermod tui --node :3000             Attach TUI to a running daemon
 
 
 IDENTITY (one-time setup)
 --------------------------
 
-  hermond identity init --alias "alice"    Generate Ed25519 + X25519 keypair
-  hermond identity show                    Show fingerprint, alias, public keys
+  hermod identity init --alias "alice"    Generate Ed25519 + X25519 keypair
+  hermod identity show                    Show fingerprint, alias, public keys
 
 
 UPLOADING FILES
 ----------------
 
-  hermond upload --name <name> --file <path>
+  hermod upload --name <name> --file <path>
       Upload a single file.
 
-  hermond upload --name <name> --dir <path>
+  hermod upload --name <name> --dir <path>
       Upload an entire directory.
 
-  hermond upload --name <name> --file <path> --public
+  hermod upload --name <name> --file <path> --public
       Upload and mark as publicly browsable by all peers.
 
-  hermond upload --name <name> --file <path> --share-with bob,charlie
+  hermod upload --name <name> --file <path> --share-with bob,charlie
       Encrypt with ECDH so only bob and charlie can decrypt.
 
-  hermond upload --name <name> --file <path> --share-with-key <x25519-pubkey>
+  hermod upload --name <name> --file <path> --share-with-key <x25519-pubkey>
       Encrypt for a specific public key (fallback when alias isn't known).
 
   Flags:
@@ -54,13 +54,13 @@ UPLOADING FILES
 DOWNLOADING FILES
 ------------------
 
-  hermond download --name <name> --output <path>
+  hermod download --name <name> --output <path>
       Download a file you previously uploaded.
 
-  hermond download --name <name> --output <path> --from alice
+  hermod download --name <name> --output <path> --from alice
       Download a file uploaded by another user (by alias).
 
-  hermond download --name <name> --output <path> --from-key <fingerprint>
+  hermod download --name <name> --output <path> --from-key <fingerprint>
       Download using the owner's fingerprint (for duplicate aliases).
 
   Flags:
@@ -74,7 +74,7 @@ DOWNLOADING FILES
 DIRECT SEND
 -------------
 
-  hermond send <file-key> <peer-addr-or-alias>
+  hermod send <file-key> <peer-addr-or-alias>
       Send a direct-share notification for one of your uploaded files to a
       specific peer. The file must already be uploaded.
 
@@ -82,7 +82,7 @@ DIRECT SEND
 SEARCHING
 ----------
 
-  hermond search <query>
+  hermod search <query>
       Flood-search the network for files matching the query.
       Returns: key, name, size, owner, node address.
 
@@ -90,36 +90,36 @@ SEARCHING
 NETWORK & PEERS
 ----------------
 
-  hermond peers                        List all connected peers
-  hermond browse <peer-addr>           Browse a peer's public files
-  hermond status                       Show node info (uptime, peers, files)
-  hermond connect <addr-or-alias>      Manually connect to a peer
+  hermod peers                        List all connected peers
+  hermod browse <peer-addr>           Browse a peer's public files
+  hermod status                       Show node info (uptime, peers, files)
+  hermod connect <addr-or-alias>      Manually connect to a peer
 
 
 TRANSFER MANAGEMENT
 --------------------
 
-  hermond transfers                    List all active/recent transfers
-  hermond pause <transfer-id>          Pause an active transfer
-  hermond resume <transfer-id>         Resume a paused transfer
-  hermond cancel <transfer-id>         Cancel a transfer
+  hermod transfers                    List all active/recent transfers
+  hermod pause <transfer-id>          Pause an active transfer
+  hermod resume <transfer-id>         Resume a paused transfer
+  hermod cancel <transfer-id>         Cancel a transfer
 
 
 FILE MANAGEMENT
 ----------------
 
-  hermond list uploads                 Show your upload history
-  hermond list uploads --public        Show only public uploads
-  hermond list uploads --private       Show only encrypted/shared uploads
-  hermond list downloads               Show your download history
-  hermond list public                  Show the public file catalog
-  hermond remove <name>               Remove a file (tombstone propagated)
+  hermod list uploads                 Show your upload history
+  hermod list uploads --public        Show only public uploads
+  hermod list uploads --private       Show only encrypted/shared uploads
+  hermod list downloads               Show your download history
+  hermod list public                  Show the public file catalog
+  hermod remove <name>               Remove a file (tombstone propagated)
 
 
 VERSION
 --------
 
-  hermond version                      Print version, commit hash, build date
+  hermod version                      Print version, commit hash, build date
 
 
 TUI KEYBOARD SHORTCUTS
@@ -142,24 +142,24 @@ EXAMPLES
 ---------
 
   # First-time setup
-  hermond identity init --alias "alice"
-  hermond --port :3000
+  hermod identity init --alias "alice"
+  hermod --port :3000
 
   # Share a movie with everyone on the network
-  hermond upload --name "inception.mkv" --file ~/Movies/inception.mkv --public
+  hermod upload --name "inception.mkv" --file ~/Movies/inception.mkv --public
 
   # Share class notes privately with bob
-  hermond upload --name "cs101-notes" --dir ~/notes/cs101/ --share-with bob
+  hermod upload --name "cs101-notes" --dir ~/notes/cs101/ --share-with bob
 
   # Download a file from a peer
-  hermond download --name "inception.mkv" --output ./inception.mkv --from alice
+  hermod download --name "inception.mkv" --output ./inception.mkv --from alice
 
   # Search for files across the network
-  hermond search "lecture"
+  hermod search "lecture"
 
   # Check what's happening
-  hermond transfers
-  hermond status
+  hermod transfers
+  hermod status
 
 
 ================================================================================

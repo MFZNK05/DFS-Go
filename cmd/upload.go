@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -28,6 +29,12 @@ var uploadCmd = &cobra.Command{
 		}
 		if uploadFile != "" && uploadDir != "" {
 			return fmt.Errorf("--file and --dir are mutually exclusive")
+		}
+		// Auto-append source file extension if name has none.
+		if uploadFile != "" && filepath.Ext(uploadName) == "" {
+			if ext := filepath.Ext(uploadFile); ext != "" {
+				uploadName += ext
+			}
 		}
 		if uploadDir != "" {
 			return UploadDirectory(uploadName, uploadDir, uploadShareWith, uploadShareWithKey, socketPath(uploadNode), uploadPublic)
