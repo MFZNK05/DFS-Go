@@ -56,46 +56,71 @@ A comprehensive technical reference for engineers who want to understand how Her
 Hermod is a peer-to-peer distributed file system. Every node is both a client and a server. There is no central coordinator — nodes discover each other via gossip, distribute files using consistent hashing, and replicate data to survive node failures.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Hermod Node                         │
-│                                                             │
-│  ┌─────────┐   ┌───────────┐   ┌────────────────────────┐  │
-│  │  TUI    │──>│  IPC      │──>│  Server (orchestrator)  │  │
-│  │ (Bubble │   │  (Unix    │   │                         │  │
-│  │  Tea)   │   │  Socket)  │   │  ┌────────┐ ┌────────┐ │  │
-│  └─────────┘   └───────────┘   │  │ Gossip │ │HashRing│ │  │
-│  ┌─────────┐                   │  └────────┘ └────────┘ │  │
-│  │  CLI    │──────────┐        │  ┌────────┐ ┌────────┐ │  │
-│  │ (Cobra) │          │        │  │Quorum  │ │Handoff │ │  │
-│  └─────────┘          │        │  └────────┘ └────────┘ │  │
-│                       │        │  ┌────────┐ ┌────────┐ │  │
-│                       │        │  │FailDet │ │Rebalncr│ │  │
-│                       │        │  └────────┘ └────────┘ │  │
-│                       │        │  ┌────────┐ ┌────────┐ │  │
-│                       │        │  │BW Mgr  │ │Selector│ │  │
-│                       │        │  └────────┘ └────────┘ │  │
-│                       │        │  ┌────────┐ ┌────────┐ │  │
-│                       │        │  │ mDNS   │ │Firewall│ │  │
-│                       │        │  └────────┘ └────────┘ │  │
-│                       │        └──────────┬─────────────┘  │
-│                       │                   │                 │
-│                       │        ┌──────────▼─────────────┐  │
-│                       │        │  Storage Engine         │  │
-│                       │        │  CAS + Chunker +        │  │
-│                       │        │  Compress + Resume      │  │
-│                       │        └──────────┬─────────────┘  │
-│                       │                   │                 │
-│                       └───────>┌──────────▼─────────────┐  │
-│                                │  QUIC Transport         │  │
-│                                │  (TLS 1.3, per-stream)  │  │
-│                                └──────────┬─────────────┘  │
-└───────────────────────────────────────────┼─────────────────┘
-                                            │
-              ┌─────────────────────────────┼─────────────────────────┐
-              │                             │                         │
-        ┌─────▼─────┐               ┌─────▼─────┐            ┌─────▼─────┐
-        │  Peer B   │               │  Peer C   │            │  Peer D   │
-        └───────────┘               └───────────┘            └───────────┘
+                    Hermod Node (single machine)
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  Stateless Clients (any number can attach/detach)                │
+│  ┌──────────┐  ┌──────────┐                                     │
+│  │   TUI    │  │   CLI    │  (hermod upload, hermod peers, ...)  │
+│  │ (Bubble  │  │ (Cobra)  │                                     │
+│  │  Tea)    │  │          │                                     │
+│  └────┬─────┘  └────┬─────┘                                     │
+│       │              │                                           │
+│       └──────┬───────┘                                           │
+│              │ IPC (Unix socket / Windows named pipe)             │
+│              ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │                  Daemon (background process)               │   │
+│  │                                                           │   │
+│  │  ┌─────────────────────────────────────────────────────┐  │   │
+│  │  │              Server (orchestrator)                   │  │   │
+│  │  │                                                     │  │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐           │  │   │
+│  │  │  │  Gossip  │ │ HashRing │ │  Quorum  │           │  │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘           │  │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐           │  │   │
+│  │  │  │ FailDet  │ │ Handoff  │ │Rebalancer│           │  │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘           │  │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐           │  │   │
+│  │  │  │ Selector │ │Downloader│ │TransferMg│           │  │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘           │  │   │
+│  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐           │  │   │
+│  │  │  │  mDNS    │ │CacheMgr │ │  NAT     │           │  │   │
+│  │  │  │Advertiser│ │ (Swarm)  │ │ (STUN)   │           │  │   │
+│  │  │  └──────────┘ └──────────┘ └──────────┘           │  │   │
+│  │  │  ┌──────────┐ ┌──────────┐                        │  │   │
+│  │  │  │AntiEntro-│ │ Cluster  │                        │  │   │
+│  │  │  │py (Merkle│ │  State   │                        │  │   │
+│  │  │  └──────────┘ └──────────┘                        │  │   │
+│  │  └──────────┬──────────────────────┬─────────────────┘  │   │
+│  │             │                      │                     │   │
+│  │  ┌──────────▼───────────┐  ┌───────▼──────────┐         │   │
+│  │  │  Storage Engine      │  │  StateDB         │         │   │
+│  │  │  CAS + Chunker +     │  │  (BoltDB:        │         │   │
+│  │  │  Compress + Resume + │  │   uploads, peers, │         │   │
+│  │  │  Swarm Cache         │  │   public catalog) │         │   │
+│  │  └──────────┬───────────┘  └──────────────────┘         │   │
+│  │             │                                            │   │
+│  │  ┌──────────▼────────────────────────────────────────┐  │   │
+│  │  │            Dual-Port QUIC Transport                │  │   │
+│  │  │                                                    │  │   │
+│  │  │  ┌──────────────────┐  ┌─────────────────────┐    │  │   │
+│  │  │  │ Control (port N) │  │   Data (port N+1)   │    │  │   │
+│  │  │  │ gossip, heartbeat│  │  chunk store/get,    │    │  │   │
+│  │  │  │ announce, meta,  │  │  file replication,   │    │  │   │
+│  │  │  │ manifest lookup  │  │  swarm fetch         │    │  │   │
+│  │  │  │ (TLS 1.3)        │  │  (TLS 1.3)           │    │  │   │
+│  │  │  └────────┬─────────┘  └──────────┬──────────┘    │  │   │
+│  │  └───────────┼───────────────────────┼───────────────┘  │   │
+│  └──────────────┼───────────────────────┼──────────────────┘   │
+└─────────────────┼───────────────────────┼──────────────────────┘
+                  │        Network        │
+        ┌─────────▼───────────────────────▼─────────┐
+        │                                           │
+  ┌─────▼─────┐          ┌───────────┐       ┌─────▼─────┐
+  │  Peer B   │          │  Peer C   │       │  Peer D   │
+  │ ctrl+data │          │ ctrl+data │       │ ctrl+data │
+  └───────────┘          └───────────┘       └───────────┘
 ```
 
 **Key principle:** Every subsystem is its own Go package with no circular dependencies. The `Server` package wires everything together.
@@ -148,7 +173,7 @@ Step 7: Replication
    Hash ring lookup: GetNodes("report.pdf", RF=3) → [self, NodeB, NodeC]
    For each remote replica:
      - Send MessageStoreFile (gob-encoded) with key, size, encrypted chunk
-     - Stream chunk data over QUIC (throttled by bandwidth manager)
+     - Stream chunk data over QUIC data transport (port N+1)
    Quorum: for RF >= 3, wait for majority (RF/2 + 1) acks before returning success.
    If a target is unreachable → store hint for hinted handoff.
 
@@ -1557,10 +1582,13 @@ The `Server` struct is the root of the entire system. Every subsystem is a field
 
 ```go
 type Server struct {
-    // Transport
-    transport peer2peer.Transport   // QUIC transport (listens + dials)
-    peerLock  sync.RWMutex
-    peers     map[string]peer2peer.Peer  // addr → live connection
+    // Transport — Dual-Port
+    transport     peer2peer.Transport        // QUIC control transport (port N)
+    dataTransport peer2peer.Transport        // QUIC data transport (port N+1, nil = single-port)
+    peerLock      sync.RWMutex
+    peers         map[string]peer2peer.Peer  // addr → control-plane connection
+    dataPeerLock  sync.RWMutex
+    dataPeers     map[string]peer2peer.Peer  // addr → data-plane connection
 
     // Storage
     Store     *storage.Store        // CAS storage engine + metadata
@@ -1585,13 +1613,23 @@ type Server struct {
     NATService     *nat.Puncher          // STUN external address discovery
     MDNSAdvertiser *peermdns.Advertiser  // LAN DNS-SD advertisement
 
+    // Swarm
+    CacheMgr  *swarm.CacheManager  // LRU cache for secondary seeder chunks
+
     // Identity
     identityMeta map[string]string  // {"alias", "fingerprint", "x25519_pub", "ed25519_pub"}
     externalAddr string             // set after MessageAnnounceAck or STUN
+    x25519Priv   []byte             // for ECDH DEK unwrapping
+    dekCache     sync.Map           // LRU cache for unwrapped DEKs
 
-    // Misc
-    startedAt  time.Time
-    searchSeen sync.Map  // flood-search dedup (msgID → bool)
+    // Operational
+    activeUploads atomic.Int32      // upload priority — background tasks yield when > 0
+    casWriteCh    chan casWriteReq  // async CAS cache writes (non-blocking hot path)
+    startedAt     time.Time
+    searchSeen    sync.Map          // flood-search dedup (msgID → bool)
+    lanPeers      []peermdns.DiscoveredPeer  // cached mDNS scan results
+    lanPeersMu    sync.RWMutex
+    maxPeers      int               // target active peer count
 }
 ```
 
@@ -1616,14 +1654,16 @@ MakeServer(opts MakeServerOpts) *Server
   15. peermdns.NewAdvertiser(...)
 
 Server.Start():
-  1. transport.ListenAndAccept() in goroutine
-  2. go discoverNAT()           → non-blocking STUN query
-  3. GossipSvc.Start()
-  4. HeartbeatSvc.Start()
-  5. AntiEntropy.Start()
-  6. HandoffSvc.StartPurgeLoop()
-  7. HealthSrv.Start()          (if enabled)
-  8. go rpcLoop()               → reads transport.Consume() channel
+  1. transport.ListenAndAccept()      → control transport goroutine
+  2. dataTransport.ListenAndAccept()  → data transport goroutine (if dual-port)
+  3. go discoverNAT()                → non-blocking STUN query
+  4. GossipSvc.Start()
+  5. HeartbeatSvc.Start()
+  6. AntiEntropy.Start()
+  7. HandoffSvc.StartPurgeLoop()
+  8. HealthSrv.Start()               (if enabled)
+  9. go rpcLoop()                    → reads control transport.Consume()
+  10. go dataLoop()                   → reads data transport.Consume() (if dual-port)
 ```
 
 **Message dispatch** (`rpcLoop` → `handleMessage`):
@@ -1662,16 +1702,19 @@ func (s *Server) handleMessage(rpc peer2peer.RPC) {
 
 ```
 Outbound dial (s.Connect(addr)):
-  transport.Dial(addr)
-  → OnPeer(peer) fires:
+  DialDual(transport, dataTransport, addr)
+  → OnPeer(peer) fires (control transport):
       peers[addr] = peer
       HashRing.AddNode(addr)
       Cluster.AddNode(addr, nil)
       send MessageAnnounce{ListenAddr: effectiveSelfAddr()}
       send MessageIdentityMeta{Meta: identityMeta}
+  → OnDataPeer(peer) fires (data transport):
+      dataPeers[addr] = peer  // indexed by control port addr
 
 Inbound connection accepted:
   → OnPeer(peer) same as above (minus announce — waits for remote to send it)
+  → OnDataPeer(peer) same — adds to dataPeers map
 
 MessageAnnounce arrives:
   handleAnnounce(peer, msg):
@@ -2551,7 +2594,7 @@ func HandleClient(conn net.Conn, s *server.Server) {
 //    onChunk → writeProgress(conn, done, total)
 // 5. HashRing.GetNodes(key, RF) → replicas
 // 6. for each remote replica:
-//      s.replicateChunk(replica, key, chunkData)  // QUIC MessageStoreFile
+//      s.replicateChunk(replica, key, chunkData)  // via data transport (port N+1)
 // 7. TransferMgr.SetStatus(id, Completed, "")
 // 8. StateDB.RecordUpload(...)
 // 9. if public: StateDB.AddPublicFile(...)
@@ -2874,7 +2917,7 @@ The table below shows which struct field on `Server` wires to which subsystem ca
 |-----------|-------------------|----------|
 | Store chunk locally | `Store` | `Store.StoreData(key, r, opts)` |
 | Find replica nodes | `HashRing` | `HashRing.GetNodes(key, RF)` |
-| Send chunk to peer | `peers[addr]` | `peer.SendStream(hdr, data)` |
+| Send chunk to peer | `dataPeers[addr]` | `peer.SendStream(hdr, data)` via data transport |
 | Pick best peer | `Selector` | `Selector.BestPeer(candidates)` |
 | Download chunks | `Downloader` | `Downloader.DownloadToFileResumable(...)` |
 | Verify chunk integrity | (inline in downloader) | `sha256(plaintext) == manifest.Chunks[i].Hash` |
