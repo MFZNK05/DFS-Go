@@ -30,8 +30,8 @@ Moving large files on a campus network shouldn't require cloud uploads, USB driv
 **What sets it apart:**
 
 - **Encrypted Direct Send** — Push files directly to a specific person using ECDH (X25519) encryption. Only the intended recipient can decrypt the data. No server ever sees the plaintext.
-- **LAN-Speed Transfers** — Built on QUIC with adaptive bandwidth management. Multi-GB transfers run at the physical limits of your network without saturating it for everyone else.
-- **Zero-Config Discovery** — Nodes find each other via gossip protocol. No IP addresses to type, no config files to edit. Join the swarm and start sharing.
+- **LAN-Speed Transfers** — Built on QUIC with native congestion control. Multi-GB transfers run at the physical limits of your network without saturating it for everyone else.
+- **Zero-Config Discovery** — Nodes on the same LAN find each other automatically via mDNS. Across subnets, gossip propagates membership. No IP addresses to type, no config files to edit.
 - **Persistent & Resumable** — Close your laptop mid-transfer? Hermod remembers exactly which chunks were downloaded and picks up where it left off.
 
 ---
@@ -39,6 +39,7 @@ Moving large files on a campus network shouldn't require cloud uploads, USB driv
 ## Table of Contents
 
 - [Installation](#installation)
+- [First Run](#first-run)
 - [Quick Start](#quick-start)
 - [The TUI](#the-tui)
 - [CLI Reference](#cli-reference)
@@ -47,6 +48,7 @@ Moving large files on a campus network shouldn't require cloud uploads, USB driv
 - [Package Reference](#package-reference)
 - [Security Model](#security-model)
 - [Tech Stack](#tech-stack)
+- [Data Directory](#data-directory)
 - [License](#license)
 
 ---
@@ -92,31 +94,60 @@ hermod version
 
 ---
 
+## First Run
+
+The first time you run `hermod`, it walks you through a one-time setup:
+
+```
+$ hermod
+Welcome to Hermod!
+Enter your alias: alice
+Control port (default 3000, data port will be 3001): 3000
+
+Identity created: alice (fingerprint: c34144eb91e1cb10)
+Port configured: 3000 (data port: 3001)
+```
+
+| Setting | Details |
+|---------|---------|
+| **Alias** | Your permanent name on the network. Tied to your cryptographic fingerprint — cannot be changed later. |
+| **Control port** | Used for gossip, heartbeat, and metadata. Default `3000`. |
+| **Data port** | Used for chunk transfers. Always control port + 1 (automatic). |
+
+Both are saved to `~/.hermod/identity.json` and `~/.hermod/config.json`. On subsequent launches, Hermod loads these automatically.
+
+Hermod also auto-configures your OS firewall on first startup:
+- **Windows:** UAC prompt to add netsh inbound UDP rules
+- **macOS:** Admin password prompt to configure Application Firewall
+- **Linux:** Uses `ufw`, `firewall-cmd`, or `iptables` (non-interactive `sudo -n`)
+
+If firewall setup fails, Hermod continues — you may need to open the ports manually.
+
+> **Non-interactive setup:** If you prefer to skip the prompt (scripting, CI), run `hermod identity init --alias <name>` before first launch.
+
+---
+
 ## Quick Start
 
-### 1. Create your identity
-
-Every node needs a keypair for encryption and peer identification:
+### 1. Launch Hermod
 
 ```sh
-hermod identity init --alias "alice"
+hermod
 ```
 
-### 2. Launch Hermod
+This forks a background daemon and opens the TUI dashboard. First run will prompt for setup (see [First Run](#first-run)).
 
-Run without arguments to start the daemon and open the TUI:
+### 2. Connect to a peer
+
+On another machine on the same LAN subnet, just run `hermod` — peers discover each other automatically via mDNS. No flags needed.
+
+To connect across subnets or VLANs:
 
 ```sh
-hermod --port :3000
+hermod --peer <alice-ip>:3000
 ```
 
-On another machine, join the first node:
-
-```sh
-hermod --port :4000 --peer <alice-ip>:3000
-```
-
-Nodes discover each other automatically from there — no need to manually connect every pair.
+Nodes discover the rest of the cluster automatically from there via gossip — no need to manually connect every pair.
 
 ### 3. Share files
 
@@ -138,7 +169,13 @@ hermod download --name "movie.mkv" --output ./movie.mkv --from alice
 
 ## The TUI
 
-Launch the full-screen terminal dashboard with `hermod` (or `hermod tui` to connect to a running daemon).
+The TUI is a **stateless IPC client** — it connects to the background daemon over a Unix socket (or named pipe on Windows). Pressing `q` or `Ctrl+C` exits only the TUI; the daemon keeps running.
+
+```
+Hermod is still running in the background. Use 'hermod stop' to shut it down.
+```
+
+To reattach to a running daemon at any time: `hermod tui`
 
 ### Network Tab
 
@@ -165,26 +202,38 @@ Node health dashboard: address, uptime, peer count, upload/download totals, and 
 |-----|--------|
 | `Tab` / `Shift+Tab` | Switch tabs |
 | `Ctrl+U` | Open upload modal |
-| `Ctrl+D` | Open download prompt |
-| `Ctrl+H` | Show help overlay |
-| `Ctrl+C` | Quit |
+| `d` | Download (in Network tab) |
+| `?` | Show help overlay |
+| `q` / `Ctrl+C` | Quit TUI (daemon keeps running) |
 
 ---
 
 ## CLI Reference
 
-All commands support the `--node` flag (default `:3000`) to target a specific local daemon.
-
 ### Core Commands
 
 | Command | Description |
 |---------|-------------|
-| `hermod` | Start daemon + launch TUI |
+| `hermod` | Fork daemon + launch TUI (first run prompts for setup) |
+| `hermod start` | Start daemon only (headless, blocks until stopped) |
+| `hermod stop` | Gracefully shut down a running daemon |
+| `hermod tui` | Attach TUI to an already-running daemon |
 | `hermod upload --name <n> --file <f>` | Upload a file to the network |
 | `hermod upload --name <n> --dir <d>` | Upload a directory |
 | `hermod download --name <n> --output <o>` | Download a file or directory |
-| `hermod send <file-key> <peer>` | Direct-send a file to a specific peer |
+| `hermod send <file-key> <peer>` | Send a direct-share notification to a peer |
 | `hermod search <query>` | Flood-search the network for files |
+
+### Daemon Flags
+
+| Flag | Applies to | Description |
+|------|-----------|-------------|
+| `--port` | `hermod`, `hermod start` | Control port (default `:3000`, data port is automatically N+1) |
+| `--peer` | `hermod`, `hermod start` | Bootstrap peer address(es) (repeatable or comma-separated) |
+| `--no-stun` | `hermod`, `hermod start` | Disable STUN NAT traversal |
+| `--replication` | `hermod start` | Replicas per file (default 3) |
+| `--max-peers` | `hermod start` | Target number of active peer connections (default 8) |
+| `--node` (`-n` for stop) | `hermod stop`, `hermod tui` | Port of daemon to target (default `:3000`) |
 
 ### Upload Flags
 
@@ -213,7 +262,9 @@ All commands support the `--node` flag (default `:3000`) to target a specific lo
 | `hermod peers` | List connected peers |
 | `hermod browse <peer-addr>` | Browse a peer's public files |
 | `hermod status` | Show node status (uptime, peer count, files) |
-| `hermod connect <addr-or-alias>` | Manually connect to a peer |
+| `hermod connect <addr-or-alias>` | Connect to a peer (also unblocks if blocklisted) |
+| `hermod disconnect <addr-or-alias>` | Disconnect and blocklist a peer |
+| `hermod unblock <addr-or-alias>` | Remove a peer from the blocklist |
 
 ### Transfer Management
 
@@ -237,7 +288,7 @@ All commands support the `--node` flag (default `:3000`) to target a specific lo
 
 | Command | Description |
 |---------|-------------|
-| `hermod identity init --alias <name>` | Generate a new Ed25519 + X25519 keypair |
+| `hermod identity init --alias <name>` | Generate a new Ed25519 + X25519 keypair (optional — handled by first-run prompt) |
 | `hermod identity show` | Display fingerprint, alias, and public keys |
 | `hermod version` | Print version, commit, and build date |
 
@@ -280,8 +331,10 @@ hermod download --name "report.pdf" --output ./out.pdf --from alice
 ### Peer Discovery
 
 ```
-Node starts
-  -> Dials bootstrap peers (--peer flag)
+Node starts (hermod forks daemon in background)
+  -> mDNS advertises on LAN (_hermod._udp)
+  -> Same-subnet peers discovered automatically (no config)
+  -> Dials bootstrap peers if provided (--peer flag)
   -> Gossip protocol propagates membership (O(log N) convergence)
   -> Identity metadata exchanged (alias, fingerprint, public keys)
   -> Hash ring updated automatically
@@ -292,37 +345,43 @@ Node starts
 
 ## Architecture
 
+Hermod uses a **daemon + client** model. The daemon runs as a detached background process; the TUI and CLI connect to it via IPC. Network traffic is split across **two QUIC ports**: a control port for cluster coordination and a data port for bulk chunk transfers.
+
 ```
 +-------------------------------------------------------------------+
-|                         Hermod Node                              |
-|                                                                   |
-|  +----------+    +-----------+    +---------------------------+   |
-|  | TUI      |--->| IPC       |--->|  Server (orchestrator)    |   |
-|  | (Bubble  |    | (Unix     |    |                           |   |
-|  |  Tea)    |    |  Socket)  |    |  Gossip    Hash Ring      |   |
-|  +----------+    +-----------+    |  Quorum    Heartbeat      |   |
-|  +----------+                     |  Handoff   Rebalancer     |   |
-|  | CLI      |----+               |  Selector  Anti-Entropy   |   |
-|  | (Cobra)  |    |               |  Bandwidth Transfer Mgr   |   |
-|  +----------+    |               +-------------+-------------+   |
-|                  |                             |                  |
-|                  |               +-------------v-------------+   |
-|                  |               |  Storage Engine            |   |
-|                  |               |  CAS + Chunker + Compress  |   |
-|                  |               |  + Resume + Dir Manifest   |   |
-|                  |               +-------------+-------------+   |
-|                  |                             |                  |
-|                  |               +-------------v-------------+   |
-|                  +-------------->|  QUIC Transport            |   |
-|                                  |  (TLS 1.3, per-stream)    |   |
-|                                  +-------------+-------------+   |
-+---------------------------------------|---------------------------+
-                                        |
-              +-------------------------+-------------------------+
-              |                         |                         |
-        +-----v-----+            +-----v-----+            +-----v-----+
-        |  Peer B   |            |  Peer C   |            |  Peer D   |
-        +-----------+            +-----------+            +-----------+
+|                     Hermod Daemon (background)                     |
+|                                                                    |
+|  +------------------------+   +------------------------+          |
+|  | Control Port (:N)      |   | Data Port (:N+1)       |          |
+|  | Gossip, Heartbeat,     |   | Chunk Transfers         |          |
+|  | Metadata, Search       |   | (QUIC streams)          |          |
+|  +-----------+------------+   +-----------+------------+          |
+|              |                            |                        |
+|  +-----------v----------------------------v------------+          |
+|  |  Server (orchestrator)                               |          |
+|  |                                                      |          |
+|  |  Gossip    Hash Ring    Quorum    Heartbeat           |          |
+|  |  Handoff   Rebalancer   Selector  Anti-Entropy        |          |
+|  |  Bandwidth  Transfer Mgr  mDNS    NAT/STUN           |          |
+|  +-------------------------+----------------------------+          |
+|                            |                                       |
+|  +-------------------------v----------------------------+          |
+|  |  Storage Engine                                       |          |
+|  |  CAS + Chunker + Compress + Resume + Swarm Cache      |          |
+|  +-------------------------+----------------------------+          |
+|                            |                                       |
+|  +-------------------------v----------------------------+          |
+|  |  IPC Socket                                           |          |
+|  |  Unix: /tmp/hermod-N.sock  |  Win: \\.\pipe\hermod-N  |          |
+|  +------+----------------------+------------------------+          |
++---------|----------------------|-------------------------------+
+          |                      |
+   +------v------+       +------v------+
+   | TUI         |       | CLI         |
+   | (Bubble Tea)|       | (Cobra)     |
+   | hermod /    |       | hermod ...  |
+   | hermod tui  |       |             |
+   +-------------+       +-------------+
 ```
 
 ---
@@ -335,10 +394,9 @@ Hermod is organized into isolated sub-packages with no circular dependencies.
 
 | Package | Description |
 |---------|-------------|
-| `Server/` | Central orchestrator — peer lifecycle, storage, replication, message routing |
+| `Server/` | Central orchestrator — peer lifecycle, storage, replication, dual-port routing |
 | `Server/downloader/` | Parallel multi-source chunk fetcher with on-the-fly SHA-256 verification |
 | `Server/transfer/` | In-memory transfer registry — progress tracking, pause/resume/cancel |
-| `Server/ratelimit/` | LEDBAT-lite adaptive bandwidth — monitors QUIC RTT, auto-throttles |
 
 ### Storage
 
@@ -350,6 +408,7 @@ Hermod is organized into isolated sub-packages with no circular dependencies.
 | `Storage/dirmanifest/` | Directory manifest — wraps N file manifests as a table of contents |
 | `Storage/resume/` | Download resume sidecar — append-only log, O(1) per chunk, fast-verify on restart |
 | `Storage/pending/` | Upload resume sidecar — crash-safe tracking of partially uploaded directories |
+| `Storage/swarm/` | Seed-in-place cache — serve chunks from original file, LRU eviction (50 GB default) |
 
 ### Cluster
 
@@ -378,7 +437,8 @@ Hermod is organized into isolated sub-packages with no circular dependencies.
 
 | Package | Description |
 |---------|-------------|
-| `Peer2Peer/quic/` | QUIC transport — self-signed TLS 1.3, per-message streams, no head-of-line blocking |
+| `Peer2Peer/quic/` | QUIC transport — dual-port (control + data), TLS 1.3, per-message streams |
+| `Peer2Peer/mdns/` | mDNS LAN auto-discovery — advertises node presence, scans for peers on same subnet |
 | `Peer2Peer/nat/` | STUN-based NAT traversal — discovers external address, LAN-only fallback on failure |
 
 ### State & IPC
@@ -386,16 +446,16 @@ Hermod is organized into isolated sub-packages with no circular dependencies.
 | Package | Description |
 |---------|-------------|
 | `State/` | Persistent local state (BoltDB) — uploads, downloads, public catalog, tombstones, peers |
-| `ipc/` | Inter-process communication wire protocol — 18 opcodes for all CLI/TUI operations |
+| `ipc/` | Inter-process communication wire protocol — 35 opcodes for all CLI/TUI operations |
 
 ### Interface
 
 | Package | Description |
 |---------|-------------|
-| `tui/` | Terminal UI (Bubble Tea) — 4 tabs, upload/download modals, keyboard-driven |
+| `tui/` | Terminal UI (Bubble Tea) — stateless IPC client, 4 tabs, keyboard-driven |
 | `tui/tabs/` | Individual tab implementations (Network, Transfers, Vault, Diagnostics) |
 | `tui/components/` | Reusable UI components (tables, modals, header, footer) |
-| `cmd/` | Cobra CLI commands and IPC client helpers |
+| `cmd/` | Cobra CLI, daemon lifecycle (`start`/`stop`), cross-platform firewall, IPC helpers |
 
 ### Observability
 
@@ -405,6 +465,7 @@ Hermod is organized into isolated sub-packages with no circular dependencies.
 | `Observability/metrics/` | Prometheus instrumentation (`dfs_*` metric families) |
 | `Observability/tracing/` | OpenTelemetry distributed tracing (OTLP export to Jaeger) |
 | `Observability/logging/` | Structured logging via zerolog |
+| `Observability/memlog/` | OOM forensics — periodic heap stats, auto heap profile dumps at thresholds |
 
 ---
 
@@ -450,9 +511,29 @@ Each node has a unique cryptographic identity:
 | Encryption | AES-256-GCM (streaming), X25519 ECDH, Ed25519 |
 | Compression | Zstandard (zstd) |
 | Hashing | SHA-256 (integrity), MD5 (CAS filenames) |
-| Bandwidth | LEDBAT-lite (golang.org/x/time/rate) |
+| Discovery | mDNS (hashicorp/mdns) + Gossip |
+| Bandwidth | QUIC native congestion control (no application-layer throttling) |
 | Observability | Prometheus + OpenTelemetry + zerolog |
 | CI/CD | GitHub Actions + GoReleaser |
+
+---
+
+## Data Directory
+
+All runtime data lives under `~/.hermod/` regardless of where you run the binary from.
+
+| File / Directory | Purpose |
+|-----------------|---------|
+| `identity.json` | Ed25519 + X25519 keypair and alias (permanent) |
+| `config.json` | Saved port preference from first-run prompt |
+| `daemon.log` | Daemon stdout/stderr output |
+| `tui-debug.log` | TUI debug output (Bubble Tea) |
+| `state-<port>.db` | BoltDB local state (uploads, downloads, peers, public catalog) |
+| `_<port>_metadata.db` | Chunk and directory manifests |
+| `_<port>_network/` | CAS chunk storage (SHA-256 directory tree) |
+| `.firewall-configured` | Flag file to prevent re-running firewall setup on each launch |
+
+> **Upgrading?** Hermod auto-migrates `~/.dfs/` to `~/.hermod/` on first run after upgrade.
 
 ---
 

@@ -29,7 +29,7 @@ A comprehensive technical reference for engineers who want to understand how Her
   - [Hinted Handoff](#hinted-handoff)
   - [Anti-Entropy (Merkle Sync)](#anti-entropy-merkle-sync)
   - [Rebalancing](#rebalancing)
-- [Bandwidth Management: LEDBAT-lite](#bandwidth-management-ledbat-lite)
+- [Bandwidth Management: QUIC Native](#bandwidth-management-quic-native)
 - [Download Resume](#download-resume)
 - [Peer Selection (EWMA Latency)](#peer-selection-ewma-latency)
 - [NAT Traversal & External Address Discovery](#nat-traversal--external-address-discovery)
@@ -275,18 +275,6 @@ Each logical message opens a new short-lived QUIC stream:
 ### Built-in TLS 1.3
 
 QUIC mandates TLS 1.3. Hermod generates a self-signed certificate on first run. All peer traffic is encrypted at the transport level, independent of application-layer ECDH encryption.
-
-### SmoothedRTT for Bandwidth Management
-
-QUIC maintains a kernel-level smoothed RTT estimate per connection. Hermod's bandwidth manager reads `connection.ConnectionStats().SmoothedRTT` every 2 seconds to drive adaptive throttling — no application-level RTT probing needed.
-
-### SendStreamThrottled
-
-For large data transfers (chunk replication), the header and data are split:
-- **Header** (< 100 bytes): sent at wire speed (no throttling)
-- **Data** (4 MiB chunk): streamed through rate-limited writer via `io.CopyBuffer` with 32 KiB slices
-
-This prevents the rate limiter from "wasting" tokens on tiny metadata bytes.
 
 ---
 
@@ -680,35 +668,26 @@ When the hash ring topology changes, chunks may need to migrate.
 
 ---
 
-## Bandwidth Management: LEDBAT-lite
+## Bandwidth Management: QUIC Native
 
-Hermod automatically manages bandwidth — no user configuration. The system monitors network congestion and backs off to keep the LAN smooth for everyone.
+Hermod delegates all bandwidth management to QUIC's built-in congestion control. There is no application-layer throttling.
 
-**Algorithm:**
+### Why No Application-Layer Throttling
 
-```
-Every 2 seconds, per-peer:
-  rtt = connection.ConnectionStats().SmoothedRTT  (from QUIC)
+An earlier version (v0.2.x) implemented a custom LEDBAT-lite layer: an application-level token bucket that monitored `SmoothedRTT` and adjusted rate limits dynamically. It was removed for three reasons:
 
-  if rtt < 5ms:
-    rate *= 1.20  (grow 20% — network is clear)
-  elif rtt > 25ms:
-    rate *= 0.60  (slash 40% — bufferbloat detected)
-  else:
-    hold steady
+1. **Redundant with QUIC:** QUIC already implements cubic/BBR congestion control at the transport level. Adding a second throttling layer on top created double-buffering — QUIC would back off, then the token bucket would independently back off, resulting in severe bandwidth underutilization (often 10-20% of available capacity).
 
-  Clamp: 1 MB/s <= rate <= 200 MB/s
-  Initial rate: 50 MB/s
-  Burst size: 64 KiB
-```
+2. **Burst-size deadlocks:** The token bucket had a burst of 64 KiB, but `bytes.Reader.WriteTo` could send 4 MiB in a single `Write()` call, exceeding the burst limit. This required complex workarounds (chunking writes into burst-sized pieces) that added latency without improving throughput.
 
-**Why no user-configurable limits?** Users are selfish — they'd set it to maximum and saturate the network. LEDBAT detects congestion via RTT increases and automatically yields bandwidth.
+3. **Dual-port separation solved the real problem:** The original motivation for LEDBAT was preventing chunk transfers from starving heartbeats. The [dual-port architecture](#dual-port-architecture-control-plane--data-plane) eliminates this entirely — control messages have their own dedicated QUIC connection with independent congestion windows.
 
-**Critical implementation detail — burst-size chunking:**
+### Current Design
 
-The token bucket has a burst of 64 KiB. But `bytes.Reader.WriteTo` bypasses `io.CopyBuffer`'s 32 KiB buffer and sends the full chunk (100 KiB+) in one `Write()` call. Calling `WaitN(len(p))` where `len(p) > burst` would deadlock.
-
-**Fix:** `RateLimitedWriter.Write()` internally chunks data into burst-sized pieces. Each piece waits for tokens before writing. Same fix for `RateLimitedReader.Read()` — caps the read buffer to burst before calling underlying Read. This chunking is invisible to QUIC — backpressure propagates naturally.
+- **No rate limiting code** — the `Server/ratelimit/` package was deleted
+- **QUIC handles congestion** — each connection maintains its own congestion window, RTT estimates, and flow control credits
+- **Dual-port isolation** — control messages are never starved by data transfers (separate UDP sockets, independent congestion state)
+- **Per-stream flow control** — QUIC's per-stream windows prevent any single chunk transfer from monopolizing a connection
 
 ---
 
@@ -898,6 +877,18 @@ Response format varies by opcode:
 | 0x15 | Resume transfer |
 | 0x17 | Remove file (tombstone) |
 | 0x18 | Network search (JSON response) |
+| 0x19 | Connect to peer |
+| 0x1A | Disconnect and blocklist peer |
+| 0x1B | Full browse (all files from peer) |
+| 0x1C | Send direct-share notification |
+| 0x1D | List inbox (received notifications) |
+| 0x1E | Unblock peer |
+| 0x1F | Scan LAN via mDNS |
+| 0x20 | Seed-in-place upload (no CAS copy) |
+| 0x21 | Seed-in-place ECDH upload |
+| 0x22 | Seed-in-place directory upload |
+| 0x23 | Seed-in-place ECDH directory upload |
+| 0x24 | Graceful daemon shutdown |
 
 ---
 
@@ -1530,7 +1521,7 @@ hermod/
 │   └── nat/                   STUN-based NAT traversal
 │
 ├── State/                     BoltDB persistent state (10 buckets)
-├── ipc/                       Binary IPC protocol (24 opcodes)
+├── ipc/                       Binary IPC protocol (35 opcodes)
 ├── tui/                       Bubble Tea terminal UI (stateless IPC client)
 ├── cmd/                       Cobra CLI commands + daemon lifecycle
 │   ├── unified.go             Daemon fork, TUI launch, config persistence
@@ -1591,9 +1582,8 @@ type Server struct {
     TransferMgr *transfer.Manager     // pause/resume/cancel registry
 
     // Networking
-    BandwidthMgr *ratelimit.BandwidthManager  // LEDBAT-lite adaptive throttle
-    NATService   *nat.Puncher                 // STUN external address discovery
-    MDNSAdvertiser *peermdns.Advertiser        // LAN DNS-SD advertisement
+    NATService     *nat.Puncher          // STUN external address discovery
+    MDNSAdvertiser *peermdns.Advertiser  // LAN DNS-SD advertisement
 
     // Identity
     identityMeta map[string]string  // {"alias", "fingerprint", "x25519_pub", "ed25519_pub"}
@@ -1620,11 +1610,10 @@ MakeServer(opts MakeServerOpts) *Server
   9. selector.New()
   10. downloader.New(cfg, selector, fetchChunk, decryptChunk, getPeers)
   11. transfer.NewManager()
-  12. ratelimit.New(cfg)        → BandwidthManager (always-on)
-  13. State.Open(dbPath)        → StateDB
-  14. merkle.NewAntiEntropyService(...)
-  15. nat.New(cfg)              (if !DisableSTUN)
-  16. peermdns.NewAdvertiser(...)
+  12. State.Open(dbPath)        → StateDB
+  13. merkle.NewAntiEntropyService(...)
+  14. nat.New(cfg)              (if !DisableSTUN)
+  15. peermdns.NewAdvertiser(...)
 
 Server.Start():
   1. transport.ListenAndAccept() in goroutine
@@ -1678,7 +1667,6 @@ Outbound dial (s.Connect(addr)):
       peers[addr] = peer
       HashRing.AddNode(addr)
       Cluster.AddNode(addr, nil)
-      BandwidthMgr.RegisterPeer(addr, peer)  // peer satisfies RTTSource
       send MessageAnnounce{ListenAddr: effectiveSelfAddr()}
       send MessageIdentityMeta{Meta: identityMeta}
 
@@ -1705,7 +1693,6 @@ Disconnect (OnPeerDisconnect):
     delete peers[addr]
     HashRing.RemoveNode(addr)
     Cluster.ForceLocalState(addr, StateDead)
-    BandwidthMgr.UnregisterPeer(addr)
     Rebalancer.OnNodeLeft(addr)
     HandoffSvc: replay hints for addr on reconnect
 ```
@@ -2003,12 +1990,9 @@ type Peer interface {
     net.Conn
     Send(b []byte) error                              // fire-and-forget (new stream per call)
     SendMsg(controlByte byte, payload []byte) error   // [ctrl][4B len][payload]
-    SendStream(msgPayload, streamData []byte) error   // header unthrottled, data streamed
-    SendStreamThrottled(msgPayload, streamData []byte,
-        wrapWriter func(io.Writer) io.Writer) error   // same + rate-limit wrapper
+    SendStream(msgPayload, streamData []byte) error   // header + data streamed
     CloseStream()
     Outbound() bool
-    SmoothedRTT() time.Duration                       // RTTSource for BandwidthManager
 }
 
 type Transport interface {
@@ -2055,16 +2039,8 @@ func (p *QUICPeer) SendMsg(controlByte byte, payload []byte) error {
     return err
 }
 
-// SendStreamThrottled: header at wire speed, data via io.CopyBuffer (32 KiB slices)
-// wrapWriter = BandwidthManager.WrapWriter(stream)
-func (p *QUICPeer) SendStreamThrottled(msgPayload, streamData []byte,
-    wrapWriter func(io.Writer) io.Writer) error
-
-// SmoothedRTT reads from QUIC's internal congestion controller
-func (p *QUICPeer) SmoothedRTT() time.Duration {
-    return p.conn.ConnectionStats().SmoothedRTT
-    // NOTE: ConnectionStats(), NOT ConnectionState() — common mistake
-}
+// SendStream: writes header + data over a single QUIC stream
+func (p *QUICPeer) SendStream(msgPayload, streamData []byte) error
 ```
 
 #### NAT Traversal (`Peer2Peer/nat/`)
@@ -2465,67 +2441,6 @@ func (m *Manager) Cancel(id string) error
 
 ---
 
-### Bandwidth Manager (`Server/ratelimit/`)
-
-```go
-type BandwidthManager struct {
-    peersMu sync.RWMutex
-    peers   map[string]RTTSource    // addr → QUICPeer (for RTT reads)
-
-    uploadLimiter   *rate.Limiter   // golang.org/x/time/rate token bucket
-    downloadLimiter *rate.Limiter
-    // Initial: 50 MB/s, burst 64 KiB
-    // Floor:   1 MB/s, ceiling: 200 MB/s
-
-    adjTicker *time.Ticker  // fires every 2s
-    stopCh    chan struct{}
-
-    transferSem chan struct{}  // bounded by --max-transfers flag
-}
-
-// RTT adjustment loop (every 2s):
-// for each registered peer:
-//   rtt = peer.SmoothedRTT()
-//   if rtt < 5ms:  limit = min(limit*1.20, 200 MB/s)
-//   if rtt > 25ms: limit = max(limit*0.60,   1 MB/s)
-// upload and download limiters adjusted independently
-
-type RTTSource interface {
-    SmoothedRTT() time.Duration
-}
-
-// RateLimitedWriter: calls limiter.WaitN in burst-sized chunks
-// CRITICAL: must NOT call WaitN(len(p)) directly if len(p) > burst (deadlocks)
-// Instead: chunk p into burstSize pieces, WaitN(burstSize) per piece
-type rateLimitedWriter struct {
-    w         io.Writer
-    limiter   *rate.Limiter
-    burstSize int  // 64 KiB = limiter.Burst()
-}
-
-// Same pattern for rateLimitedReader
-type rateLimitedReader struct {
-    r         io.Reader
-    limiter   *rate.Limiter
-    burstSize int
-}
-
-func (bm *BandwidthManager) WrapWriter(w io.Writer) io.Writer
-func (bm *BandwidthManager) WrapReader(r io.Reader) io.Reader
-
-// Upload path wiring:
-// replicateChunk(peer, key, data):
-//   peer.SendStreamThrottled(header, data, bm.WrapWriter)
-// handleGetFile (serving a chunk):
-//   peer.SendStreamThrottled(header, data, bm.WrapWriter)
-
-// Download path wiring:
-// RPC loop for stream RPCs: wraps rpc.StreamReader with bm.WrapReader
-// → QUIC backpressure propagates to sender automatically
-```
-
----
-
 ### Persistent State (`State/state.go`)
 
 ```go
@@ -2622,13 +2537,6 @@ func HandleClient(conn net.Conn, s *server.Server) {
     }
 }
 
-// All handlers that start transfers call acquireTransfer first
-func acquireTransfer(conn net.Conn, s *server.Server) (release func(), ok bool) {
-    if err := s.BandwidthMgr.AcquireTransfer(ctx); err != nil {
-        writeError(conn, "max transfers reached")
-        return nil, false
-    }
-    return s.BandwidthMgr.ReleaseTransfer, true
 }
 ```
 
@@ -2966,8 +2874,7 @@ The table below shows which struct field on `Server` wires to which subsystem ca
 |-----------|-------------------|----------|
 | Store chunk locally | `Store` | `Store.StoreData(key, r, opts)` |
 | Find replica nodes | `HashRing` | `HashRing.GetNodes(key, RF)` |
-| Send chunk to peer | `peers[addr]` | `peer.SendStreamThrottled(hdr, data, bm.WrapWriter)` |
-| Throttle transfer | `BandwidthMgr` | `BandwidthMgr.WrapWriter(stream)` |
+| Send chunk to peer | `peers[addr]` | `peer.SendStream(hdr, data)` |
 | Pick best peer | `Selector` | `Selector.BestPeer(candidates)` |
 | Download chunks | `Downloader` | `Downloader.DownloadToFileResumable(...)` |
 | Verify chunk integrity | (inline in downloader) | `sha256(plaintext) == manifest.Chunks[i].Hash` |
